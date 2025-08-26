@@ -405,6 +405,10 @@ class DetectionModel(BaseModel):
 
         # Define model
         self.yaml["channels"] = ch  # save channels
+        # print("-"*50)
+        # print("Inside task.py: DetectionModel")
+        # print(self.yaml["channels"])
+        # print("-"*50)
         if nc and nc != self.yaml["nc"]:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml["nc"] = nc  # override YAML value
@@ -1732,6 +1736,8 @@ def parse_model(d, ch, verbose=True):
         elif m in frozenset(
             {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
         ):
+            # print("f:", f)
+            # print("ch:", ch)
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)

@@ -59,7 +59,6 @@ __all__ = (
     "ConvNeXtDownsample",
     "ConvNeXtBlock",
     "GRN",
-    "ConvNeXtV2Block",
 )
 
 

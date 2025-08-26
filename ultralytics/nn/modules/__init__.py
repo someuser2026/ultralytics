@@ -65,7 +65,6 @@ from .block import (
     ConvNeXtDownsample,
     ConvNeXtBlock,
     GRN,
-    ConvNeXtV2Block,
 )
 from .conv import (
     CBAM,
