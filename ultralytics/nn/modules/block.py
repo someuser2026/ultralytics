@@ -52,6 +52,14 @@ __all__ = (
     "PSA",
     "SCDown",
     "TorchVision",
+    # ConvNeXt family
+    "ConvNeXtLayerNorm",
+    "DropPath",
+    "ConvNeXtStem",
+    "ConvNeXtDownsample",
+    "ConvNeXtBlock",
+    "GRN",
+    "ConvNeXtV2Block",
 )
 
 
@@ -1685,6 +1693,22 @@ class TorchVision(nn.Module):
             y = self.m(x)
         return y
 
+class DinoV3Backbone(nn.Module):
+    """
+    Load any pre-trained backbone from .pt or .pth file.
+
+    This class is designed to easily load any SSL backbone for transfer learning tasks.
+
+    Attributes:
+        m (nn.module): The loaded SSL backbone model.
+
+    Args:
+        weights (str): Pre-trained weights to load.
+        unwrap (bool): Whether to unwrap the model.
+        truncate (int): Number of layers to truncate.
+        split (bool): Whether to split the output.
+    """
+    
 
 class AAttn(nn.Module):
     """
@@ -2029,3 +2053,135 @@ class SAVPE(nn.Module):
         aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
+
+
+class ConvNeXtLayerNorm(nn.Module):
+    """
+    LayerNorm supporting channels_last (NHWC) and channels_first (NCHW).
+    """
+
+    def __init__(self, normalized_shape: int, eps: float = 1e-6, data_format: str = "channels_last") -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.eps = eps
+        assert data_format in ("channels_last", "channels_first")
+        self.data_format = data_format
+        self.normalized_shape = (normalized_shape,)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.data_format == "channels_last":
+            return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        # channels_first
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        x = self.weight[:, None, None] * x + self.bias[:, None, None]
+        return x
+
+
+class DropPath(nn.Module):
+    """Stochastic Depth per sample (when applied in main path of residual blocks)."""
+
+    def __init__(self, drop_prob: float = 0.0) -> None:
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
+
+
+class ConvNeXtStem(nn.Module):
+    """ConvNeXt stem: Conv4x4 stride 4 followed by LayerNorm (channels_first)."""
+
+    def __init__(self, c1: int, c2: int):
+        super().__init__()
+        self.conv = nn.Conv2d(c1, c2, kernel_size=4, stride=4)
+        self.norm = ConvNeXtLayerNorm(c2, data_format="channels_first")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv(x)
+        return self.norm(x)
+
+
+class ConvNeXtDownsample(nn.Module):
+    """ConvNeXt downsample: LayerNorm (channels_first) then Conv2d 2x2 stride 2."""
+
+    def __init__(self, c1: int, c2: int):
+        super().__init__()
+        self.norm = ConvNeXtLayerNorm(c1, data_format="channels_first")
+        self.conv = nn.Conv2d(c1, c2, kernel_size=2, stride=2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.norm(x)
+        return self.conv(x)
+
+
+class ConvNeXtBlock(nn.Module):
+    """
+    ConvNeXt/ConvNeXtV2 Block (unified):
+    DWConv(k=7) -> channels_last LayerNorm -> 1x1 MLP (4x, GELU) ->
+      - if use_grn: GRN -> 1x1 -> residual -> DropPath (ConvNeXtV2)
+      - else: 1x1 -> layer-scale gamma -> residual -> DropPath (ConvNeXt)
+    Keeps channel dimension; if c1 != c2, input is projected to c2 first.
+    """
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        layer_scale_init_value: float = 1e-6,
+        drop_path: float = 0.0,
+        use_grn: bool = False,
+    ):
+        super().__init__()
+        self.use_grn = use_grn
+        self.proj_in = nn.Conv2d(c1, c2, kernel_size=1) if c1 != c2 else nn.Identity()
+        self.dwconv = nn.Conv2d(c2, c2, kernel_size=7, padding=3, groups=c2)
+        self.norm = ConvNeXtLayerNorm(c2, eps=1e-6, data_format="channels_last")
+        self.pwconv1 = nn.Conv2d(c2, 4 * c2, kernel_size=1)
+        self.act = nn.GELU()
+        self.grn = GRN(4 * c2) if use_grn else None
+        self.pwconv2 = nn.Conv2d(4 * c2, c2, kernel_size=1)
+        self.gamma = (
+            None if use_grn else (nn.Parameter(layer_scale_init_value * torch.ones((c2))) if layer_scale_init_value > 0 else None)
+        )
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shortcut = x
+        x = self.proj_in(x)
+        x = self.dwconv(x)
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm(x)
+        x = x.permute(0, 3, 1, 2)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        if self.grn is not None:
+            x = x.permute(0, 2, 3, 1)
+            x = self.grn(x)
+            x = x.permute(0, 3, 1, 2)
+        x = self.pwconv2(x)
+        if self.gamma is not None:
+            x = self.gamma.view(1, -1, 1, 1) * x
+        x = self.drop_path(x)
+        return shortcut + x
+
+class GRN(nn.Module):
+    """ GRN (Global Response Normalization) layer
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(1, 1, 1, dim))
+        self.beta = nn.Parameter(torch.zeros(1, 1, 1, dim))
+
+    def forward(self, x):
+        Gx = torch.norm(x, p=2, dim=(1,2), keepdim=True)
+        Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + 1e-6)
+        return self.gamma * (x * Nx) + self.beta + x

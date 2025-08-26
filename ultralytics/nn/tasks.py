@@ -68,6 +68,9 @@ from ultralytics.nn.modules import (
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
+    ConvNeXtBlock,
+    ConvNeXtStem,
+    ConvNeXtDownsample,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -92,6 +95,16 @@ from ultralytics.utils.torch_utils import (
     smart_inference_mode,
     time_sync,
 )
+
+# Add custom backbone and neck imports
+try:
+    from .modules.custom_backbone import CustomBackbone, DINOv3Backbone, CLIPBackbone
+    from .modules.custom_neck import CustomNeck, VisionTransformerNeck, AdaptiveNeck
+    CUSTOM_MODULES_AVAILABLE = True
+except ImportError:
+    CUSTOM_MODULES_AVAILABLE = False
+    CustomBackbone = DINOv3Backbone = CLIPBackbone = None
+    CustomNeck = VisionTransformerNeck = AdaptiveNeck = None
 
 
 class BaseModel(torch.nn.Module):
@@ -1642,6 +1655,10 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
+            # ConvNeXt-compatible modules
+            ConvNeXtStem,
+            ConvNeXtDownsample,
+            ConvNeXtBlock,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
