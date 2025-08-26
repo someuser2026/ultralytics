@@ -1749,6 +1749,12 @@ def parse_model(d, ch, verbose=True):
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        elif m in frozenset({ConvNeXtDownsample, ConvNeXtStem}):
+            c1, c2 = ch[f], args[0]
+            args = [c1, c2]
+        elif m in frozenset({ConvNeXtBlock}):
+            c1, c2 = ch[f], args[0]
+            args = [c1, c2, *args[1:]]
         else:
             c2 = ch[f]
 
