@@ -153,10 +153,10 @@ def on_train_end(trainer):
     """Save the best model as an artifact and log final plots at the end of training."""
     _log_plots(trainer.validator.plots, step=trainer.epoch + 1)
     _log_plots(trainer.plots, step=trainer.epoch + 1)
-    art = wb.Artifact(type="model", name=f"run_{wb.run.id}_model")
-    if trainer.best.exists():
-        art.add_file(trainer.best)
-        wb.run.log_artifact(art, aliases=["best"])
+    # art = wb.Artifact(type="model", name=f"run_{wb.run.id}_model")
+    # if trainer.best.exists():
+    #     art.add_file(trainer.best)
+    #     wb.run.log_artifact(art, aliases=["best"])
     # Check if we actually have plots to save
     if trainer.args.plots and hasattr(trainer.validator.metrics, "curves_results"):
         for curve_name, curve_values in zip(trainer.validator.metrics.curves, trainer.validator.metrics.curves_results):

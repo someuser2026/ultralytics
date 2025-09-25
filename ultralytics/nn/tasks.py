@@ -1660,9 +1660,9 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             A2C2f,
             # ConvNeXt-compatible modules
-            ConvNeXtStem,
-            ConvNeXtDownsample,
-            ConvNeXtBlock,
+            # ConvNeXtStem,
+            # ConvNeXtDownsample,
+            # ConvNeXtBlock,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1758,13 +1758,41 @@ def parse_model(d, ch, verbose=True):
         elif m in frozenset({ConvNeXtDownsample, ConvNeXtStem}):
             c1, c2 = ch[f], args[0]
             args = [c1, c2]
+            # print("-"*50)
+            # print("ConvNeXtDownsample/Stem", c1, c2, args)
+            # print("-"*50)
         elif m in frozenset({ConvNeXtBlock}):
             c1, c2 = ch[f], args[0]
-            args = [c1, c2, *args[1:]]
+            drop_path_method = args[5] if len(args) > 5 else "constant"  # Fixed: should be args[5] not args[4]
+    
+            if n > 1 and drop_path_method == "linear":
+                # Calculate progressive drop_path values
+                start_prob = args[2]  # Initial drop_path value from YAML
+                end_prob = args[4]    # max_drop_path from YAML
+                drop_probs = [start_prob + (end_prob - start_prob) * i / (n - 1) for i in range(n)]
+                
+                # Create individual blocks with different drop_path values
+                blocks = []
+                for j in range(n):  # Fixed: use j instead of i to avoid conflict
+                    # ConvNeXtBlock constructor: c1, c2, layer_scale_init_value, drop_path, use_grn, max_drop_path, drop_path_method
+                    block_args = [c1, c2, args[1], drop_probs[j], args[3], args[4], args[5]]
+                    # print("-"*50)
+                    # print("Block args:", block_args)
+                    # print("-"*50)
+                    blocks.append(m(*block_args))
+                m_ = torch.nn.Sequential(*blocks)
+                # n = 1
+            else:
+                # Standard handling for constant drop_path
+                args = [c1, c2, *args[1:]]
+                m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)
         else:
             c2 = ch[f]
 
-        m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+        # Fixed: Move this outside ConvNeXtBlock handling and fix the condition
+        if m not in frozenset({ConvNeXtBlock}):
+            m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+        
         t = str(m)[8:-2].replace("__main__.", "")  # module type
         m_.np = sum(x.numel() for x in m_.parameters())  # number params
         m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type

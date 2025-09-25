@@ -756,7 +756,26 @@ def compute_ap(recall: List[float], precision: List[float]) -> Tuple[float, np.n
 
     return ap, mpre, mrec
 
-
+def compute_f2(precision: np.ndarray, recall: np.ndarray, eps: float = 1e-16) -> np.ndarray:
+    """
+    Compute F2 score from precision and recall arrays.
+    
+    F2 score weights recall twice as much as precision, making it useful when
+    recall is more important than precision (e.g., medical diagnosis, security).
+    
+    Args:
+        precision (np.ndarray): Precision values.
+        recall (np.ndarray): Recall values.
+        eps (float, optional): Small value to avoid division by zero.
+        
+    Returns:
+        (np.ndarray): F2 scores.
+        
+    Formula:
+        F2 = (1 + 2²) * (precision * recall) / (2² * precision + recall)
+        F2 = 5 * (precision * recall) / (4 * precision + recall)
+    """
+    return 5 * (precision * recall) / (4 * precision + recall + eps)
 def ap_per_class(
     tp: np.ndarray,
     conf: np.ndarray,
@@ -790,11 +809,13 @@ def ap_per_class(
         p (np.ndarray): Precision values at threshold given by max F1 metric for each class.
         r (np.ndarray): Recall values at threshold given by max F1 metric for each class.
         f1 (np.ndarray): F1-score values at threshold given by max F1 metric for each class.
+        f2 (np.ndarray): F2-score values at threshold given by max F1 metric for each class.
         ap (np.ndarray): Average precision for each class at different IoU thresholds.
         unique_classes (np.ndarray): An array of unique classes that have data.
         p_curve (np.ndarray): Precision curves for each class.
         r_curve (np.ndarray): Recall curves for each class.
         f1_curve (np.ndarray): F1-score curves for each class.
+        f2_curve (np.ndarray): F2-score curves for each class.
         x (np.ndarray): X-axis values for the curves.
         prec_values (np.ndarray): Precision values at mAP@0.5 for each class.
     """
@@ -840,18 +861,24 @@ def ap_per_class(
 
     # Compute F1 (harmonic mean of precision and recall)
     f1_curve = 2 * p_curve * r_curve / (p_curve + r_curve + eps)
+    
+    # ADD: Compute F2 score (weights recall twice as much as precision)
+    f2_curve = compute_f2(p_curve, r_curve, eps)
+    
     names = {i: names[k] for i, k in enumerate(unique_classes) if k in names}  # dict: only classes that have data
     if plot:
         plot_pr_curve(x, prec_values, ap, save_dir / f"{prefix}PR_curve.png", names, on_plot=on_plot)
         plot_mc_curve(x, f1_curve, save_dir / f"{prefix}F1_curve.png", names, ylabel="F1", on_plot=on_plot)
+        # ADD: Plot F2 curve
+        plot_mc_curve(x, f2_curve, save_dir / f"{prefix}F2_curve.png", names, ylabel="F2", on_plot=on_plot)
         plot_mc_curve(x, p_curve, save_dir / f"{prefix}P_curve.png", names, ylabel="Precision", on_plot=on_plot)
         plot_mc_curve(x, r_curve, save_dir / f"{prefix}R_curve.png", names, ylabel="Recall", on_plot=on_plot)
 
     i = smooth(f1_curve.mean(0), 0.1).argmax()  # max F1 index
-    p, r, f1 = p_curve[:, i], r_curve[:, i], f1_curve[:, i]  # max-F1 precision, recall, F1 values
+    p, r, f1, f2 = p_curve[:, i], r_curve[:, i], f1_curve[:, i], f2_curve[:, i]  # MODIFIED: added f2
     tp = (r * nt).round()  # true positives
     fp = (tp / (p + eps) - tp).round()  # false positives
-    return tp, fp, p, r, f1, ap, unique_classes.astype(int), p_curve, r_curve, f1_curve, x, prec_values
+    return tp, fp, p, r, f1, f2, ap, unique_classes.astype(int), p_curve, r_curve, f1_curve, f2_curve, x, prec_values  # MODIFIED: added f2, f2_curve
 
 
 class Metric(SimpleClass):
@@ -961,6 +988,26 @@ class Metric(SimpleClass):
             (float): The mAP over IoU thresholds of 0.5 - 0.95 in steps of 0.05.
         """
         return self.all_ap.mean() if len(self.all_ap) else 0.0
+    
+    @property
+    def mf1(self) -> float:
+        """
+        Return the Mean F1 score of all classes.
+
+        Returns:
+            (float): The mean F1 score of all classes.
+        """
+        return self.f1.mean() if len(self.f1) else 0.0
+
+    @property
+    def mf2(self) -> float:
+        """
+        Return the Mean F2 score of all classes.
+
+        Returns:
+            (float): The mean F2 score of all classes.
+        """
+        return self.f2.mean() if len(self.f2) else 0.0
 
     def mean_results(self) -> List[float]:
         """Return mean of results, mp, mr, map50, map."""
@@ -992,26 +1039,30 @@ class Metric(SimpleClass):
                 - p (list): Precision for each class.
                 - r (list): Recall for each class.
                 - f1 (list): F1 score for each class.
+                - f2 (list): F2 score for each class.
                 - all_ap (list): AP scores for all classes and all IoU thresholds.
                 - ap_class_index (list): Index of class for each AP score.
                 - p_curve (list): Precision curve for each class.
                 - r_curve (list): Recall curve for each class.
                 - f1_curve (list): F1 curve for each class.
+                - f2_curve (list): F2 curve for each class.
                 - px (list): X values for the curves.
                 - prec_values (list): Precision values for each class.
         """
         (
-            self.p,
-            self.r,
-            self.f1,
-            self.all_ap,
-            self.ap_class_index,
-            self.p_curve,
-            self.r_curve,
-            self.f1_curve,
-            self.px,
-            self.prec_values,
-        ) = results
+        self.p,
+        self.r,
+        self.f1,
+        self.f2,           # ADD this line
+        self.all_ap,
+        self.ap_class_index,
+        self.p_curve,
+        self.r_curve,
+        self.f1_curve,
+        self.f2_curve,     # ADD this line
+        self.px,
+        self.prec_values,
+    ) = results
 
     @property
     def curves(self) -> List:
@@ -1024,6 +1075,7 @@ class Metric(SimpleClass):
         return [
             [self.px, self.prec_values, "Recall", "Precision"],
             [self.px, self.f1_curve, "Confidence", "F1"],
+            [self.px, self.f2_curve, "Confidence", "F2"],  # ADD this line
             [self.px, self.p_curve, "Confidence", "Precision"],
             [self.px, self.r_curve, "Confidence", "Recall"],
         ]
@@ -1124,11 +1176,17 @@ class DetMetrics(SimpleClass, DataExportMixin):
     @property
     def keys(self) -> List[str]:
         """Return a list of keys for accessing specific metrics."""
-        return ["metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)"]
+        return [
+            "metrics/precision(B)", 
+            "metrics/recall(B)", 
+            "metrics/mAP50(B)", 
+            "metrics/mAP50-95(B)",
+            "metrics/f2(B)"
+        ]
 
     def mean_results(self) -> List[float]:
-        """Calculate mean of detected objects & return precision, recall, mAP50, and mAP50-95."""
-        return self.box.mean_results()
+        """Calculate mean of detected objects & return precision, recall, mAP50, mAP50-95, and mF2."""
+        return self.box.mean_results() + [self.box.mf2]
 
     def class_result(self, i: int) -> Tuple[float, float, float, float]:
         """Return the result of evaluating the performance of an object detection model on a specific class."""
@@ -1157,7 +1215,13 @@ class DetMetrics(SimpleClass, DataExportMixin):
     @property
     def curves(self) -> List[str]:
         """Return a list of curves for accessing specific metrics curves."""
-        return ["Precision-Recall(B)", "F1-Confidence(B)", "Precision-Confidence(B)", "Recall-Confidence(B)"]
+        return [
+            "Precision-Recall(B)", 
+            "F1-Confidence(B)", 
+            "F2-Confidence(B)",  # ADD this line
+            "Precision-Confidence(B)", 
+            "Recall-Confidence(B)"
+        ]
 
     @property
     def curves_results(self) -> List[List]:
@@ -1185,6 +1249,7 @@ class DetMetrics(SimpleClass, DataExportMixin):
             "Box-P": self.box.p,
             "Box-R": self.box.r,
             "Box-F1": self.box.f1,
+            "Box-F2": self.box.f2,  # ADD this line
         }
         return [
             {
@@ -1273,12 +1338,13 @@ class SegmentMetrics(DetMetrics):
             "metrics/recall(M)",
             "metrics/mAP50(M)",
             "metrics/mAP50-95(M)",
+            "metrics/f2(M)",
         ]
 
     def mean_results(self) -> List[float]:
         """Return the mean metrics for bounding box and segmentation results."""
-        return DetMetrics.mean_results(self) + self.seg.mean_results()
-
+        return DetMetrics.mean_results(self) + self.seg.mean_results() + [self.seg.mf2]  # ADD seg mf2
+    
     def class_result(self, i: int) -> List[float]:
         """Return classification results for a specified class index."""
         return DetMetrics.class_result(self, i) + self.seg.class_result(i)
@@ -1299,6 +1365,7 @@ class SegmentMetrics(DetMetrics):
         return DetMetrics.curves.fget(self) + [
             "Precision-Recall(M)",
             "F1-Confidence(M)",
+            "F2-Confidence(M)",  # ADD this line for mask F2
             "Precision-Confidence(M)",
             "Recall-Confidence(M)",
         ]
@@ -1329,6 +1396,7 @@ class SegmentMetrics(DetMetrics):
             "Mask-P": self.seg.p,
             "Mask-R": self.seg.r,
             "Mask-F1": self.seg.f1,
+            "Mask-F2": self.seg.f2,  # ADD this line
         }
         summary = DetMetrics.summary(self, normalize, decimals)  # get box summary
         for i, s in enumerate(summary):

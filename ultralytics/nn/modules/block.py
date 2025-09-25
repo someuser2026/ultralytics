@@ -2138,6 +2138,8 @@ class ConvNeXtBlock(nn.Module):
         layer_scale_init_value: float = 1e-6,
         drop_path: float = 0.0,
         use_grn: bool = False,
+        max_drop_path: float = 0.5,
+        drop_path_method: str = "linear",
     ):
         super().__init__()
         self.use_grn = use_grn
