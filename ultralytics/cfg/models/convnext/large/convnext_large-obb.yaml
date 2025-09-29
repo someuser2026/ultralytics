@@ -27,7 +27,7 @@ head:
   - [-1, 3, C2f,                [512]]                     # Layer 13: C2f module with 512 channels (8x)
 
   - [-1, 1, Conv,               [512, 3, 2]]               # Layer 14: Downsample by 2x (from 8x to 16x) using Conv
-  - [[-1, 11], 1, Concat,       [1]]                       # Layer 15: Concatenate Layer 14 (16x) and Layer 11 (16x)
+  - [[-1, 10], 1, Concat,       [1]]                       # Layer 15: Concatenate Layer 14 (16x) and Layer 11 (16x)
   - [-1, 3, C2f,                [1024]]                    # Layer 16: C2f module with 1024 channels (16x)
 
   - [-1, 1, Conv,               [1024, 3, 2]]              # Layer 17: Downsample by 2x (from 16x to 32x) using Conv

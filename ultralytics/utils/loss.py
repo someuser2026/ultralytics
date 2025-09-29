@@ -1,6 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -296,6 +296,201 @@ class v8DetectionLoss:
 
         return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
 
+class LovaszHingeLoss(nn.Module):
+    """
+    Lovasz-Hinge loss for binary segmentation (IoU/Jaccard surrogate).
+
+    This module implements the binary Lovasz extension on *logits* as introduced in:
+        Berman et al., "The Lovasz-Softmax loss: A tractable surrogate for the optimization of the IoU measure".
+
+    It is well-suited for tasks where boundary exactness is ambiguous and IoU alignment is desired.
+
+    Args:
+        ignore_index (int, optional): Label value to ignore in the loss. Defaults to -100.
+        per_image (bool, optional): If True, compute loss per instance/map then return a vector (N,).
+                                    If False, expects flattened (P,) inputs. Defaults to True.
+    Returns:
+        torch.Tensor: If `per_image=True`, returns a tensor of shape (N,) with the loss per instance.
+                      If `per_image=False`, returns a scalar tensor.
+
+    Notes:
+        * Input must be raw logits (no sigmoid). Targets must be {0,1} or {0,1,ignore_index}.
+        * For multi-class segmentation prefer the Lovasz-Softmax variant; for binary masks per instance,
+          Lovasz-Hinge is typically preferred and lighter-weight.
+    """
+
+    def __init__(self, ignore_index: int = -100, per_image: bool = True):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.per_image = per_image
+
+    @staticmethod
+    def _lovasz_grad(gt_sorted: torch.Tensor) -> torch.Tensor:
+        """Compute gradient of the Lovasz extension w.r.t. sorted errors."""
+        p = gt_sorted.sum()
+        if p == 0:
+            return gt_sorted.new_zeros(gt_sorted.numel())
+        intersection = p - gt_sorted.cumsum(0)
+        union = p + (1 - gt_sorted).cumsum(0)
+        jaccard = 1.0 - intersection / union
+        if gt_sorted.numel() > 1:
+            jaccard[1:] = jaccard[1:] - jaccard[:-1]
+        return jaccard
+
+    def _flat(self, logits: torch.Tensor, targets: torch.Tensor) -> tuple:
+        """Flatten logits/targets and drop ignore_index."""
+        logits = logits.contiguous().view(-1)
+        targets = targets.contiguous().view(-1)
+        if self.ignore_index is not None:
+            valid = targets != self.ignore_index
+            return logits[valid], targets[valid]
+        return logits, targets
+
+    def _lovasz_hinge_flat(self, logits_flat: torch.Tensor, targets_flat: torch.Tensor) -> torch.Tensor:
+        """Binary Lovasz-Hinge on flattened logits/targets."""
+        if targets_flat.numel() == 0:
+            return logits_flat.new_tensor(0.0)
+        # Map {0,1} -> {-1,+1} margins
+        signs = 2.0 * targets_flat.float() - 1.0
+        errors = 1.0 - logits_flat * signs  # margin errors
+        errors_sorted, perm = torch.sort(errors, descending=True)
+        gt_sorted = targets_flat[perm]
+        grad = self._lovasz_grad(gt_sorted)
+        return torch.dot(F.relu(errors_sorted), grad)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Compute Lovasz-Hinge loss.
+
+        Args:
+            logits (Tensor): Raw logits. If `per_image=True`, shape (N, H, W).
+                             If `per_image=False`, provide flattened (P,).
+            targets (Tensor): Binary targets with same shape, values in {0,1} or ignore_index.
+
+        Returns:
+            Tensor: Loss per instance (N,) if `per_image=True`; else a scalar tensor.
+        """
+        if self.per_image:
+            assert logits.dim() == 3 and targets.dim() == 3, "Expect (N,H,W) when per_image=True."
+            N = logits.shape[0]
+            out = logits.new_zeros(N)
+            for i in range(N):
+                l_flat, y_flat = self._flat(logits[i], targets[i])
+                out[i] = self._lovasz_hinge_flat(l_flat, y_flat)
+            return out
+        # flattened mode
+        l_flat, y_flat = self._flat(logits, targets)
+        return self._lovasz_hinge_flat(l_flat, y_flat)
+
+
+def dice_loss_with_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    Dice loss computed on probabilities derived from logits.
+
+    Args:
+        logits (Tensor): Raw logits of shape (N, H, W).
+        targets (Tensor): Binary targets (N, H, W).
+        eps (float): Epsilon for numerical stability.
+
+    Returns:
+        Tensor: Per-instance Dice loss of shape (N,).
+    """
+    probs = torch.sigmoid(logits)
+    num = 2.0 * (probs * targets).sum(dim=(1, 2))
+    den = (probs * probs).sum(dim=(1, 2)) + (targets * targets).sum(dim=(1, 2)) + eps
+    return 1.0 - (num + eps) / den
+
+
+class MixedMaskLoss(nn.Module):
+    """
+    Mixed segmentation loss for proto-head models:
+    Lovasz-Hinge (IoU surrogate) + Dice (with logits) + BCE-with-logits.
+
+    Designed to operate on proto-assembled, cropped per-instance logits.
+
+    Args:
+        w_lovasz (float): Weight for Lovasz-Hinge term. Default: 1.0
+        w_dice (float): Weight for Dice term. Default: 0.3
+        w_bce (float): Weight for BCE-with-logits term. Default: 0.2
+        ignore_index (int): Ignore label for targets. Default: -100
+        area_normalize (bool): If True, divide each instance loss by its area to prevent domination by large objects.
+                               Default: True
+        lovasz (LovaszHingeLoss | None): Optional external Lovasz module; if None, a default is constructed.
+
+    Forward Args:
+        logits (Tensor): Assembled instance logits, shape (N, H, W), raw (no sigmoid).
+        targets (Tensor): Binary targets, shape (N, H, W).
+        xyxy (Tensor): Instance boxes in mask-space for cropping, shape (N, 4).
+        area (Tensor): Per-instance areas, shape (N,).
+        crop_mask_fn (Callable): Function(tensor, xyxy) -> cropped tensor with shape (N, h, w).
+
+    Returns:
+        Tensor: Scalar total loss (sum over instances after weighting/normalisation).
+
+    Notes:
+        * Keep BCE/Dice weights modest: Lovasz drives IoU alignment; Dice/BCE stabilise early training.
+        * Works seamlessly with Ultralytics' proto head where masks are built via einsum(coeffs, prototypes).
+    """
+
+    def __init__(
+        self,
+        w_lovasz: float = 1.0,
+        w_dice: float = 0.3,
+        w_bce: float = 0.2,
+        ignore_index: int = -100,
+        area_normalize: bool = True,
+        lovasz: Optional[LovaszHingeLoss] = None,
+    ):
+        super().__init__()
+        self.w_lovasz = float(w_lovasz)
+        self.w_dice = float(w_dice)
+        self.w_bce = float(w_bce)
+        self.area_normalize = area_normalize
+        self.ignore_index = ignore_index
+        self.lovasz = lovasz if lovasz is not None else LovaszHingeLoss(ignore_index=ignore_index, per_image=True)
+
+    def forward(
+        self,
+        logits: torch.Tensor,          # (N, H, W), raw logits
+        targets: torch.Tensor,         # (N, H, W), {0,1}
+        xyxy: torch.Tensor,            # (N, 4), in mask-space
+        area: torch.Tensor,            # (N,)
+        crop_mask_fn: callable,        # callable(tensor, xyxy) -> (N, h, w)
+    ) -> torch.Tensor:
+
+        if logits.numel() == 0:
+            return logits.new_tensor(0.0)
+
+        # Crop logits and targets to instance support
+        logits_c = crop_mask_fn(logits, xyxy)   # (N, h, w)
+        targets_c = crop_mask_fn(targets, xyxy) # (N, h, w)
+
+        # (1) Lovasz-Hinge per instance (N,)
+        lovasz_vec = self.lovasz(logits_c, targets_c)  # (N,)
+
+        # (2) Dice per instance (N,)
+        dice_vec = dice_loss_with_logits(logits_c, targets_c)  # (N,)
+
+        # (3) BCE-with-logits per instance (N,)
+        N = logits_c.shape[0]
+        bce_vals = []
+        for i in range(N):
+            bce_vals.append(
+                F.binary_cross_entropy_with_logits(
+                    logits_c[i:i+1, ...], targets_c[i:i+1, ...], reduction="mean"
+                )
+            )
+        bce_vec = torch.stack(bce_vals) if bce_vals else logits.new_zeros(1, device=logits.device)
+
+        # Optional area normalisation
+        if self.area_normalize:
+            norm = area.clamp_min(1e-6)
+            lovasz_vec = lovasz_vec / norm
+            dice_vec = dice_vec / norm
+            bce_vec = bce_vec / norm
+
+        per_instance = self.w_lovasz * lovasz_vec + self.w_dice * dice_vec + self.w_bce * bce_vec
+        return per_instance.sum()
 
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
@@ -304,6 +499,17 @@ class v8SegmentationLoss(v8DetectionLoss):
         """Initialize the v8SegmentationLoss class with model parameters and mask overlap setting."""
         super().__init__(model)
         self.overlap = model.args.overlap_mask
+
+        self.use_mixed_loss = getattr(model.args, "seg_use_mixed_loss", False)
+        
+        if self.use_mixed_loss:
+            self.mixed_mask_loss = MixedMaskLoss(
+                w_lovasz=float(getattr(model.args, "seg_w_lovasz", 1.0)),
+                w_dice=float(getattr(model.args, "seg_w_dice", 0.3)),
+                w_bce=float(getattr(model.args, "seg_w_bce", 0.2)),
+                ignore_index=int(getattr(model.args, "seg_ignore_index", -100)),
+                area_normalize=bool(getattr(model.args, "seg_area_normalize", True)),
+            )
 
     def __call__(self, preds: Any, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the combined loss for detection and segmentation."""
@@ -388,9 +594,9 @@ class v8SegmentationLoss(v8DetectionLoss):
 
         return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
 
-    @staticmethod
+    # @staticmethod
     def single_mask_loss(
-        gt_mask: torch.Tensor, pred: torch.Tensor, proto: torch.Tensor, xyxy: torch.Tensor, area: torch.Tensor
+        self, gt_mask: torch.Tensor, pred: torch.Tensor, proto: torch.Tensor, xyxy: torch.Tensor, area: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute the instance segmentation loss for a single image.
@@ -409,9 +615,22 @@ class v8SegmentationLoss(v8DetectionLoss):
             The function uses the equation pred_mask = torch.einsum('in,nhw->ihw', pred, proto) to produce the
             predicted masks from the prototype masks and predicted mask coefficients.
         """
+        # Assemble logits from prototypes
         pred_mask = torch.einsum("in,nhw->ihw", pred, proto)  # (n, 32) @ (32, 80, 80) -> (n, 80, 80)
-        loss = F.binary_cross_entropy_with_logits(pred_mask, gt_mask, reduction="none")
-        return (crop_mask(loss, xyxy).mean(dim=(1, 2)) / area).sum()
+        
+        # NEW: Use mixed loss if enabled, otherwise fall back to BCE
+        if self.use_mixed_loss:
+            return self.mixed_mask_loss(
+                logits=pred_mask,
+                targets=gt_mask.float(),
+                xyxy=xyxy,
+                area=area,
+                crop_mask_fn=crop_mask
+            )
+        else:
+            # Original BCE implementation (backward compatible)
+            loss = F.binary_cross_entropy_with_logits(pred_mask, gt_mask, reduction="none")
+            return (crop_mask(loss, xyxy).mean(dim=(1, 2)) / area).sum()
 
     def calculate_segmentation_loss(
         self,

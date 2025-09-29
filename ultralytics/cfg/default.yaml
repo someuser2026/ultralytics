@@ -42,6 +42,13 @@ overlap_mask: True # (bool) merge object masks into a single image mask during t
 mask_ratio: 4 # (int) mask downsample ratio (segment train only)
 # Classification
 dropout: 0.0 # (float) use dropout regularization (classify train only)
+# Segmentation loss settings (Lovasz-Hinge + Dice + BCE)
+seg_use_mixed_loss: False         # Enable mixed loss (default: False for backward compatibility)
+seg_w_lovasz: 1.0                 # Weight for Lovasz-Hinge (IoU surrogate)
+seg_w_dice: 0.3                   # Weight for Dice loss
+seg_w_bce: 0.2                    # Weight for BCE
+seg_area_normalize: False          # Normalize by instance area
+seg_ignore_index: -100            # Label to ignore in loss
 
 # Val/Test settings ----------------------------------------------------------------------------------------------------
 val: True # (bool) validate/test during training
@@ -53,6 +60,7 @@ max_det: 300 # (int) maximum number of detections per image
 half: False # (bool) use half precision (FP16)
 dnn: False # (bool) use OpenCV DNN for ONNX inference
 plots: True # (bool) save plots and images during train/val
+comparison_metric: f2 # (str) metric to use for comparision, choices=[fitness, f1, f2]
 
 # Predict settings -----------------------------------------------------------------------------------------------------
 source: # (str, optional) source directory for images or videos
