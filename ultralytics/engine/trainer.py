@@ -682,8 +682,8 @@ class BaseTrainer:
             self.comp_metric = f2
         # if not self.best_fitness or self.best_fitness < fitness:
         if not self.best_comp_metric or self.best_comp_metric < self.comp_metric:
-            self.best_comp_metric = self.comp_metric
-        return metrics, f2
+            self.best_comp_metric = copy(self.comp_metric)
+        return metrics, copy(self.comp_metric)
 
     def get_model(self, cfg=None, weights=None, verbose=True):
         """Get model and raise NotImplementedError for loading cfg files."""

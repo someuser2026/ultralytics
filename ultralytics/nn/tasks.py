@@ -71,6 +71,8 @@ from ultralytics.nn.modules import (
     ConvNeXtBlock,
     ConvNeXtStem,
     ConvNeXtDownsample,
+    Timm,
+    DinoV3Backbone
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1751,10 +1753,22 @@ def parse_model(d, ch, verbose=True):
             args = [c1, c2, *args[1:]]
         elif m is CBFuse:
             c2 = ch[f[-1]]
-        elif m in frozenset({TorchVision, Index}):
+        elif m in frozenset({TorchVision}):
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        elif m in frozenset({Index}):
+            c1 = ch[f]
+            idx = args[0]
+            if isinstance(c1, list):  # Handle multi-scale from Timm
+                c2 = c1[idx]
+            else:
+                c2 = c1
+            # print("-"*30)
+            # print("Inside Index")
+            # print("ch:", ch, "idx:", idx, "c1:", c1, "c2:", c2)
+            # print("-"*30)
+            args = [idx]
         elif m in frozenset({ConvNeXtDownsample, ConvNeXtStem}):
             c1, c2 = ch[f], args[0]
             args = [c1, c2]
@@ -1786,11 +1800,30 @@ def parse_model(d, ch, verbose=True):
                 # Standard handling for constant drop_path
                 args = [c1, c2, *args[1:]]
                 m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)
+        elif m is Timm:
+            c1 = ch[f]
+            args[2] = c1
+
+            m_ = m(*args)  # ← Instantiate here!
+    
+            # Extract channels immediately after instantiation
+            if hasattr(m_, 'channels') and isinstance(m_.channels, list):
+                c2 = m_.channels  # [128, 256, 512, 1024]
+            else:
+                raise ValueError("Timm module did not provide channel info")
+        elif m is DinoV3Backbone:
+            c1 = ch[f]
+            c2 = args[2]
+            args[1] = c1
         else:
             c2 = ch[f]
 
         # Fixed: Move this outside ConvNeXtBlock handling and fix the condition
-        if m not in frozenset({ConvNeXtBlock}):
+        if m not in frozenset({ConvNeXtBlock, Timm}):
+            # if m in {Segment, YOLOESegment}:
+            #     print("[DEBUG] Segment sources f =", f)
+            #     print("[DEBUG] Segment in-channels =", [ch[u] for u in f], flush=True)
+
             m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
         
         t = str(m)[8:-2].replace("__main__.", "")  # module type
@@ -1803,6 +1836,10 @@ def parse_model(d, ch, verbose=True):
         if i == 0:
             ch = []
         ch.append(c2)
+        # print("-"*30, flush=True)
+        # print(f"[L{i:02d}] f={f} → c1={ch[f] if isinstance(f, int) and f >= 0 else 'list/concat'} " f"→ c2={c2} type={t}", flush=True)
+        # print(ch, flush=True)
+        # print("-"*30)
     return torch.nn.Sequential(*layers), sorted(save)
 
 

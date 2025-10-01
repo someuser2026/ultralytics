@@ -1,11 +1,12 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Block modules."""
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
@@ -59,6 +60,8 @@ __all__ = (
     "ConvNeXtDownsample",
     "ConvNeXtBlock",
     "GRN",
+    "Timm",
+    "DinoV3Backbone",
 )
 
 
@@ -1692,21 +1695,21 @@ class TorchVision(nn.Module):
             y = self.m(x)
         return y
 
-class DinoV3Backbone(nn.Module):
-    """
-    Load any pre-trained backbone from .pt or .pth file.
+# class DinoV3Backbone(nn.Module):
+#     """
+#     Load any pre-trained backbone from .pt or .pth file.
 
-    This class is designed to easily load any SSL backbone for transfer learning tasks.
+#     This class is designed to easily load any SSL backbone for transfer learning tasks.
 
-    Attributes:
-        m (nn.module): The loaded SSL backbone model.
+#     Attributes:
+#         m (nn.module): The loaded SSL backbone model.
 
-    Args:
-        weights (str): Pre-trained weights to load.
-        unwrap (bool): Whether to unwrap the model.
-        truncate (int): Number of layers to truncate.
-        split (bool): Whether to split the output.
-    """
+#     Args:
+#         weights (str): Pre-trained weights to load.
+#         unwrap (bool): Whether to unwrap the model.
+#         truncate (int): Number of layers to truncate.
+#         split (bool): Whether to split the output.
+#     """
     
 
 class AAttn(nn.Module):
@@ -2186,3 +2189,296 @@ class GRN(nn.Module):
         Gx = torch.norm(x, p=2, dim=(1,2), keepdim=True)
         Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + 1e-6)
         return self.gamma * (x * Nx) + self.beta + x
+class Timm(nn.Module):
+    """
+    Timm module to allow loading any timm model as a feature extractor.
+
+    This class provides a way to load a model from the timm library with pretrained weights,
+    customize input channels with intelligent weight adaptation, and extract multi-scale 
+    features for tasks like detection and segmentation.
+
+    When features_only=True, returns a list of feature tensors at different scales.
+    Use with Index module to select specific scales in YAML configurations.
+
+    Attributes:
+        m (nn.Module): The loaded timm model configured as a feature extractor.
+        out_indices (tuple): Indices of stages to extract features from.
+        channels (list): Output channel dimensions for each feature stage.
+        strides (list): Spatial reduction factors for each feature stage.
+
+    Args:
+        model (str): Name of the timm model to load (e.g., 'convnext_base', 'efficientnet_b0').
+        pretrained (bool, optional): Whether to load pretrained weights. Default is True.
+        in_chans (int, optional): Number of input channels. Default is 3.
+        features_only (bool, optional): If True, extracts multi-scale features as a list. Default is True.
+        out_indices (tuple, optional): Indices of feature stages to output. Default is (1, 2, 3, 4).
+        output_stride (int, optional): Output stride for the model. Default is 32.
+        norm_layer (str, optional): Normalization layer to use. Default is None (model default).
+        stem_mode (str, optional): How to handle non-3 channel inputs when pretrained=True:
+            - 'auto': Automatically adjust stem - repeat for >3 channels, mean for <3 (default)
+            - 'repeat': Repeat RGB weights across channels
+            - 'mean': Average RGB weights across channels
+            - 'kaiming': Reinitialize stem with Kaiming initialization
+            Note: Ignored if in_chans=3 or pretrained=False
+        freeze_stem (bool, optional): Whether to freeze stem weights. Default is False.
+        freeze (bool, optional): Whether to freeze entire backbone. Default is False.
+
+    Example:
+        YAML usage with Index to select specific feature scales:
+        ```yaml
+        backbone:
+          - [-1, 1, Timm, ['convnext_base', True, 3, True, [1,2,3,4]]]  # Layer 0: [P2, P3, P4, P5]
+        
+        head:
+          - [0, 1, Index, [3]]  # Layer 1: Select P5 (32x downsample)
+          - [0, 1, Index, [2]]  # Layer 2: Select P4 (16x downsample)
+          - [[1, 2], 1, Concat, [1]]  # Layer 3: Concatenate P5 and P4
+        ```
+    """
+
+    def __init__(
+        self,
+        model: str,
+        pretrained: bool = True,
+        in_chans: int = 3,
+        features_only: bool = True,
+        out_indices: tuple = (1, 2, 3, 4),
+        output_stride: int = 32,
+        norm_layer: Optional[str] = None,
+        stem_mode: str = 'auto',
+        freeze_stem: bool = False,
+        freeze: bool = False,
+        pure_transformers: bool = True
+    ):
+        """
+        Load the model from timm with specified configuration.
+
+        Args:
+            model (str): Name of the timm model to load.
+            pretrained (bool): Whether to load pretrained weights.
+            in_chans (int): Number of input channels (RGB=3, RGBD=4, grayscale=1, etc.).
+            features_only (bool): Whether to extract multi-scale features.
+            out_indices (tuple): Which feature stages to output (typically 1-4 for P2-P5).
+            output_stride (int): Output stride for the model.
+            norm_layer (str): Normalization layer override.
+            stem_mode (str): Method for adapting pretrained weights to non-3 channel inputs.
+            freeze_stem (bool): Whether to freeze stem weights.
+            freeze (bool): Whether to freeze all backbone parameters.
+        """
+        import timm  # scope for faster 'import ultralytics'
+
+        super().__init__()
+        
+        # Handle non-standard input channels with pretrained weights
+        if pretrained and in_chans != 3:
+            # Load with 3 channels first to get pretrained weights
+            model_kwargs = {
+                'pretrained': True,
+                'in_chans': 3,
+                'features_only': features_only,
+            }
+            
+            if features_only:
+                model_kwargs['out_indices'] = out_indices
+                if not pure_transformers:
+                    model_kwargs['output_stride'] = output_stride
+            
+            if norm_layer is not None:
+                model_kwargs['norm_layer'] = norm_layer
+            
+            self.m = timm.create_model(model, **model_kwargs)
+            
+            # Adapt the stem for different input channels
+            self._adapt_stem(in_chans, stem_mode)
+        else:
+            # Standard loading (no stem adaptation needed)
+            model_kwargs = {
+                'pretrained': pretrained,
+                'in_chans': in_chans,
+                'features_only': features_only,
+            }
+            
+            if features_only:
+                model_kwargs['out_indices'] = out_indices
+                if not pure_transformers:
+                    model_kwargs['output_stride'] = output_stride
+            
+            if norm_layer is not None:
+                model_kwargs['norm_layer'] = norm_layer
+            
+            self.m = timm.create_model(model, **model_kwargs)
+        # Apply freezing
+        if freeze:
+            self._freeze_backbone()
+        elif freeze_stem:
+            self._freeze_stem()
+        
+        # Store configuration
+        self.features_only = features_only
+        self.out_indices = out_indices
+        
+        # Get feature info if available
+        if features_only and hasattr(self.m, 'feature_info'):
+            self.feature_info = self.m.feature_info
+            # channels_all = [info['num_chs'] for info in self.feature_info]
+            # self.channels = [channels_all[i] for i in self.out_indices]
+            # strides_all = [info['reduction'] for info in self.feature_info]
+            # self.strides = [strides_all[i] for i in self.out_indices]
+            self.channels = self.feature_info.channels()
+            self.strides = self.feature_info.reduction()
+            # print("Inside Timm")
+            # print(self.channels, self.strides)
+        else:
+            self.feature_info = None
+            self.channels = None
+            self.strides = None
+    
+    def _adapt_stem(self, in_chans: int, stem_mode: str):
+        """
+        Adapt the stem layer for different input channels while preserving pretrained weights.
+        
+        Args:
+            in_chans (int): Target number of input channels.
+            stem_mode (str): Method for weight adaptation.
+        """
+        # Find the first conv layer
+        first_conv = None
+        for name, module in self.m.named_modules():
+            if isinstance(module, nn.Conv2d):
+                first_conv = (name, module)
+                break
+        
+        if first_conv is None:
+            raise ValueError("Could not find first conv layer in model")
+        
+        name, conv = first_conv
+        old_weight = conv.weight.data
+        
+        # Create new conv layer with target input channels
+        new_conv = nn.Conv2d(
+            in_chans,
+            conv.out_channels,
+            kernel_size=conv.kernel_size,
+            stride=conv.stride,
+            padding=conv.padding,
+            bias=conv.bias is not None
+        )
+        
+        # Handle weight initialization based on stem_mode
+        with torch.no_grad():
+            if stem_mode == 'repeat' or (stem_mode == 'auto' and in_chans > 3):
+                # Repeat weights across channels (good for RGBD, multispectral, etc.)
+                repeat_times = (in_chans + 2) // 3
+                repeated = old_weight.repeat(1, repeat_times, 1, 1)
+                new_conv.weight.data = repeated[:, :in_chans, :, :]
+            elif stem_mode == 'mean' or (stem_mode == 'auto' and in_chans < 3):
+                # Average weights (good for grayscale)
+                new_conv.weight.data = old_weight.mean(dim=1, keepdim=True).repeat(1, in_chans, 1, 1)
+            elif stem_mode == 'kaiming':
+                # Reinitialize from scratch
+                nn.init.kaiming_normal_(new_conv.weight, mode='fan_out', nonlinearity='relu')
+            
+            if conv.bias is not None:
+                new_conv.bias.data = conv.bias.data
+        
+        # Replace the conv layer in the model
+        parent_name = '.'.join(name.split('.')[:-1]) if '.' in name else ''
+        attr_name = name.split('.')[-1]
+        
+        if parent_name:
+            parent = dict(self.m.named_modules())[parent_name]
+        else:
+            parent = self.m
+        
+        setattr(parent, attr_name, new_conv)
+    
+    def _freeze_stem(self):
+        """Freeze the stem/first few layers only."""
+        frozen = False
+        for name, param in self.m.named_parameters():
+            if 'stem' in name.lower() or 'conv1' in name.lower() or name.startswith('0.'):
+                param.requires_grad = False
+                frozen = True
+            elif frozen:
+                break
+    
+    def _freeze_backbone(self):
+        """Freeze all parameters in the backbone."""
+        for param in self.m.parameters():
+            param.requires_grad = False
+        # Set model to eval mode to freeze batch norm statistics
+        self.m.eval()
+    
+    def train(self, mode: bool = True):
+        """
+        Override train mode to keep backbone in eval if frozen.
+        
+        Args:
+            mode (bool): Whether to set training mode (True) or evaluation mode (False).
+        
+        Returns:
+            self
+        """
+        super().train(mode)
+        # Keep backbone in eval mode if any parameters are frozen
+        if any(not p.requires_grad for p in self.m.parameters()):
+            self.m.eval()
+        return self
+
+    def forward(self, x: torch.Tensor) -> Union[torch.Tensor, List[torch.Tensor]]:
+        """
+        Forward pass through the model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W).
+
+        Returns:
+            (torch.Tensor | List[torch.Tensor]): 
+                - If features_only=True: List of feature tensors at different scales
+                - If features_only=False: Single output tensor
+        """
+        return self.m(x)
+    
+    def get_channel_info(self) -> Optional[dict]:
+        """
+        Get information about output channels and strides.
+
+        Returns:
+            (dict | None): Dictionary containing 'channels' and 'strides' lists, or None if not available.
+        """
+        if self.channels is not None and self.strides is not None:
+            return {
+                'channels': self.channels,
+                'strides': self.strides,
+                'out_indices': self.out_indices
+            }
+        return None
+
+class DinoV3Backbone(nn.Module):
+    """
+    Use to load any dinov3 backbone saved as a .pt file into as a module in the framework. Can be used to extract intermediate features.
+
+    Attributes:
+        m (nn.module): The loaded .pt file as a torch module
+    """
+    def __init__(self, filepath: str, in_channels: int = 3, out_channels: int = 1024, freeze: bool = True, out_indices: int | list[int] = [23], weights_only: bool = False):
+        """
+        """
+        try:
+            device = 0 if torch.cuda.is_available() else "cpu"
+            self.m = torch.load(filepath, weights_only = weights_only, map_location = torch.device(device))
+            if isinstance(out_indices, int):
+                self.out_indices = range(out_indices)
+            self.out_indices = out_indices
+            self.out_channels = out_channels
+            if freeze:
+                for p in self.m.parameters():
+                    p.requires_grad = False
+            self.m.eval()
+        except Exception as e:
+            raise e
+    
+    def forward(self, x):
+        feats = self.m.get_intermediate_layers(x, n = self.out_indices, reshape = True, norm = True)
+        # feats_small = [i.view()]]
+        return feats

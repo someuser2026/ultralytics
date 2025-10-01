@@ -65,6 +65,8 @@ from .block import (
     ConvNeXtDownsample,
     ConvNeXtBlock,
     GRN,
+    Timm,
+    DinoV3Backbone
 )
 from .conv import (
     CBAM,
@@ -192,4 +194,6 @@ __all__ = (
     "ConvNeXtBlock",
     "GRN",
     "ConvNeXtV2Block",
+    "Timm",
+    "DinoV3Backbone"
 )
