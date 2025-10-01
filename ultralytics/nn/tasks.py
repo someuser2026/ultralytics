@@ -1811,10 +1811,10 @@ def parse_model(d, ch, verbose=True):
                 c2 = m_.channels  # [128, 256, 512, 1024]
             else:
                 raise ValueError("Timm module did not provide channel info")
-        elif m is DinoV3Backbone:
-            c1 = ch[f]
-            c2 = args[2]
-            args[1] = c1
+        # elif m is DinoV3Backbone:
+        #     c1 = ch[f]
+        #     c2 = args[2]
+        #     args[1] = c1
         else:
             c2 = ch[f]
 

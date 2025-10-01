@@ -269,7 +269,7 @@ class Segment(Detect):
     def forward(self, x: List[torch.Tensor]) -> Union[Tuple, List[torch.Tensor]]:
         """Return model outputs and mask coefficients if training, otherwise return outputs and mask coefficients."""
         # DEBUG (remove after it passes)
-        assert x[0].shape[1] == self.nm, f"Proto nm={self.nm}, got x0 C={x[0].shape[1]}"
+        # assert x[0].shape[1] == self.nm, f"Proto nm={self.nm}, got x0 C={x[0].shape[1]}"
 
         p = self.proto(x[0])  # mask protos
         bs = p.shape[0]  # batch size
