@@ -2222,6 +2222,8 @@ class Timm(nn.Module):
             Note: Ignored if in_chans=3 or pretrained=False
         freeze_stem (bool, optional): Whether to freeze stem weights. Default is False.
         freeze (bool, optional): Whether to freeze entire backbone. Default is False.
+        pure_transformers (bool, optional): Whether model is a pure transformer. Default is True.
+        dynamic_img_size (bool, optional): Allow dynamic input sizes (disables strict size checks). Default is True.
 
     Example:
         YAML usage with Index to select specific feature scales:
@@ -2248,7 +2250,8 @@ class Timm(nn.Module):
         stem_mode: str = 'auto',
         freeze_stem: bool = False,
         freeze: bool = False,
-        pure_transformers: bool = True
+        pure_transformers: bool = True,
+        dynamic_img_size: bool = False
     ):
         """
         Load the model from timm with specified configuration.
@@ -2264,71 +2267,231 @@ class Timm(nn.Module):
             stem_mode (str): Method for adapting pretrained weights to non-3 channel inputs.
             freeze_stem (bool): Whether to freeze stem weights.
             freeze (bool): Whether to freeze all backbone parameters.
+            pure_transformers (bool): Whether the model is a pure transformer (affects output_stride usage).
+            dynamic_img_size (bool): Allow dynamic input image sizes (disables strict size checking).
         """
         import timm  # scope for faster 'import ultralytics'
 
         super().__init__()
         
-        # Handle non-standard input channels with pretrained weights
-        if pretrained and in_chans != 3:
-            # Load with 3 channels first to get pretrained weights
-            model_kwargs = {
-                'pretrained': True,
-                'in_chans': 3,
-                'features_only': features_only,
-            }
-            
+        # Store configuration first
+        self.features_only = features_only
+        self.out_indices = out_indices
+        self.model_name = model
+        self.dynamic_img_size = dynamic_img_size
+        
+        # Try to create model with features_only first to validate out_indices
+        try:
+            # Handle non-standard input channels with pretrained weights
+            if pretrained and in_chans != 3:
+                # Load with 3 channels first to get pretrained weights
+                model_kwargs = {
+                    'pretrained': True,
+                    'in_chans': 3,
+                    'features_only': features_only,
+                }
+                
+                if features_only:
+                    model_kwargs['out_indices'] = out_indices
+                    if not pure_transformers:
+                        model_kwargs['output_stride'] = output_stride
+                
+                if norm_layer is not None:
+                    model_kwargs['norm_layer'] = norm_layer
+                
+                self.m = timm.create_model(model, **model_kwargs)
+                
+                # Adapt the stem for different input channels
+                self._adapt_stem(in_chans, stem_mode)
+            else:
+                # Standard loading (no stem adaptation needed)
+                model_kwargs = {
+                    'pretrained': pretrained,
+                    'in_chans': in_chans,
+                    'features_only': features_only,
+                }
+                
+                if features_only:
+                    model_kwargs['out_indices'] = out_indices
+                    if not pure_transformers:
+                        model_kwargs['output_stride'] = output_stride
+                
+                if norm_layer is not None:
+                    model_kwargs['norm_layer'] = norm_layer
+                
+                self.m = timm.create_model(model, **model_kwargs)
+                
+        except Exception as e:
+            print(f"Error creating model with features_only={features_only}, out_indices={out_indices}: {e}")
             if features_only:
-                model_kwargs['out_indices'] = out_indices
-                if not pure_transformers:
-                    model_kwargs['output_stride'] = output_stride
-            
-            if norm_layer is not None:
-                model_kwargs['norm_layer'] = norm_layer
-            
-            self.m = timm.create_model(model, **model_kwargs)
-            
-            # Adapt the stem for different input channels
-            self._adapt_stem(in_chans, stem_mode)
-        else:
-            # Standard loading (no stem adaptation needed)
-            model_kwargs = {
-                'pretrained': pretrained,
-                'in_chans': in_chans,
-                'features_only': features_only,
-            }
-            
-            if features_only:
-                model_kwargs['out_indices'] = out_indices
-                if not pure_transformers:
-                    model_kwargs['output_stride'] = output_stride
-            
-            if norm_layer is not None:
-                model_kwargs['norm_layer'] = norm_layer
-            
-            self.m = timm.create_model(model, **model_kwargs)
+                print(f"Attempting to create model with default out_indices...")
+                # Try with default out_indices
+                try:
+                    model_kwargs = {
+                        'pretrained': pretrained,
+                        'in_chans': in_chans,
+                        'features_only': True,
+                    }
+                    if norm_layer is not None:
+                        model_kwargs['norm_layer'] = norm_layer
+                    
+                    self.m = timm.create_model(model, **model_kwargs)
+                    print(f"Success! Model created with default feature extraction.")
+                    
+                    # Update out_indices to match what the model actually provides
+                    if hasattr(self.m, 'feature_info'):
+                        actual_indices = list(range(len(self.m.feature_info)))
+                        print(f"Available feature indices: {actual_indices}")
+                        self.out_indices = tuple(actual_indices)
+                except Exception as e2:
+                    raise ValueError(f"Failed to create model '{model}': {e2}")
+            else:
+                raise
+        
         # Apply freezing
         if freeze:
             self._freeze_backbone()
         elif freeze_stem:
             self._freeze_stem()
         
-        # Store configuration
-        self.features_only = features_only
-        self.out_indices = out_indices
+        # Enable dynamic image size if requested (for Vision Transformers)
+        if dynamic_img_size:
+            self._enable_dynamic_img_size()
         
-        # Get feature info if available
-        if features_only and hasattr(self.m, 'feature_info'):
-            self.feature_info = self.m.feature_info
-            # channels_all = [info['num_chs'] for info in self.feature_info]
-            # self.channels = [channels_all[i] for i in self.out_indices]
-            # strides_all = [info['reduction'] for info in self.feature_info]
-            # self.strides = [strides_all[i] for i in self.out_indices]
-            self.channels = self.feature_info.channels()
-            self.strides = self.feature_info.reduction()
-            # print("Inside Timm")
-            # print(self.channels, self.strides)
-        else:
+        # Get feature info with robust fallback
+        self._extract_feature_info(in_chans)
+    
+    def _enable_dynamic_img_size(self):
+        """
+        Enable dynamic image size support for Vision Transformers and other models
+        that have strict image size requirements.
+        """
+        # Find and modify PatchEmbed modules to allow dynamic sizes
+        modified_count = 0
+        for name, module in self.m.named_modules():
+            # Handle timm PatchEmbed
+            if module.__class__.__name__ == 'PatchEmbed':
+                if hasattr(module, 'strict_img_size'):
+                    module.strict_img_size = False
+                    modified_count += 1
+                if hasattr(module, 'dynamic_img_pad'):
+                    module.dynamic_img_pad = True
+                # Set img_size to None to allow any size
+                if hasattr(module, 'img_size'):
+                    module.img_size = None
+        
+        if modified_count > 0:
+            print(f"✓ Enabled dynamic image size for model '{self.model_name}' ({modified_count} PatchEmbed modules modified)")
+    
+    def _extract_feature_info(self, in_chans: int):
+        """
+        Extract feature information from the model with robust fallback mechanisms.
+        
+        Args:
+            in_chans (int): Number of input channels.
+        """
+        if not self.features_only:
+            # Non-feature extraction mode - probe to get single output
+            print(f"Warning: Model '{self.model_name}' loaded with features_only=False")
+            print("Probing model to determine output channels...")
+            self._probe_model_features(in_chans)
+            return
+        
+        # Try to get feature info from timm's feature_info
+        if hasattr(self.m, 'feature_info'):
+            try:
+                self.feature_info = self.m.feature_info
+                
+                # Try different methods to extract channels and strides
+                if hasattr(self.feature_info, 'channels') and callable(self.feature_info.channels):
+                    self.channels = self.feature_info.channels()
+                elif hasattr(self.feature_info, 'info') and isinstance(self.feature_info.info, list):
+                    # Older timm versions
+                    self.channels = [info['num_chs'] for info in self.feature_info.info]
+                elif isinstance(self.feature_info, list):
+                    # Fallback: directly access as list
+                    self.channels = [info['num_chs'] for info in self.feature_info]
+                else:
+                    raise AttributeError("Cannot extract channels from feature_info")
+                
+                if hasattr(self.feature_info, 'reduction') and callable(self.feature_info.reduction):
+                    self.strides = self.feature_info.reduction()
+                elif hasattr(self.feature_info, 'info') and isinstance(self.feature_info.info, list):
+                    self.strides = [info['reduction'] for info in self.feature_info.info]
+                elif isinstance(self.feature_info, list):
+                    self.strides = [info['reduction'] for info in self.feature_info]
+                else:
+                    raise AttributeError("Cannot extract strides from feature_info")
+                
+                print(f"✓ Extracted feature info from model '{self.model_name}':")
+                print(f"  Channels: {self.channels}")
+                print(f"  Strides: {self.strides}")
+                return
+                
+            except Exception as e:
+                print(f"Warning: Could not extract feature info from feature_info attribute: {e}")
+        
+        # Fallback: probe the model with a dummy input
+        print(f"Warning: Model '{self.model_name}' does not have feature_info")
+        print("Probing with dummy input...")
+        self._probe_model_features(in_chans)
+    
+    def _probe_model_features(self, in_chans: int):
+        """
+        Probe the model with a dummy input to determine output channels and strides.
+        
+        Args:
+            in_chans (int): Number of input channels.
+        """
+        import torch
+        
+        try:
+            # Create a dummy input (must match expected input size for some models)
+            # Try common sizes
+            for size in [256, 224, 384, 512]:
+                try:
+                    dummy_input = torch.randn(1, in_chans, size, size)
+                    
+                    # Run forward pass
+                    was_training = self.m.training
+                    self.m.eval()
+                    with torch.no_grad():
+                        outputs = self.m(dummy_input)
+                    if was_training:
+                        self.m.train()
+                    
+                    if isinstance(outputs, (list, tuple)):
+                        self.channels = [out.shape[1] for out in outputs]
+                        # Calculate strides based on spatial dimensions
+                        self.strides = [size // out.shape[2] for out in outputs]
+                    else:
+                        # Single output
+                        self.channels = [outputs.shape[1]]
+                        self.strides = [size // outputs.shape[2]]
+                    
+                    self.feature_info = {
+                        'channels': self.channels,
+                        'reduction': self.strides,
+                        'method': 'probed',
+                        'input_size': size
+                    }
+                    
+                    print(f"✓ Probed features successfully (input_size={size}):")
+                    print(f"  Channels: {self.channels}")
+                    print(f"  Strides: {self.strides}")
+                    return
+                    
+                except Exception as e:
+                    if size == 512:  # Last attempt failed
+                        raise e
+                    continue
+            
+        except Exception as e:
+            # Last resort: set reasonable defaults or raise error
+            print(f"✗ Error: Could not probe model features: {e}")
+            print(f"Model '{self.model_name}' may not support the requested configuration.")
+            
+            # Set None to trigger error in parse_model with helpful message
             self.feature_info = None
             self.channels = None
             self.strides = None
@@ -2349,7 +2512,9 @@ class Timm(nn.Module):
                 break
         
         if first_conv is None:
-            raise ValueError("Could not find first conv layer in model")
+            print(f"Warning: Could not find first conv layer in model '{self.model_name}'")
+            print("Model may be a pure transformer or have non-standard architecture")
+            return
         
         name, conv = first_conv
         old_weight = conv.weight.data
@@ -2391,6 +2556,7 @@ class Timm(nn.Module):
             parent = self.m
         
         setattr(parent, attr_name, new_conv)
+        print(f"✓ Adapted stem layer '{name}' for {in_chans} input channels (mode: {stem_mode})")
     
     def _freeze_stem(self):
         """Freeze the stem/first few layers only."""

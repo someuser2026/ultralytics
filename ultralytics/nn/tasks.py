@@ -422,7 +422,9 @@ class DetectionModel(BaseModel):
         # Build strides
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
-            s = 256  # 2x min stride
+            s = deepcopy(self.yaml["stride"])  # 2x min stride
+            del self.yaml["stride"]
+            # s = 256
             m.inplace = self.inplace
 
             def _forward(x):
