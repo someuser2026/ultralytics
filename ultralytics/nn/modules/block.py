@@ -10,7 +10,7 @@ import os
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
-from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
+from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad, SE
 from .transformer import TransformerBlock
 
 __all__ = (
@@ -61,7 +61,11 @@ __all__ = (
     "ConvNeXtBlock",
     "GRN",
     "Timm",
-    "DinoV3Backbone",
+    # "DinoV3Backbone",
+    "MaxMBConv",
+    "WindowSA",
+    "GridSA",
+    "MaxViTBlock",
 )
 
 
@@ -2620,31 +2624,311 @@ class Timm(nn.Module):
             }
         return None
 
-class DinoV3Backbone(nn.Module):
+
+
+# class DinoV3Backbone(nn.Module):
+#     """
+#     Use to load any dinov3 backbone saved as a .pt file into as a module in the framework. Can be used to extract intermediate features.
+
+#     Attributes:
+#         m (nn.module): The loaded .pt file as a torch module
+#     """
+#     def __init__(self, filepath: str, in_channels: int = 3, out_channels: int = 1024, freeze: bool = True, out_indices: int | list[int] = [23], weights_only: bool = False):
+#         """
+#         """
+#         try:
+#             device = 0 if torch.cuda.is_available() else "cpu"
+#             self.m = torch.load(filepath, weights_only = weights_only, map_location = torch.device(device))
+#             if isinstance(out_indices, int):
+#                 self.out_indices = range(out_indices)
+#             self.out_indices = out_indices
+#             self.out_channels = out_channels
+#             if freeze:
+#                 for p in self.m.parameters():
+#                     p.requires_grad = False
+#             self.m.eval()
+#         except Exception as e:
+#             raise e
+    
+#     def forward(self, x):
+#         feats = self.m.get_intermediate_layers(x, n = self.out_indices, reshape = True, norm = True)
+#         # feats_small = [i.view()]]
+#         return feats
+
+class MaxMBConv(nn.Module):
     """
-    Use to load any dinov3 backbone saved as a .pt file into as a module in the framework. Can be used to extract intermediate features.
+    Mobile Inverted Bottleneck with Squeeze-and-Excitation.
+
+    This module implements a mobile inverted bottleneck block with expansion, depthwise convolution,
+    SE attention, and projection. Supports residual connection when input and output dimensions match.
 
     Attributes:
-        m (nn.module): The loaded .pt file as a torch module
+        expand (nn.Module): Expansion layer (1x1 conv or identity).
+        dw (DWConv): Depthwise convolution with specified stride.
+        se (SE): Squeeze-and-Excitation block.
+        project (Conv): Projection layer (1x1 conv with linear activation).
+        add (bool): Whether to use residual connection.
+        drop (nn.Module): Dropout layer.
+
+    Examples:
+        >>> mbconv = MaxMBConv(c1=64, c2=128, s=2, expand=4.0)
+        >>> x = torch.randn(1, 64, 56, 56)
+        >>> out = mbconv(x)
+        >>> print(out.shape)
+        torch.Size([1, 128, 28, 28])
     """
-    def __init__(self, filepath: str, in_channels: int = 3, out_channels: int = 1024, freeze: bool = True, out_indices: int | list[int] = [23], weights_only: bool = False):
+
+    def __init__(self, c1: int, c2: int, s: int = 1, expand: float = 4.0, se_rd: int = 4, drop: float = 0.0):
         """
+        Initialize Mobile Inverted Bottleneck block.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            s (int): Stride for depthwise convolution. Default is 1.
+            expand (float): Expansion ratio for hidden dimension. Default is 4.0.
+            se_rd (int): Reduction ratio for SE block. Default is 4.
+            drop (float): Dropout probability. Default is 0.0.
         """
-        try:
-            device = 0 if torch.cuda.is_available() else "cpu"
-            self.m = torch.load(filepath, weights_only = weights_only, map_location = torch.device(device))
-            if isinstance(out_indices, int):
-                self.out_indices = range(out_indices)
-            self.out_indices = out_indices
-            self.out_channels = out_channels
-            if freeze:
-                for p in self.m.parameters():
-                    p.requires_grad = False
-            self.m.eval()
-        except Exception as e:
-            raise e
-    
+        super().__init__()
+        ce = int(round(c1 * expand))
+        self.expand = Conv(c1, ce, k=1, s=1) if ce != c1 else nn.Identity()
+        self.dw = DWConv(ce, ce, k=3, s=s)  # depthwise + BN + act
+        self.se = SE(ce, rd=se_rd)
+        # project with linear act (disable activation inside Conv)
+        self.project = Conv(ce, c2, k=1, s=1, act=False)
+        self.add = (s == 1) and (c1 == c2)
+        self.drop = nn.Dropout2d(p=drop) if drop > 0 else nn.Identity()
+
     def forward(self, x):
-        feats = self.m.get_intermediate_layers(x, n = self.out_indices, reshape = True, norm = True)
-        # feats_small = [i.view()]]
-        return feats
+        """
+        Forward pass through MBConv block.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C1, H, W).
+
+        Returns:
+            (torch.Tensor): Output tensor of shape (B, C2, H//s, W//s).
+        """
+        y = self.expand(x)
+        y = self.dw(y)
+        y = self.se(y)
+        y = self.project(y)
+        y = self.drop(y)
+        return x + y if self.add else y
+
+class WindowSA(nn.Module):
+    """
+    Windowed Self-Attention using TransformerEncoderLayer.
+
+    Divides input into non-overlapping windows and applies self-attention within each window,
+    enabling efficient local attention computation.
+
+    Attributes:
+        proj (nn.Module): Input projection layer (1x1 conv or identity).
+        win (int): Window size.
+        enc (TransformerEncoderLayer): Transformer encoder for attention computation.
+        c2 (int): Output channels.
+
+    Examples:
+        >>> wsa = WindowSA(c1=128, c2=128, win=7, heads=8)
+        >>> x = torch.randn(1, 128, 56, 56)
+        >>> out = wsa(x)
+        >>> print(out.shape)
+        torch.Size([1, 128, 56, 56])
+    """
+
+    def __init__(
+        self, c1: int, c2: int, win: int = 7, heads: int = 8, mlp: float = 4.0, dropout: float = 0.0, pre_norm: bool = True
+    ):
+        """
+        Initialize Windowed Self-Attention module.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            win (int): Window size for local attention. Default is 7.
+            heads (int): Number of attention heads. Default is 8.
+            mlp (float): MLP expansion ratio. Default is 4.0.
+            dropout (float): Dropout probability. Default is 0.0.
+            pre_norm (bool): Whether to use pre-normalization. Default is True.
+        """
+        super().__init__()
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.win = win
+        self.enc = TransformerEncoderLayer(
+            c1=c2, cm=int(c2 * mlp), num_heads=heads, dropout=dropout, act=nn.GELU(), normalize_before=pre_norm
+        )  # batch_first=True in Ultralytics impl
+        self.c2 = c2
+
+    def forward(self, x):
+        """
+        Forward pass with windowed self-attention.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W).
+
+        Returns:
+            (torch.Tensor): Output tensor of shape (B, C, H, W) after windowed attention.
+        """
+        x = self.proj(x)
+        B, C, H, W = x.shape
+        w = self.win
+        # pad to multiple of w
+        pad_h = (w - H % w) % w
+        pad_w = (w - W % w) % w
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+            H, W = H + pad_h, W + pad_w
+        # (B, C, H, W) -> windows: (B * (H/w) * (W/w), w*w, C)
+        x_ = x.view(B, C, H // w, w, W // w, w).permute(0, 2, 4, 3, 5, 1).contiguous()
+        tokens = x_.view(-1, w * w, C)  # batch_first=True: (N, L, C)
+        tokens = self.enc(tokens)  # attn + FFN
+        # merge back
+        x_ = tokens.view(B, H // w, W // w, w, w, C).permute(0, 5, 1, 3, 2, 4).contiguous()
+        y = x_.view(B, C, H, W)
+        # remove padding
+        return y[:, :, : H - pad_h if pad_h else None, : W - pad_w if pad_w else None]
+
+
+class GridSA(nn.Module):
+    """
+    Grid Self-Attention for sparse global attention.
+
+    Divides the spatial dimensions into a grid of groups (g x g), where each group attends
+    over tokens in the same grid position across all groups, enabling efficient global mixing.
+
+    Attributes:
+        proj (nn.Module): Input projection layer (1x1 conv or identity).
+        g (int): Grid size (number of groups per dimension).
+        enc (TransformerEncoderLayer): Transformer encoder for attention computation.
+
+    Examples:
+        >>> gsa = GridSA(c1=128, c2=128, grid=7, heads=8)
+        >>> x = torch.randn(1, 128, 56, 56)
+        >>> out = gsa(x)
+        >>> print(out.shape)
+        torch.Size([1, 128, 56, 56])
+    """
+
+    def __init__(
+        self, c1: int, c2: int, grid: int = 7, heads: int = 8, mlp: float = 4.0, dropout: float = 0.0, pre_norm: bool = True
+    ):
+        """
+        Initialize Grid Self-Attention module.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            grid (int): Grid size for grouping. Default is 7.
+            heads (int): Number of attention heads. Default is 8.
+            mlp (float): MLP expansion ratio. Default is 4.0.
+            dropout (float): Dropout probability. Default is 0.0.
+            pre_norm (bool): Whether to use pre-normalization. Default is True.
+        """
+        super().__init__()
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.g = grid
+        self.enc = TransformerEncoderLayer(
+            c1=c2, cm=int(c2 * mlp), num_heads=heads, dropout=dropout, act=nn.GELU(), normalize_before=pre_norm
+        )
+
+    def forward(self, x):
+        """
+        Forward pass with grid self-attention.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W).
+
+        Returns:
+            (torch.Tensor): Output tensor of shape (B, C, H, W) after grid attention.
+        """
+        x = self.proj(x)
+        B, C, H, W = x.shape
+        g = self.g
+        # pad so H,W are multiples of g
+        pad_h = (g - H % g) % g
+        pad_w = (g - W % g) % g
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+            H, W = H + pad_h, W + pad_w
+        # (B, C, H, W) -> (B*g*g, (H/g)*(W/g), C)
+        x_ = x.view(B, C, g, H // g, g, W // g).permute(0, 2, 4, 3, 5, 1).contiguous()
+        tokens = x_.view(B * g * g, (H // g) * (W // g), C)
+        tokens = self.enc(tokens)
+        # merge back
+        x_ = tokens.view(B, g, g, H // g, W // g, C).permute(0, 5, 1, 3, 2, 4).contiguous()
+        y = x_.reshape(B, C, H, W)
+        # remove padding
+        return y[:, :, : H - pad_h if pad_h else None, : W - pad_w if pad_w else None]
+
+
+class MaxViTBlock(nn.Module):
+    """
+    MaxViT block combining MBConv with multi-axis attention.
+
+    This block sequentially applies: Mobile Inverted Bottleneck → Window Self-Attention → Grid Self-Attention,
+    providing both local and global feature interactions. Downsampling is applied via stride in MBConv.
+
+    Attributes:
+        mb (MaxMBConv): Mobile inverted bottleneck layer.
+        win (WindowSA): Window self-attention layer.
+        grid (GridSA): Grid self-attention layer.
+
+    Examples:
+        >>> block = MaxViTBlock(c1=128, c2=256, s=2, win=7, grid=7, heads=8)
+        >>> x = torch.randn(1, 128, 56, 56)
+        >>> out = block(x)
+        >>> print(out.shape)
+        torch.Size([1, 256, 28, 28])
+    """
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        win: int = 7,
+        grid: int = 7,
+        heads: int = 8,
+        expand: float = 4.0,
+        se_rd: int = 4,
+        mlp: float = 4.0,
+        s: int = 1,
+        dropout: float = 0.0,
+        pre_norm: bool = True,
+    ):
+        """
+        Initialize MaxViT block.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            win (int): Window size for local attention. Default is 7.
+            grid (int): Grid size for global attention. Default is 7.
+            heads (int): Number of attention heads. Default is 8.
+            expand (float): Expansion ratio for MBConv. Default is 4.0.
+            se_rd (int): Reduction ratio for SE block. Default is 4.
+            mlp (float): MLP expansion ratio for attention blocks. Default is 4.0.
+            s (int): Stride for downsampling (applied in MBConv). Default is 1.
+            dropout (float): Dropout probability. Default is 0.0.
+            pre_norm (bool): Whether to use pre-normalization in attention. Default is True.
+        """
+        super().__init__()
+        self.mb = MaxMBConv(c1, c2, s=s, expand=expand, se_rd=se_rd, drop=dropout)
+        self.win = WindowSA(c2, c2, win=win, heads=heads, mlp=mlp, dropout=dropout, pre_norm=pre_norm)
+        self.grid = GridSA(c2, c2, grid=grid, heads=heads, mlp=mlp, dropout=dropout, pre_norm=pre_norm)
+
+    def forward(self, x):
+        """
+        Forward pass through MaxViT block.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C1, H, W).
+
+        Returns:
+            (torch.Tensor): Output tensor of shape (B, C2, H//s, W//s) after MBConv and multi-axis attention.
+        """
+        x = self.mb(x)
+        x = self.win(x)
+        x = self.grid(x)
+        return x

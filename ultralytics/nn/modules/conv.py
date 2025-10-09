@@ -711,3 +711,47 @@ class Index(nn.Module):
             (torch.Tensor): Selected tensor.
         """
         return x[self.index]
+
+class SE(nn.Module):
+    """
+    Squeeze-and-Excitation block for channel attention.
+
+    This module implements channel-wise attention through global pooling and gating,
+    allowing the network to adaptively recalibrate channel-wise feature responses.
+
+    Attributes:
+        avg (nn.AdaptiveAvgPool2d): Global average pooling layer.
+        fc (nn.Sequential): Two-layer MLP with SiLU activation for channel gating.
+
+    Examples:
+        >>> se = SE(c=256, rd=4)
+        >>> x = torch.randn(1, 256, 14, 14)
+        >>> out = se(x)
+        >>> print(out.shape)
+        torch.Size([1, 256, 14, 14])
+    """
+
+    def __init__(self, c: int, rd: int = 4):
+        """
+        Initialize Squeeze-and-Excitation block.
+
+        Args:
+            c (int): Number of input channels.
+            rd (int): Reduction ratio for hidden dimension. Default is 4.
+        """
+        super().__init__()
+        h = max(c // rd, 4)
+        self.avg = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(nn.Conv2d(c, h, 1), nn.SiLU(), nn.Conv2d(h, c, 1), nn.Sigmoid())
+
+    def forward(self, x):
+        """
+        Apply channel attention to input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W).
+
+        Returns:
+            (torch.Tensor): Output tensor of shape (B, C, H, W) with channel attention applied.
+        """
+        return x * self.fc(self.avg(x))

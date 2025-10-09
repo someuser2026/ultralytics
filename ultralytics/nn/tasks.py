@@ -72,7 +72,8 @@ from ultralytics.nn.modules import (
     ConvNeXtStem,
     ConvNeXtDownsample,
     Timm,
-    DinoV3Backbone
+    # DinoV3Backbone
+    MaxViTBlock,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -423,7 +424,7 @@ class DetectionModel(BaseModel):
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
             s = deepcopy(self.yaml["stride"])  # 2x min stride
-            del self.yaml["stride"]
+            # s = self.yaml.pop("stride")
             # s = 256
             m.inplace = self.inplace
 
@@ -436,6 +437,10 @@ class DetectionModel(BaseModel):
             self.model.eval()  # Avoid changing batch statistics until training begins
             m.training = True  # Setting it to True to properly return strides
             m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
+            # print("-"*50)
+            # print("Inside task.py 439")
+            # print("m.stride:", m.stride)
+            # print("-"*50)
             self.stride = m.stride
             self.model.train()  # Set model back to training(default) mode
             m.bias_init()  # only run once
@@ -1663,6 +1668,7 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
+            MaxViTBlock,
             # ConvNeXt-compatible modules
             # ConvNeXtStem,
             # ConvNeXtDownsample,

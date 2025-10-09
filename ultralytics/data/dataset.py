@@ -221,6 +221,10 @@ class YOLODataset(BaseDataset):
             hyp.cutmix = hyp.cutmix if self.augment and not self.rect else 0.0
             transforms = v8_transforms(self, self.imgsz, hyp)
         else:
+            print("-"*50)
+            print("Inside dataset.py 224")
+            print("self.imgsz:", self.imgsz)
+            print("-"*50)
             transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
         transforms.append(
             Format(

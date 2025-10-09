@@ -66,7 +66,9 @@ from .block import (
     ConvNeXtBlock,
     GRN,
     Timm,
-    DinoV3Backbone
+    MaxViTBlock,
+    MaxMBConv,
+    # DinoV3Backbone
 )
 from .conv import (
     CBAM,

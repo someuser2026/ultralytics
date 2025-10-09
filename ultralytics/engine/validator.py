@@ -181,6 +181,10 @@ class BaseValidator:
             if not (pt or (getattr(model, "dynamic", False) and not model.imx)):
                 self.args.rect = False
             self.stride = model.stride  # used in get_dataloader() for padding
+            # print("-"*50)
+            # print("Inside validator.py 184")
+            # print("stride:", self.stride)
+            # print("-"*50)
             self.dataloader = self.dataloader or self.get_dataloader(self.data.get(self.args.split), self.args.batch)
 
             model.eval()
@@ -201,10 +205,19 @@ class BaseValidator:
             self.batch_i = batch_i
             # Preprocess
             with dt[0]:
+                # print("-"*50)
+                # print("Inside validator.py 204")
+                # print("batch:", batch["img"].shape)
+                # print("-"*50)
                 batch = self.preprocess(batch)
 
             # Inference
             with dt[1]:
+                # print("-"*50)
+                # print("Inside validator.py 209")
+                # print("augment:", augment)
+                # print("batch:", batch["img"].shape)
+                # print("-"*50)
                 preds = model(batch["img"], augment=augment)
 
             # Loss

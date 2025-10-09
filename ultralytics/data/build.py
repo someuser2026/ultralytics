@@ -124,6 +124,10 @@ def build_yolo_dataset(
 ):
     """Build and return a YOLO dataset based on configuration parameters."""
     dataset = YOLOMultiModalDataset if multi_modal else YOLODataset
+    # print("-"*50)
+    # print("Inside build_yolo_dataset 127")
+    # print("stride:", stride)
+    # print("-"*50)
     return dataset(
         img_path=img_path,
         imgsz=cfg.imgsz,
@@ -134,7 +138,7 @@ def build_yolo_dataset(
         cache=cfg.cache or None,
         single_cls=cfg.single_cls or False,
         stride=int(stride),
-        pad=0.0 if mode == "train" else 0.5,
+        pad=0.0 if mode == "train" else 0.0,
         prefix=colorstr(f"{mode}: "),
         task=cfg.task,
         classes=cfg.classes,

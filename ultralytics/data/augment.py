@@ -1621,7 +1621,7 @@ class LetterBox:
         scaleup: bool = True,
         center: bool = True,
         stride: int = 32,
-        padding_value: int = 114,
+        padding_value: int = 0,
         interpolation: int = cv2.INTER_LINEAR,
     ):
         """
@@ -1736,6 +1736,11 @@ class LetterBox:
             labels = self._update_labels(labels, ratio, left, top)
             labels["img"] = img
             labels["resized_shape"] = new_shape
+            # print("-"*50)
+            # print("Inside augment.py 1739")
+            # print("labels img shape:", labels["img"].shape)
+            # print("new_shape:", new_shape)
+            # print("-"*50)
             return labels
         else:
             return img
