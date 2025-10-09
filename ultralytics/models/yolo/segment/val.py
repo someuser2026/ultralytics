@@ -173,25 +173,7 @@ class SegmentationValidator(DetectionValidator):
         if gt_cls.shape[0] == 0 or preds["cls"].shape[0] == 0:
             tp_m = np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)
         else:
-<<<<<<< HEAD
-            pred_masks = preds["masks"]
-            if self.args.overlap_mask:
-                nl = len(gt_cls)
-                index = torch.arange(nl, device=gt_masks.device).view(nl, 1, 1) + 1
-                gt_masks = gt_masks.repeat(nl, 1, 1)  # shape(1,640,640) -> (n,640,640)
-                gt_masks = torch.where(gt_masks == index, 1.0, 0.0)
-            if gt_masks.shape[1:] != pred_masks.shape[1:]:
-                # print("-"*50)
-                # print("Inside segment/val.py 170")
-                # print("gt_masks.shape:", gt_masks.shape)
-                # print("pred_masks.shape:", pred_masks.shape)
-                # print("-"*50)
-                gt_masks = F.interpolate(gt_masks[None], pred_masks.shape[1:], mode="bilinear", align_corners=False)[0]
-                gt_masks = gt_masks.gt_(0.5)
-            iou = mask_iou(gt_masks.view(gt_masks.shape[0], -1), pred_masks.view(pred_masks.shape[0], -1))
-=======
             iou = mask_iou(batch["masks"].flatten(1), preds["masks"].flatten(1))
->>>>>>> origin/main
             tp_m = self.match_predictions(preds["cls"], gt_cls, iou).cpu().numpy()
         tp.update({"tp_m": tp_m})  # update tp with mask IoU
         return tp
