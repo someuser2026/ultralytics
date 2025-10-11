@@ -2329,28 +2329,28 @@ class Timm(nn.Module):
         except Exception as e:
             print(f"Error creating model with features_only={features_only}, out_indices={out_indices}: {e}")
             if features_only:
-                print(f"Attempting to create model with default out_indices...")
-                # Try with default out_indices
+                print(f"Attempting to create model WITHOUT features_only (will use custom feature extraction)...")
+                # Try WITHOUT features_only - load as full model
                 try:
                     model_kwargs = {
                         'pretrained': pretrained,
                         'in_chans': in_chans,
-                        'features_only': True,
+                        'features_only': False,  # KEY CHANGE: Load as full model
                     }
                     if norm_layer is not None:
                         model_kwargs['norm_layer'] = norm_layer
                     
                     self.m = timm.create_model(model, **model_kwargs)
-                    print(f"Success! Model created with default feature extraction.")
+                    print(f"✓ Model loaded as full model (not feature extractor)")
+                    print(f"⚠ Warning: Will attempt to extract features using forward hooks")
                     
-                    # Update out_indices to match what the model actually provides
-                    if hasattr(self.m, 'feature_info'):
-                        actual_indices = list(range(len(self.m.feature_info)))
-                        print(f"Available feature indices: {actual_indices}")
-                        self.out_indices = tuple(actual_indices)
+                    # Set up feature extraction using hooks
+                    self._setup_feature_hooks(out_indices)
+                    
                 except Exception as e2:
                     raise ValueError(f"Failed to create model '{model}': {e2}")
             else:
+                # features_only=False, just re-raise the error
                 raise
         
         # Apply freezing
@@ -2365,6 +2365,51 @@ class Timm(nn.Module):
         
         # Get feature info with robust fallback
         self._extract_feature_info(in_chans)
+    
+    def _setup_feature_hooks(self, out_indices):
+        """
+        Set up forward hooks to extract intermediate features from models that don't support features_only.
+        
+        Args:
+            out_indices (tuple): Indices of layers to extract features from.
+        """
+        self.feature_outputs = {}
+        self.hooks = []
+        
+        # Get all modules
+        modules = list(self.m.named_modules())
+        
+        # For transformers, we typically want to hook into the blocks
+        target_modules = []
+        for name, module in modules:
+            # Look for transformer blocks or stages
+            if 'block' in name.lower() or 'stage' in name.lower() or 'layer' in name.lower():
+                # Skip nested modules
+                if '.' not in name.split('block')[-1].split('stage')[-1].split('layer')[-1]:
+                    target_modules.append((name, module))
+        
+        # If no blocks found, try to use sequential children
+        if not target_modules:
+            for i, (name, module) in enumerate(self.m.named_children()):
+                target_modules.append((name, module))
+        
+        print(f"Found {len(target_modules)} potential feature extraction points")
+        
+        # Register hooks for requested indices
+        for idx in out_indices:
+            if idx < len(target_modules):
+                name, module = target_modules[idx]
+                print(f"  Hooking layer {idx}: {name}")
+                
+                def hook_fn(idx):
+                    def fn(module, input, output):
+                        self.feature_outputs[idx] = output
+                    return fn
+                
+                handle = module.register_forward_hook(hook_fn(idx))
+                self.hooks.append(handle)
+        
+        self._using_hooks = True
     
     def _enable_dynamic_img_size(self):
         """
@@ -2395,14 +2440,19 @@ class Timm(nn.Module):
         Args:
             in_chans (int): Number of input channels.
         """
-        if not self.features_only:
-            # Non-feature extraction mode - probe to get single output
-            print(f"Warning: Model '{self.model_name}' loaded with features_only=False")
-            print("Probing model to determine output channels...")
+        # If using hooks (features_only=True but model doesn't support it), probe to get info
+        if hasattr(self, '_using_hooks') and self._using_hooks:
+            print("Using forward hooks for feature extraction, probing model...")
             self._probe_model_features(in_chans)
             return
         
-        # Try to get feature info from timm's feature_info
+        # If features_only=False, just probe to get single output info
+        if not self.features_only:
+            print(f"Model '{self.model_name}' loaded with features_only=False (single output mode)")
+            self._probe_single_output(in_chans)
+            return
+        
+        # Try to get feature info from timm's feature_info (features_only=True and supported)
         if hasattr(self.m, 'feature_info'):
             try:
                 self.feature_info = self.m.feature_info
@@ -2441,6 +2491,74 @@ class Timm(nn.Module):
         print("Probing with dummy input...")
         self._probe_model_features(in_chans)
     
+    def _probe_single_output(self, in_chans: int):
+        """
+        Probe the model to get single output info (for features_only=False).
+        
+        Args:
+            in_chans (int): Number of input channels.
+        """
+        import torch
+        
+        try:
+            # Try common input sizes
+            for size in [224, 256, 384, 512]:
+                try:
+                    dummy_input = torch.randn(1, in_chans, size, size)
+                    
+                    # Run forward pass
+                    was_training = self.m.training
+                    self.m.eval()
+                    with torch.no_grad():
+                        output = self.m(dummy_input)
+                    if was_training:
+                        self.m.train()
+                    
+                    # Get output shape - should be single tensor
+                    if isinstance(output, (list, tuple)):
+                        # Take last output if multiple
+                        output = output[-1]
+                    
+                    # Determine channels based on output shape
+                    if len(output.shape) == 4:  # (B, C, H, W) or (B, H, W, C)
+                        if output.shape[1] < output.shape[-1]:  # (B, H, W, C)
+                            self.channels = [output.shape[-1]]
+                            self.strides = [size // output.shape[1]]
+                        else:  # (B, C, H, W)
+                            self.channels = [output.shape[1]]
+                            self.strides = [size // output.shape[2]]
+                    elif len(output.shape) == 2:  # (B, num_classes) - classification output
+                        self.channels = [output.shape[1]]
+                        self.strides = [size]  # Full reduction
+                    elif len(output.shape) == 3:  # (B, N, C) - transformer output
+                        self.channels = [output.shape[-1]]
+                        import math
+                        h = int(math.sqrt(output.shape[1]))
+                        self.strides = [size // h if h > 0 else size]
+                    
+                    self.feature_info = {
+                        'channels': self.channels,
+                        'reduction': self.strides,
+                        'method': 'probed_single_output',
+                        'input_size': size
+                    }
+                    
+                    print(f"✓ Single output info (input_size={size}):")
+                    print(f"  Channels: {self.channels}")
+                    print(f"  Strides: {self.strides}")
+                    return
+                    
+                except Exception as e:
+                    if size == 512:  # Last attempt
+                        raise e
+                    continue
+                    
+        except Exception as e:
+            print(f"✗ Error probing single output: {e}")
+            self.feature_info = None
+            self.channels = None
+            self.strides = None
+    
     def _probe_model_features(self, in_chans: int):
         """
         Probe the model with a dummy input to determine output channels and strides.
@@ -2453,9 +2571,13 @@ class Timm(nn.Module):
         try:
             # Create a dummy input (must match expected input size for some models)
             # Try common sizes
-            for size in [256, 224, 384, 512]:
+            for size in [224, 256, 384, 512]:
                 try:
                     dummy_input = torch.randn(1, in_chans, size, size)
+                    
+                    # Clear previous outputs if using hooks
+                    if hasattr(self, '_using_hooks') and self._using_hooks:
+                        self.feature_outputs = {}
                     
                     # Run forward pass
                     was_training = self.m.training
@@ -2465,14 +2587,44 @@ class Timm(nn.Module):
                     if was_training:
                         self.m.train()
                     
+                    # Extract features from hooks if we're using them
+                    if hasattr(self, '_using_hooks') and self._using_hooks:
+                        # Sort by index
+                        sorted_indices = sorted(self.feature_outputs.keys())
+                        outputs = [self.feature_outputs[idx] for idx in sorted_indices]
+                    
                     if isinstance(outputs, (list, tuple)):
-                        self.channels = [out.shape[1] for out in outputs]
-                        # Calculate strides based on spatial dimensions
-                        self.strides = [size // out.shape[2] for out in outputs]
+                        self.channels = []
+                        self.strides = []
+                        for out in outputs:
+                            # Handle transformer outputs (B, H, W, C) or conv outputs (B, C, H, W)
+                            if len(out.shape) == 4:
+                                if out.shape[1] < out.shape[-1]:  # (B, H, W, C)
+                                    self.channels.append(out.shape[-1])
+                                    self.strides.append(size // out.shape[1])
+                                else:  # (B, C, H, W)
+                                    self.channels.append(out.shape[1])
+                                    self.strides.append(size // out.shape[2])
+                            elif len(out.shape) == 3:  # (B, N, C) - flatten tokens
+                                self.channels.append(out.shape[-1])
+                                # Estimate stride from number of tokens
+                                import math
+                                h = int(math.sqrt(out.shape[1]))
+                                self.strides.append(size // h if h > 0 else size)
                     else:
                         # Single output
-                        self.channels = [outputs.shape[1]]
-                        self.strides = [size // outputs.shape[2]]
+                        if len(outputs.shape) == 4:
+                            if outputs.shape[1] < outputs.shape[-1]:  # (B, H, W, C)
+                                self.channels = [outputs.shape[-1]]
+                                self.strides = [size // outputs.shape[1]]
+                            else:  # (B, C, H, W)
+                                self.channels = [outputs.shape[1]]
+                                self.strides = [size // outputs.shape[2]]
+                        elif len(outputs.shape) == 3:  # (B, N, C)
+                            self.channels = [outputs.shape[-1]]
+                            import math
+                            h = int(math.sqrt(outputs.shape[1]))
+                            self.strides = [size // h if h > 0 else size]
                     
                     self.feature_info = {
                         'channels': self.channels,
@@ -2605,9 +2757,19 @@ class Timm(nn.Module):
 
         Returns:
             (torch.Tensor | List[torch.Tensor]): 
-                - If features_only=True: List of feature tensors at different scales
-                - If features_only=False: Single output tensor
+                - If features_only=True with native support: List of feature tensors at different scales
+                - If features_only=True with hooks: List of feature tensors extracted via hooks
+                - If features_only=False: Single output tensor (unchanged from model output)
         """
+        if hasattr(self, '_using_hooks') and self._using_hooks:
+            # Using hooks for feature extraction
+            self.feature_outputs = {}
+            _ = self.m(x)
+            # Return features in order of out_indices
+            sorted_indices = sorted(self.feature_outputs.keys())
+            return [self.feature_outputs[idx] for idx in sorted_indices]
+        
+        # Normal forward pass (either features_only=True with native support, or features_only=False)
         return self.m(x)
     
     def get_channel_info(self) -> Optional[dict]:

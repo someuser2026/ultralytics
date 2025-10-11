@@ -13,6 +13,8 @@ import torch
 from PIL import Image
 from torch.nn import functional as F
 
+import albumentations as A
+
 from ultralytics.data.utils import polygons2masks, polygons2masks_overlap
 from ultralytics.utils import LOGGER, IterableSimpleNamespace, colorstr
 from ultralytics.utils.checks import check_version
@@ -1904,7 +1906,7 @@ class Albumentations:
         - Spatial transforms are handled differently and require special processing for bounding boxes.
     """
 
-    def __init__(self, p: float = 1.0) -> None:
+    def __init__(self, cfg: IterableSimpleNamespace, p: float = 1.0,) -> None:
         """
         Initialize the Albumentations transform object for YOLO bbox formatted parameters.
 
@@ -1943,9 +1945,9 @@ class Albumentations:
             import os
 
             os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"  # suppress Albumentations upgrade message
-            import albumentations as A
+            # import albumentations as A
 
-            check_version(A.__version__, "1.0.3", hard=True)  # version requirement
+            # check_version(A.__version__, "1.0.3", hard=True)  # version requirement
 
             # List of possible spatial transforms
             spatial_transforms = {
@@ -1996,12 +1998,21 @@ class Albumentations:
                 A.Blur(p=0.01),
                 A.MedianBlur(p=0.01),
                 A.ToGray(p=0.01),
-                A.CLAHE(p=0.01),
+                # A.CLAHE(p=0.01),
                 A.RandomBrightnessContrast(p=0.0),
-                A.RandomGamma(p=0.0),
+                # A.RandomGamma(p=0.0),
                 A.ImageCompression(quality_range=(75, 100), p=0.0),
             ]
 
+            albu_photometric = [
+                A.CLAHE(clip_limit = cfg.clahe_clip_limit, tile_grid_size = cfg.clahe_tile_grid_size, p = cfg.clahe_p),
+                A.RandomGamma(gamma_limit = (cfg.gamma_min, cfg.gamma_max), p = cfg.rand_gamma_p),
+                A.UnsharpMask(blur_limit = (cfg.unsharp_blur_limit_min, cfg.unsharp_blur_limit_max), sigma_limit = cfg.unsharp_sigma_limit, alpha = (cfg.unsharp_alpha_min, cfg.unsharp_alpha_max), threshold = cfg.unsharp_threshold, p = cfg.unsharp_p),
+                EdgeBoost(alpha = cfg.edgeboost_alpha, ksize = cfg.edgeboost_ksize, always_apply = False, p = cfg.edgeboost_p),
+                HomomorphicLightNorm(sigma = cfg.homomorphic_sigma, gain = cfg.homomorphic_gain, always_apply = False, p = cfg.homomorphic_p)
+            ]
+
+            T += albu_photometric
             # Compose transforms
             self.contains_spatial = any(transform.__class__.__name__ in spatial_transforms for transform in T)
             self.transform = (
@@ -2074,6 +2085,142 @@ class Albumentations:
 
         return labels
 
+class EdgeBoost(A.ImageOnlyTransform):
+    """
+    Edge enhancement by blending Sobel magnitude into image intensity.
+    
+    Computes edge magnitude using Sobel operators and blends it into the V channel 
+    of HSV color space. Helps delineate weak boundaries without changing image geometry.
+    
+    Args:
+        alpha (float): Blending factor for edge magnitude. Range [0, 1]. Default: 0.25.
+        ksize (int): Sobel kernel size. Must be 1, 3, 5, or 7. Default: 3.
+        always_apply (bool): Whether to always apply the transform. Default: False.
+        p (float): Probability of applying the transform. Default: 0.15.
+    
+    Targets:
+        image
+    
+    Image types:
+        uint8, float32
+    
+    Examples:
+        >>> import albumentations as A
+        >>> transform = A.Compose([EdgeBoost(alpha=0.25, ksize=3, p=0.15)])
+        >>> augmented = transform(image=image)
+        >>> edge_boosted_image = augmented['image']
+    """
+    
+    def __init__(self, alpha: float = 0.25, ksize: int = 3, always_apply: bool = False, p: float = 0.15):
+        """Initialize EdgeBoost transform."""
+        super().__init__(always_apply, p)
+        if ksize not in {1, 3, 5, 7}:
+            raise ValueError(f"Sobel kernel size must be 1, 3, 5, or 7, got {ksize}")
+        self.alpha = float(alpha)
+        self.ksize = int(ksize)
+        self.inv_alpha = 1.0 - alpha
+    
+    def apply(self, img: np.ndarray, **params) -> np.ndarray:
+        """
+        Apply edge boosting to the image.
+        
+        Args:
+            img (np.ndarray): Input image (BGR or RGB uint8).
+            **params: Additional parameters (unused).
+        
+        Returns:
+            np.ndarray: Edge-enhanced image.
+        """
+        # Convert to grayscale for edge detection
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Compute Sobel gradients with CV_16S for efficiency
+        gx = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=self.ksize)
+        gy = cv2.Sobel(gray, cv2.CV_16S, 0, 1, ksize=self.ksize)
+        
+        # Compute magnitude efficiently
+        mag = cv2.convertScaleAbs(cv2.addWeighted(cv2.convertScaleAbs(gx), 0.5, cv2.convertScaleAbs(gy), 0.5, 0))
+        
+        # Blend into HSV V-channel
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        hsv[:, :, 2] = cv2.addWeighted(hsv[:, :, 2], self.inv_alpha, mag, self.alpha, 0)
+        
+        return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    
+    def get_transform_init_args_names(self):
+        """Return names of arguments that are used in __init__."""
+        return ("alpha", "ksize")
+
+
+class HomomorphicLightNorm(A.ImageOnlyTransform):
+    """
+    Homomorphic filtering for illumination normalization.
+    
+    Applies logarithmic transformation, low-pass filtering to estimate illumination,
+    and re-exponentiates to normalize lighting variations. Useful for images with
+    uneven lighting or strong shadows.
+    
+    Args:
+        sigma (float): Gaussian blur sigma for low-pass filtering. Higher values remove
+            more illumination variation. Default: 12.0.
+        gain (float): Strength of illumination removal. Range [0, 1]. Higher values
+            remove more illumination. Default: 0.5.
+        always_apply (bool): Whether to always apply the transform. Default: False.
+        p (float): Probability of applying the transform. Default: 0.0 (opt-in).
+    
+    Targets:
+        image
+    
+    Image types:
+        uint8, float32
+    
+    Examples:
+        >>> import albumentations as A
+        >>> transform = A.Compose([HomomorphicLightNorm(sigma=12.0, gain=0.5, p=0.1)])
+        >>> augmented = transform(image=image)
+        >>> normalized_image = augmented['image']
+    
+    Note:
+        This transform can be computationally expensive. Use conservative sigma values
+        and low probability for training augmentation.
+    """
+    
+    def __init__(self, sigma: float = 12.0, gain: float = 0.5, always_apply: bool = False, p: float = 0.0):
+        """Initialize HomomorphicLightNorm transform."""
+        super().__init__(always_apply, p)
+        self.sigma = float(sigma)
+        self.gain = float(gain)
+    
+    def apply(self, img: np.ndarray, **params) -> np.ndarray:
+        """
+        Apply homomorphic filtering to the image.
+        
+        Args:
+            img (np.ndarray): Input image (BGR or RGB uint8).
+            **params: Additional parameters (unused).
+        
+        Returns:
+            np.ndarray: Illumination-normalized image.
+        """
+        # Convert to float [0, 1]
+        img_float = img.astype(np.float32) / 255.0
+        
+        # Log domain transformation
+        log_img = np.log1p(img_float)
+        
+        # Low-pass filter to estimate illumination component
+        illum = cv2.GaussianBlur(log_img, (0, 0), self.sigma)
+        
+        # Remove illumination and re-exponentiate
+        reflect = log_img - self.gain * illum
+        out = np.expm1(reflect)
+        
+        # Convert back to uint8
+        return np.clip(out * 255.0, 0, 255).astype(np.uint8)
+    
+    def get_transform_init_args_names(self):
+        """Return names of arguments that are used in __init__."""
+        return ("sigma", "gain")
 
 class Format:
     """
@@ -2592,7 +2739,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
             pre_transform,
             MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
             CutMix(dataset, pre_transform=pre_transform, p=hyp.cutmix),
-            Albumentations(p=1.0),
+            Albumentations(cfg=hyp, p=1.0),
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             RandomFlip(direction="vertical", p=hyp.flipud, flip_idx=flip_idx),
             RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),

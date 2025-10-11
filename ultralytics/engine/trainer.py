@@ -38,6 +38,7 @@ from ultralytics.utils import (
     colorstr,
     emojis,
 )
+from ultralytics.utils.metrics import calculate_fitness
 from ultralytics.utils.autobatch import check_train_batch_size
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
 from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
@@ -163,18 +164,8 @@ class BaseTrainer:
         self.lf = None
         self.scheduler = None
 
-        # Epoch level metrics
-        self.comparision_metric = self.args.get("comparision_metric", "f2")
-        if self.comparision_metric not in {"fitness", "f1", "f2"}:
-            raise NotImplementedError(f"Invalid metric for comparision {self.comparision_metric}. Supported metrics are 'fitness', 'f1', and 'f2'.")
-        self.best_comp_metric = None
-        self.comp_metric = None
-        # self.best_fitness = None
-        # self.fitness = None
-        # self.f1 = None
-        # self.best_f1 = None
-        # self.f2 = None
-        # self.best_f2 = None
+        self.best_fitness = None
+        self.fitness = None
         self.loss = None
         self.tloss = None
         self.loss_names = ["Loss"]
@@ -486,11 +477,9 @@ class BaseTrainer:
                 # Validation
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
                     self._clear_memory(threshold=0.5)  # prevent VRAM spike
-                    # self.metrics, self.fitness = self.validate()
-                    self.metrics, self.comp_metric = self.validate()
+                    self.metrics, self.fitness = self.validate()
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
-                # self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
-                self.stop |= self.stopper(epoch + 1, self.comp_metric) or final_epoch
+                self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                 if self.args.time:
                     self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
 
@@ -593,15 +582,14 @@ class BaseTrainer:
         torch.save(
             {
                 "epoch": self.epoch,
-                # "best_fitness": self.best_fitness,
-                "best_comp_metric": self.best_comp_metric,
+                "best_fitness": self.best_fitness,
                 "model": None,  # resume and final checkpoints derive from EMA
                 "ema": deepcopy(unwrap_model(self.ema.ema)).half(),
                 "updates": self.ema.updates,
                 "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
                 "scaler": self.scaler.state_dict(),
                 "train_args": vars(self.args),  # save as dict
-                "train_metrics": {**self.metrics, **{"comp_metric": self.comp_metric}},
+                "train_metrics": {**self.metrics, **{"fitness": self.fitness}},
                 "train_results": self.read_results_csv(),
                 "date": datetime.now().isoformat(),
                 "version": __version__,
@@ -620,7 +608,7 @@ class BaseTrainer:
 
         # Save checkpoints
         self.last.write_bytes(serialized_ckpt)  # save last.pt
-        if self.best_comp_metric == self.comp_metric:
+        if self.best_fitness == self.fitness:
             self.best.write_bytes(serialized_ckpt)  # save best.pt
         if (self.save_period > 0) and (self.epoch % self.save_period == 0):
             (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)  # save epoch, i.e. 'epoch3.pt'
@@ -704,20 +692,30 @@ class BaseTrainer:
             fitness (float): Fitness score for the validation.
         """
         metrics = self.validator(self)
-        fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
-        # print(metrics)
-        f2 = metrics.pop("f2", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
-        f1 = metrics.pop("f1", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
-        if self.comparision_metric == "fitness":
-            self.comp_metric = fitness
-        elif self.comparision_metric == "f1":
-            self.comp_metric = f1
-        elif self.comparision_metric == "f2":
-            self.comp_metric = f2
-        # if not self.best_fitness or self.best_fitness < fitness:
-        if not self.best_comp_metric or self.best_comp_metric < self.comp_metric:
-            self.best_comp_metric = copy(self.comp_metric)
-        return metrics, copy(self.comp_metric)
+        
+        # Calculate comparison metric based on configuration
+        # if self.comparision_metric == "fitness":
+        #     # Use the built-in fitness from metrics
+        #     self.comp_metric = metrics.pop("fitness", -self.loss.detach().cpu().numpy())
+        # elif self.comparision_metric == "f1":
+        #     # Extract F1 from metrics (for segmentation tasks)
+        #     self.comp_metric = metrics.get("metrics/f1(M)", -self.loss.detach().cpu().numpy())
+        # elif self.comparision_metric == "f2":
+        #     # Extract F2 from metrics (for segmentation tasks)
+        #     self.comp_metric = metrics.get("metrics/f2(M)", -self.loss.detach().cpu().numpy())
+        # elif self.comparision_metric == "custom":
+            # Use custom fitness calculation with configured weights
+        # fitness_weights = getattr(self.args, 'fitness_weights', None)
+        # self.comp_metric = calculate_fitness(metrics, fitness_weights)
+        # else:
+        
+        # Update best metric if current is better
+        # if not self.best_comp_metric or self.best_comp_metric < self.comp_metric:
+        #     self.best_comp_metric = copy(self.comp_metric)
+        if not self.fitness or self.fitness < self.fitness:
+            self.fitness = copy(self.fitness)
+            
+        return metrics, copy(self.fitness)
 
     def get_model(self, cfg=None, weights=None, verbose=True):
         """Get model and raise NotImplementedError for loading cfg files."""
@@ -798,7 +796,6 @@ class BaseTrainer:
                     self.validator.args.compile = False  # disable final val compile as too slow
                     self.metrics = self.validator(model=f)
                     # self.metrics.pop("fitness", None)
-                    self.metrics.pop("f2", None)
                     self.run_callbacks("on_fit_epoch_end")
 
     def check_resume(self, overrides):
@@ -857,7 +854,6 @@ class BaseTrainer:
                 f"{self.model} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {self.epochs} more epochs."
             )
             self.epochs += ckpt["epoch"]  # finetune additional epochs
-        self.best_fitness = best_fitness
         self.start_epoch = start_epoch
         if start_epoch > (self.epochs - self.args.close_mosaic):
             self._close_dataloader_mosaic()

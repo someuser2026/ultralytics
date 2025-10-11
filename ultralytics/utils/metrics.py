@@ -7,10 +7,11 @@ import math
 import warnings
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, List
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from ultralytics.utils import LOGGER, DataExportMixin, SimpleClass, TryExcept, checks, plt_settings
 
@@ -18,6 +19,76 @@ OKS_SIGMA = (
     np.array([0.26, 0.25, 0.25, 0.35, 0.35, 0.79, 0.79, 0.72, 0.72, 0.62, 0.62, 1.07, 1.07, 0.87, 0.87, 0.89, 0.89])
     / 10.0
 )
+
+
+def calculate_fitness(metrics_dict: dict, fitness_weights: dict = None) -> float:
+    """
+    Calculate a weighted fitness score from multiple metrics.
+    
+    Args:
+        metrics_dict (dict): Dictionary containing metric values with keys like:
+            - 'metrics/precision(B)', 'metrics/recall(B)', 'metrics/mAP50(B)', 'metrics/mAP50-95(B)'
+            - 'metrics/precision(M)', 'metrics/recall(M)', 'metrics/mAP50(M)', 'metrics/mAP50-95(M)'
+            - 'metrics/f2(M)', 'metrics/dice(M)', 'metrics/mIoU(M)', 'metrics/boundaryF1(M)'
+        fitness_weights (dict, optional): Dictionary of weights for each metric. If None, uses default weights.
+        
+    Returns:
+        (float): Weighted fitness score
+        
+    Example:
+        >>> metrics = {'metrics/mAP50-95(B)': 0.5, 'metrics/f2(M)': 0.7}
+        >>> weights = {'mAP50_95': 0.6, 'f2': 0.4}
+        >>> fitness = calculate_fitness(metrics, weights)
+    """
+    if fitness_weights is None:
+        # Default weights: focus on mAP50-95 for detection
+        fitness_weights = {
+            'precision': 0.0, 'recall': 0.0, 'mAP50': 0.0, 'mAP50_95': 1.0,
+            'mask_precision': 0.0, 'mask_recall': 0.0, 'mask_mAP50': 0.0, 'mask_mAP50_95': 0.0,
+            'f1': 0.0, 'f2': 0.0, 'dice': 0.0, 'miou': 0.0, 'boundary_f1': 0.0
+        }
+    
+    # Mapping from config keys to metric keys in results
+    metric_mapping = {
+        'precision': 'metrics/precision(B)',
+        'recall': 'metrics/recall(B)', 
+        'mAP50': 'metrics/mAP50(B)',
+        'mAP50_95': 'metrics/mAP50-95(B)',
+        'mask_precision': 'metrics/precision(M)',
+        'mask_recall': 'metrics/recall(M)',
+        'mask_mAP50': 'metrics/mAP50(M)', 
+        'mask_mAP50_95': 'metrics/mAP50-95(M)',
+        'f1': 'metrics/f1(M)',
+        'f2': 'metrics/f2(M)',
+        'dice': 'metrics/dice(M)',
+        'miou': 'metrics/mIoU(M)',
+        'boundary_f1': 'metrics/boundaryF1(M)'
+    }
+    
+    fitness = 0.0
+    total_weight = 0.0
+    
+    for weight_key, weight_value in fitness_weights.items():
+        if weight_value > 0:  # Only include metrics with non-zero weights
+            metric_key = metric_mapping.get(weight_key)
+            if metric_key and metric_key in metrics_dict:
+                metric_value = metrics_dict[metric_key]
+                if isinstance(metric_value, (int, float)) and not np.isnan(metric_value):
+                    fitness += weight_value * metric_value
+                    total_weight += weight_value
+    
+    # Normalize by total weight if any weights were applied
+    if total_weight > 0:
+        fitness = fitness / total_weight
+    else:
+        # Fallback: use mAP50-95 if no weights are configured
+        fallback_key = 'metrics/mAP50-95(B)'
+        if fallback_key in metrics_dict:
+            fitness = metrics_dict[fallback_key]
+        else:
+            fitness = 0.0
+    
+    return float(fitness)
 
 
 def bbox_ioa(box1: np.ndarray, box2: np.ndarray, iou: bool = False, eps: float = 1e-7) -> np.ndarray:
@@ -164,6 +235,161 @@ def mask_iou(mask1: torch.Tensor, mask2: torch.Tensor, eps: float = 1e-7) -> tor
     intersection = torch.matmul(mask1, mask2.T).clamp_(0)
     union = (mask1.sum(1)[:, None] + mask2.sum(1)[None]) - intersection  # (area1 + area2) - intersection
     return intersection / (union + eps)
+
+
+def dice_score(mask1: torch.Tensor, mask2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Compute Dice score between two binary masks.
+
+    Args:
+        mask1 (torch.Tensor): Tensor of shape (N, H, W) or (H, W).
+        mask2 (torch.Tensor): Tensor of shape (N, H, W) or (H, W).
+        eps (float): Small epsilon to avoid division by zero.
+
+    Returns:
+        (torch.Tensor): Dice score per-pair (N,).
+    """
+    if mask1.dim() == 2:
+        mask1 = mask1.unsqueeze(0)
+    if mask2.dim() == 2:
+        mask2 = mask2.unsqueeze(0)
+    inter = (mask1 & mask2).sum(dim=(1, 2)).float()
+    denom = mask1.sum(dim=(1, 2)).float() + mask2.sum(dim=(1, 2)).float()
+    return (2.0 * inter) / (denom + eps)
+
+
+def _extract_boundary(mask: torch.Tensor) -> torch.Tensor:
+    """
+    Extract a 1-pixel boundary map from a binary mask using morphological gradient.
+
+    This function computes the boundary by taking the difference between morphological dilation and erosion
+    operations. Uses max-pool identities for GPU efficiency; differentiability is not required for evaluation.
+
+    Args:
+        mask (torch.Tensor): Binary mask tensor of shape (H, W) or (N, H, W) with values in {0, 1}.
+
+    Returns:
+        (torch.Tensor): Binary boundary map of the same shape as input with values in {0, 1}.
+
+    Notes:
+        - The boundary is defined as pixels where dilation ≠ erosion.
+        - Uses 3×3 structuring element (8-connectivity).
+        - Preserves input device and dtype.
+
+    Example:
+        >>> mask = torch.zeros(100, 100)
+        >>> mask[25:75, 25:75] = 1  # Create a square
+        >>> boundary = _extract_boundary(mask)
+        >>> boundary.sum()  # Count boundary pixels
+        tensor(196)
+    """
+    original_shape = mask.shape
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0)
+    
+    # Preserve device and dtype
+    device = mask.device
+    x = mask.float()
+    
+    # Add channel dimension for max_pool2d
+    x = x.unsqueeze(1) if x.dim() == 3 else x
+    
+    # Dilation: max pool on the mask
+    dil = F.max_pool2d(x, kernel_size=3, stride=1, padding=1)
+    # Erosion: 1 - max_pool(1 - mask)
+    er = 1.0 - F.max_pool2d(1.0 - x, kernel_size=3, stride=1, padding=1)
+    
+    # Remove channel dimension
+    dil = dil.squeeze(1)
+    er = er.squeeze(1)
+    
+    # Gradient (dilation - erosion)
+    boundary = (dil - er).clamp_(0, 1)
+    result = (boundary > 0.5).to(mask.dtype)
+    
+    # Restore original shape
+    if len(original_shape) == 2:
+        result = result.squeeze(0)
+    
+    return result
+
+
+def boundary_f1(
+    mask_gt: torch.Tensor,
+    mask_pred: torch.Tensor,
+    tolerance: int = 1,
+    eps: float = 1e-7
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute boundary precision, recall, and F1 score with pixel tolerance.
+
+    This metric evaluates the quality of predicted object boundaries by comparing extracted boundaries from
+    ground truth and predicted masks. A tolerance parameter allows for slight misalignments, making the
+    metric more robust to minor prediction errors.
+
+    Args:
+        mask_gt (torch.Tensor): Ground truth binary mask of shape (H, W) or (N, H, W).
+        mask_pred (torch.Tensor): Predicted binary mask of shape (H, W) or (N, H, W).
+        tolerance (int): Dilation radius in pixels used for boundary matching. Default is 1.
+        eps (float): Small constant for numerical stability. Default is 1e-7.
+
+    Returns:
+        (tuple[torch.Tensor, torch.Tensor, torch.Tensor]): Tuple containing:
+            - precision (torch.Tensor): Boundary precision for each mask, shape (N,).
+            - recall (torch.Tensor): Boundary recall for each mask, shape (N,).
+            - f1 (torch.Tensor): Boundary F1 score for each mask, shape (N,).
+
+    Notes:
+        - Boundaries are extracted using morphological gradient (dilation - erosion).
+        - Tolerance creates a band around boundaries where matches are allowed.
+        - Useful for instance segmentation where exact pixel alignment is less critical.
+
+    Example:
+        >>> gt = torch.zeros(100, 100)
+        >>> gt[20:80, 20:80] = 1
+        >>> pred = torch.zeros(100, 100)
+        >>> pred[22:78, 22:78] = 1  # Slightly smaller prediction
+        >>> precision, recall, f1 = boundary_f1(gt, pred, tolerance=2)
+        >>> print(f"Boundary F1: {f1.item():.3f}")
+    """
+    if mask_gt.dim() == 2:
+        mask_gt = mask_gt.unsqueeze(0)
+    if mask_pred.dim() == 2:
+        mask_pred = mask_pred.unsqueeze(0)
+    
+    device = mask_gt.device
+    gt_b = _extract_boundary(mask_gt).bool()
+    pr_b = _extract_boundary(mask_pred).bool()
+    
+    if tolerance > 0:
+        k = 2 * tolerance + 1
+        # Dilate boundaries for tolerance matching
+        gt_d = F.max_pool2d(
+            gt_b.unsqueeze(1).float(), 
+            kernel_size=k, 
+            stride=1, 
+            padding=tolerance
+        ).squeeze(1).bool()
+        pr_d = F.max_pool2d(
+            pr_b.unsqueeze(1).float(), 
+            kernel_size=k, 
+            stride=1, 
+            padding=tolerance
+        ).squeeze(1).bool()
+    else:
+        gt_d, pr_d = gt_b, pr_b
+    
+    # Compute TP, FP, FN
+    tp = (pr_b & gt_d).sum(dim=(1, 2)).float()
+    fp = (pr_b & (~gt_d)).sum(dim=(1, 2)).float()
+    fn = (gt_b & (~pr_d)).sum(dim=(1, 2)).float()
+    
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    f1 = 2 * precision * recall / (precision + recall + eps)
+    
+    return precision, recall, f1
+
 
 
 def kpt_iou(
@@ -809,7 +1035,7 @@ def ap_per_class(
         p (np.ndarray): Precision values at threshold given by max F1 metric for each class.
         r (np.ndarray): Recall values at threshold given by max F1 metric for each class.
         f1 (np.ndarray): F1-score values at threshold given by max F1 metric for each class.
-        f2 (np.ndarray): F2-score values at threshold given by max F1 metric for each class.
+        f2 (np.ndarray): F2-score values at threshold given by max F2 metric for each class.
         ap (np.ndarray): Average precision for each class at different IoU thresholds.
         unique_classes (np.ndarray): An array of unique classes that have data.
         p_curve (np.ndarray): Precision curves for each class.
@@ -889,9 +1115,11 @@ class Metric(SimpleClass):
         p (list): Precision for each class. Shape: (nc,).
         r (list): Recall for each class. Shape: (nc,).
         f1 (list): F1 score for each class. Shape: (nc,).
+        f2 (list): F2 score for each class. Shape: (nc,).
         all_ap (list): AP scores for all classes and all IoU thresholds. Shape: (nc, 10).
         ap_class_index (list): Index of class for each AP score. Shape: (nc,).
         nc (int): Number of classes.
+        fitness_weights (dict): Weights for computing fitness score.
 
     Methods:
         ap50: AP at IoU threshold of 0.5 for all classes.
@@ -901,6 +1129,8 @@ class Metric(SimpleClass):
         map50: Mean AP at IoU threshold of 0.5 for all classes.
         map75: Mean AP at IoU threshold of 0.75 for all classes.
         map: Mean AP at IoU thresholds from 0.5 to 0.95 for all classes.
+        mf1: Mean F1 score of all classes.
+        mf2: Mean F2 score of all classes.
         mean_results: Mean of results, returns mp, mr, map50, map.
         class_result: Class-aware result, returns p[i], r[i], ap50[i], ap[i].
         maps: mAP of each class.
@@ -908,16 +1138,42 @@ class Metric(SimpleClass):
         update: Update metric attributes with new evaluation results.
         curves: Provides a list of curves for accessing specific metrics like precision, recall, F1, etc.
         curves_results: Provide a list of results for accessing specific metrics like precision, recall, F1, etc.
-    """
 
-    def __init__(self) -> None:
-        """Initialize a Metric instance for computing evaluation metrics for the YOLOv8 model."""
+    Examples:
+        >>> metric = Metric()
+        >>> metric.fitness_weights = {'mAP50_95': 0.6, 'f2': 0.4}
+        >>> fitness_score = metric.fitness()
+    """
+    
+    def __init__(self, fitness_weights: dict = None) -> None:
+        """
+        Initialize a Metric instance for computing evaluation metrics for the YOLO model.
+        
+        Args:
+            fitness_weights (dict, optional): Custom weights for fitness calculation. If None, uses default weights
+                focusing on mAP50-95. Keys can include: 'precision', 'recall', 'mAP50', 'mAP50_95', 'f1', 'f2'.
+
+        Examples:
+            >>> metric = Metric()
+            >>> metric = Metric(fitness_weights={'mAP50_95': 0.7, 'f2': 0.3})
+        """
         self.p = []  # (nc, )
         self.r = []  # (nc, )
         self.f1 = []  # (nc, )
+        self.f2 = []  # (nc, )
         self.all_ap = []  # (nc, 10)
         self.ap_class_index = []  # (nc, )
         self.nc = 0
+        
+        # Default weights: focus on mAP50-95
+        self.fitness_weights = fitness_weights or {
+            'precision': 0.0,
+            'recall': 0.0,
+            'mAP50': 0.0,
+            'mAP50_95': 1.0,
+            'f1': 0.0,
+            'f2': 0.0
+        }
 
     @property
     def ap50(self) -> np.ndarray | list:
@@ -1026,9 +1282,49 @@ class Metric(SimpleClass):
         return maps
 
     def fitness(self) -> float:
-        """Return model fitness as a weighted combination of metrics."""
-        w = [0.0, 0.0, 0.0, 1.0]  # weights for [P, R, mAP@0.5, mAP@0.5:0.95]
-        return (np.nan_to_num(np.array(self.mean_results())) * w).sum()
+        """
+        Return model fitness as a weighted combination of metrics.
+        
+        Computes a weighted sum of available metrics (precision, recall, mAP50, mAP50-95, F1, F2) based on
+        the configured fitness_weights. The result is normalized by the sum of weights. If no weights are
+        configured or all weights are zero, falls back to mAP50-95.
+        
+        Returns:
+            (float): Weighted fitness score in range [0.0, 1.0].
+
+        Examples:
+            >>> metric = Metric(fitness_weights={'mAP50': 0.3, 'mAP50_95': 0.7})
+            >>> metric.map50 = 0.85
+            >>> metric.map = 0.75
+            >>> fitness = metric.fitness()
+            >>> print(f"Fitness: {fitness:.3f}")
+        """
+        # Map weight keys to actual metric values
+        metrics_map = {
+            'precision': self.mp,
+            'recall': self.mr,
+            'mAP50': self.map50,
+            'mAP50_95': self.map,
+            'f1': self.mf1,
+            'f2': self.mf2
+        }
+        
+        fitness = 0.0
+        total_weight = 0.0
+        
+        for key, weight in self.fitness_weights.items():
+            if weight > 0 and key in metrics_map:
+                metric_value = metrics_map[key]
+                if not np.isnan(metric_value):
+                    fitness += weight * metric_value
+                    total_weight += weight
+        
+        # Normalize by total weight if any weights were applied
+        if total_weight > 0:
+            return fitness / total_weight
+        
+        # Fallback to mAP50-95 if no weights configured
+        return self.map
 
     def update(self, results: tuple):
         """
@@ -1093,6 +1389,7 @@ class DetMetrics(SimpleClass, DataExportMixin):
         stats (dict[str, list]): A dictionary containing lists for true positives, confidence scores, predicted classes, target classes, and target images.
         nt_per_class: Number of targets per class.
         nt_per_image: Number of targets per image.
+        fitness_weights (dict): Weights for computing fitness score.
 
     Methods:
         update_stats: Update statistics by appending new values to existing stat collections.
@@ -1108,17 +1405,39 @@ class DetMetrics(SimpleClass, DataExportMixin):
         curves: Return a list of curves for accessing specific metrics curves.
         curves_results: Return a list of computed performance metrics and statistics.
         summary: Generate a summarized representation of per-class detection metrics as a list of dictionaries.
-    """
 
-    def __init__(self, names: dict[int, str] = {}) -> None:
+    Examples:
+        >>> metrics = DetMetrics(names={0: 'person', 1: 'car'})
+        >>> metrics = DetMetrics(names={0: 'person'}, fitness_weights={'mAP50_95': 0.6, 'f2': 0.4})
+    """
+    
+    def __init__(self, names: dict[int, str] = {}, fitness_weights: dict = None) -> None:
         """
         Initialize a DetMetrics instance with a save directory, plot flag, and class names.
 
         Args:
             names (dict[int, str], optional): Dictionary of class names.
+            fitness_weights (dict, optional): Custom weights for fitness calculation. If None, uses default weights
+                focusing on mAP50-95. Keys can include: 'precision', 'recall', 'mAP50', 'mAP50_95', 'f1', 'f2'.
+
+        Examples:
+            >>> metrics = DetMetrics(names={0: 'person', 1: 'car'})
+            >>> metrics = DetMetrics(names={0: 'person'}, fitness_weights={'mAP50_95': 0.7, 'recall': 0.3})
         """
         self.names = names
-        self.box = Metric()
+        
+        # Default weights for detection: focus on mAP50-95
+        default_weights = {
+            'precision': 0.0,
+            'recall': 0.0,
+            'mAP50': 0.0,
+            'mAP50_95': 1.0,
+            'f1': 0.0,
+            'f2': 0.0
+        }
+        self.fitness_weights = fitness_weights or default_weights
+        
+        self.box = Metric(fitness_weights=self.fitness_weights)
         self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
         self.task = "detect"
         self.stats = dict(tp=[], conf=[], pred_cls=[], target_cls=[], target_img=[])
@@ -1181,12 +1500,13 @@ class DetMetrics(SimpleClass, DataExportMixin):
             "metrics/recall(B)", 
             "metrics/mAP50(B)", 
             "metrics/mAP50-95(B)",
+            "metrics/f1(B)",
             "metrics/f2(B)"
         ]
 
     def mean_results(self) -> List[float]:
         """Calculate mean of detected objects & return precision, recall, mAP50, mAP50-95, and mF2."""
-        return self.box.mean_results() + [self.box.mf2]
+        return self.box.mean_results() + [self.box.mf1, self.box.mf2]
 
     def class_result(self, i: int) -> tuple[float, float, float, float]:
         """Return the result of evaluating the performance of an object detection model on a specific class."""
@@ -1199,7 +1519,20 @@ class DetMetrics(SimpleClass, DataExportMixin):
 
     @property
     def fitness(self) -> float:
-        """Return the fitness of box object."""
+        """
+        Return the fitness score of the detection model.
+        
+        Computes fitness as a weighted combination of box detection metrics based on the configured fitness_weights.
+        
+        Returns:
+            (float): Fitness score in range [0.0, 1.0].
+
+        Examples:
+            >>> metrics = DetMetrics(names={0: 'person', 1: 'car'})
+            >>> # ... process validation results ...
+            >>> fitness = metrics.fitness
+            >>> print(f"Model fitness: {fitness:.3f}")
+        """
         return self.box.fitness()
 
     @property
@@ -1270,53 +1603,366 @@ class SegmentMetrics(DetMetrics):
     """
     Calculate and aggregate detection and segmentation metrics over a given set of classes.
 
+    This class extends DetMetrics to include mask-based evaluation metrics. It computes standard segmentation
+    metrics (precision, recall, mAP) as well as additional pixel-level metrics including Dice coefficient,
+    mean IoU, and boundary F1 score. These metrics are aggregated per-class and averaged across the dataset.
+
     Attributes:
-        names (dict[int, str]): Dictionary of class names.
-        box (Metric): An instance of the Metric class for storing detection results.
-        seg (Metric): An instance of the Metric class to calculate mask segmentation metrics.
-        speed (dict[str, float]): A dictionary for storing execution times of different parts of the detection process.
-        task (str): The task type, set to 'segment'.
-        stats (dict[str, list]): A dictionary containing lists for true positives, confidence scores, predicted classes, target classes, and target images.
-        nt_per_class: Number of targets per class.
-        nt_per_image: Number of targets per image.
+        seg (Metric): Metric object for mask-based precision-recall metrics.
+        task (str): Task type, set to "segment".
+        names (dict[int, str]): Dictionary mapping class indices to class names.
+        stats (dict): Dictionary containing statistics including 'tp_m' for mask true positives.
+        fitness_weights (dict): Weights for computing fitness score (supports both box and mask metrics).
 
     Methods:
-        process: Process the detection and segmentation metrics over the given set of predictions.
-        keys: Return a list of keys for accessing metrics.
-        mean_results: Return the mean metrics for bounding box and segmentation results.
-        class_result: Return classification results for a specified class index.
-        maps: Return mAP scores for object detection and semantic segmentation models.
-        fitness: Return the fitness score for both segmentation and bounding box models.
-        curves: Return a list of curves for accessing specific metrics curves.
-        curves_results: Provide a list of computed performance metrics and statistics.
-        summary: Generate a summarized representation of per-class segmentation metrics as a list of dictionaries.
-    """
+        update_mask_aggregates: Update per-class Dice, mIoU, and boundary F1 metrics.
+        reset_mask_aggregates: Clear per-class metric buffers.
+        process: Process all accumulated statistics and compute final metrics.
 
-    def __init__(self, names: dict[int, str] = {}) -> None:
+    Properties:
+        mdice (float): Mean Dice coefficient across all classes.
+        miou (float): Mean Intersection over Union across all classes.
+        mbf1 (float): Mean boundary F1 score across all classes.
+        fitness (float): Combined fitness score from detection and segmentation metrics.
+
+    Examples:
+        >>> from ultralytics.utils.metrics import SegmentMetrics
+        >>> metrics = SegmentMetrics(names={0: 'cat', 1: 'dog'})
+        >>> custom_weights = {'box_mAP50_95': 0.3, 'mask_mAP50_95': 0.3, 'dice': 0.2, 'miou': 0.2}
+        >>> metrics = SegmentMetrics(names={0: 'cat'}, fitness_weights=custom_weights)
+    """
+    
+    def __init__(self, names: dict[int, str] = {}, fitness_weights: dict = None) -> None:
         """
-        Initialize a SegmentMetrics instance with a save directory, plot flag, and class names.
+        Initialize a SegmentMetrics instance with detection and segmentation metrics.
 
         Args:
-            names (dict[int, str], optional): Dictionary of class names.
+            names (dict[int, str]): Dictionary mapping class indices to class names. Default is {}.
+            fitness_weights (dict, optional): Custom weights for fitness calculation. If None, uses default weights
+                that balance box and mask mAP50-95. Keys can include box metrics (prefixed with 'box_'), mask metrics
+                (prefixed with 'mask_'), and additional segmentation metrics: 'dice', 'miou', 'boundary_f1'.
+
+        Examples:
+            >>> metrics = SegmentMetrics(names={0: 'person', 1: 'car', 2: 'dog'})
+            >>> weights = {'box_mAP50_95': 0.3, 'mask_mAP50_95': 0.4, 'dice': 0.2, 'miou': 0.1}
+            >>> metrics = SegmentMetrics(names={0: 'cat'}, fitness_weights=weights)
         """
-        DetMetrics.__init__(self, names)
-        self.seg = Metric()
+        # Default weights for segmentation: balance box and mask metrics
+        default_weights = {
+            # Box metrics
+            'box_precision': 0.0,
+            'box_recall': 0.0,
+            'box_mAP50': 0.0,
+            'box_mAP50_95': 0.5,
+            'box_f1': 0.0,
+            'box_f2': 0.0,
+            # Mask metrics
+            'mask_precision': 0.0,
+            'mask_recall': 0.0,
+            'mask_mAP50': 0.0,
+            'mask_mAP50_95': 0.5,
+            'mask_f1': 0.0,
+            'mask_f2': 0.0,
+            # Additional segmentation metrics
+            'dice': 0.0,
+            'miou': 0.0,
+            'boundary_f1': 0.0
+        }
+        
+        self.fitness_weights = fitness_weights or default_weights
+        
+        # Initialize parent with box-specific weights
+        box_weights = {k.replace('box_', ''): v for k, v in self.fitness_weights.items() if k.startswith('box_')}
+        super().__init__(names, fitness_weights=box_weights)
+        
+        # Initialize mask metrics with mask-specific weights
+        mask_weights = {k.replace('mask_', ''): v for k, v in self.fitness_weights.items() if k.startswith('mask_')}
+        self.seg = Metric(fitness_weights=mask_weights)
         self.task = "segment"
-        self.stats["tp_m"] = []  # add additional stats for masks
+        self.stats["tp_m"] = []
+
+        # Aggregates for additional segmentation metrics
+        self._init_done = False
+        self._device = torch.device("cpu")
+        self._dice_num = None
+        self._dice_den = None
+        self._iou_inter = None
+        self._iou_union = None
+        self._b_tp = None
+        self._b_fp = None
+        self._b_fn = None
+
+    def _ensure_init(self):
+        """
+        Initialize per-class accumulation tensors for Dice, IoU, and boundary metrics.
+
+        This method creates zero-initialized tensors for each class to accumulate metric components
+        across all predictions. Uses float64 precision on CPU for numerical stability with large datasets.
+
+        Notes:
+            - Called automatically before first metric update.
+            - Creates tensors with length equal to number of classes.
+            - All tensors stored on CPU to prevent GPU memory overflow.
+        """
+        if self._init_done:
+            return
+        nc = len(self.names)
+        zeros = torch.zeros(nc, dtype=torch.float64, device=self._device)  # Use float64 for better precision
+        self._dice_num = zeros.clone()
+        self._dice_den = zeros.clone()
+        self._iou_inter = zeros.clone()
+        self._iou_union = zeros.clone()
+        self._b_tp = zeros.clone()
+        self._b_fp = zeros.clone()
+        self._b_fn = zeros.clone()
+        self._init_done = True
+
+    def reset_mask_aggregates(self) -> None:
+        """
+        Clear per-class aggregation buffers for Dice, mIoU, and boundary F1 metrics.
+
+        This method resets all accumulated metric values, preparing the instance for a new evaluation pass.
+        Should be called at the start of each validation/test epoch.
+
+        Example:
+            >>> metrics = SegmentMetrics(names={0: 'cat', 1: 'dog'})
+            >>> # ... accumulate metrics during validation ...
+            >>> metrics.reset_mask_aggregates()  # Reset for next epoch
+        """
+        self._init_done = False
+        self._dice_num = self._dice_den = self._iou_inter = self._iou_union = None
+        self._b_tp = self._b_fp = self._b_fn = None
+
+    def update_mask_aggregates(
+    self,
+    cls_indices: torch.Tensor,
+    gt_masks: torch.Tensor,
+    pred_masks: torch.Tensor,
+    boundary_tolerance: int = 1,
+) -> None:
+        """
+        Update per-class aggregates for Dice, mIoU, and boundary F1 using matched mask pairs.
+
+        This method processes matched ground truth and predicted mask pairs, computing intersection, union,
+        and boundary statistics for each pair, then accumulating these values per class. Matching should be
+        performed before calling this method (typically using IoU threshold-based assignment).
+
+        Args:
+            cls_indices (torch.Tensor): Ground truth class indices for each matched pair, shape (K,).
+            gt_masks (torch.Tensor): Boolean ground truth masks, shape (K, H, W).
+            pred_masks (torch.Tensor): Boolean predicted masks, shape (K, H, W).
+            boundary_tolerance (int): Dilation radius in pixels for boundary matching. Default is 1.
+
+        Notes:
+            - Assumes 1:1 matching between gt_masks and pred_masks.
+            - Uses scatter_add for efficient per-class accumulation.
+            - All computations performed on input device, then moved to CPU for storage.
+            - Empty input (K=0) is handled gracefully without errors.
+
+        Example:
+            >>> metrics = SegmentMetrics(names={0: 'cat', 1: 'dog'})
+            >>> cls = torch.tensor([0, 1, 0])  # 3 matched pairs
+            >>> gt = torch.rand(3, 100, 100) > 0.5  # Random binary masks
+            >>> pred = torch.rand(3, 100, 100) > 0.5
+            >>> metrics.update_mask_aggregates(cls, gt, pred)
+        """
+        if gt_masks.numel() == 0:
+            return
+        
+        self._ensure_init()
+        
+        device = gt_masks.device
+        nc = len(self.names)
+        cls_indices = cls_indices.to(torch.long)
+        
+        # FIXED: Filter out invalid class indices instead of clamping
+        valid_mask = (cls_indices >= 0) & (cls_indices < nc)
+        if not valid_mask.any():
+            return  # No valid classes to process
+        
+        # Apply filter to all inputs
+        cls_indices = cls_indices[valid_mask]
+        gt_masks = gt_masks[valid_mask].bool()
+        pred_masks = pred_masks[valid_mask].bool()
+        
+        # Compute intersection, areas, and union
+        inter = (gt_masks & pred_masks).sum(dim=(1, 2)).float()
+        area_gt = gt_masks.sum(dim=(1, 2)).float()
+        area_pr = pred_masks.sum(dim=(1, 2)).float()
+        union = (area_gt + area_pr - inter).clamp(min=0.0)
+        
+        # Dice components
+        dice_n = 2.0 * inter
+        dice_d = (area_gt + area_pr).clamp(min=1e-7)  # Avoid division by zero
+        
+        # Boundary extraction and matching
+        gt_b = _extract_boundary(gt_masks).bool()
+        pr_b = _extract_boundary(pred_masks).bool()
+        
+        if boundary_tolerance > 0:
+            k = 2 * boundary_tolerance + 1
+            # Dilate boundaries for tolerance matching
+            gt_d = F.max_pool2d(
+                gt_b.unsqueeze(1).float(), 
+                kernel_size=k, 
+                stride=1, 
+                padding=boundary_tolerance
+            ).squeeze(1).bool()
+            pr_d = F.max_pool2d(
+                pr_b.unsqueeze(1).float(), 
+                kernel_size=k, 
+                stride=1, 
+                padding=boundary_tolerance
+            ).squeeze(1).bool()
+        else:
+            gt_d, pr_d = gt_b, pr_b
+        
+        # Boundary metrics
+        tp_b = (pr_b & gt_d).sum(dim=(1, 2)).float()
+        fp_b = (pr_b & (~gt_d)).sum(dim=(1, 2)).float()
+        fn_b = (gt_b & (~pr_d)).sum(dim=(1, 2)).float()
+        
+        # Move to CPU for accumulation
+        cls_indices_cpu = cls_indices.cpu()
+        
+        # Accumulate per-class (using double precision for numerical stability)
+        self._dice_num.scatter_add_(0, cls_indices_cpu, dice_n.cpu().double())
+        self._dice_den.scatter_add_(0, cls_indices_cpu, dice_d.cpu().double())
+        self._iou_inter.scatter_add_(0, cls_indices_cpu, inter.cpu().double())
+        self._iou_union.scatter_add_(0, cls_indices_cpu, union.cpu().double())
+        self._b_tp.scatter_add_(0, cls_indices_cpu, tp_b.cpu().double())
+        self._b_fp.scatter_add_(0, cls_indices_cpu, fp_b.cpu().double())
+        self._b_fn.scatter_add_(0, cls_indices_cpu, fn_b.cpu().double())
+
+    @property
+    def mdice(self) -> float:
+        """
+        Calculate mean Dice coefficient across all classes with valid predictions.
+
+        The Dice coefficient (also known as F1 score for binary segmentation) measures the overlap between
+        predicted and ground truth masks: Dice = 2|X∩Y| / (|X| + |Y|). This property computes the per-class
+        Dice from accumulated intersection and union statistics, then averages over classes with non-zero
+        denominator.
+
+        Returns:
+            (float): Mean Dice coefficient in range [0, 1]. Returns 0.0 if no valid classes are present.
+
+        Example:
+            >>> metrics = SegmentMetrics(names={0: 'cat', 1: 'dog'})
+            >>> # ... process predictions ...
+            >>> dice = metrics.mdice
+            >>> print(f"Mean Dice: {dice:.3f}")
+        """
+        self._ensure_init()
+        eps = 1e-7
+        dice_c = self._dice_num / (self._dice_den + eps)
+        valid = self._dice_den > eps
+        if not valid.any():
+            return 0.0
+        return float(dice_c[valid].mean().item())
+
+    @property
+    def miou(self) -> float:
+        """
+        Calculate mean Intersection over Union (mIoU) across all classes with valid predictions.
+
+        IoU measures the overlap between predicted and ground truth masks: IoU = |X∩Y| / |X∪Y|.
+        This property computes per-class IoU from accumulated statistics, then averages over classes
+        with non-zero union.
+
+        Returns:
+            (float): Mean IoU in range [0, 1]. Returns 0.0 if no valid classes are present.
+
+        Notes:
+            - Also known as Jaccard index.
+            - Standard metric for semantic and instance segmentation.
+            - More strict than Dice coefficient (IoU ≤ Dice).
+
+        Example:
+            >>> metrics = SegmentMetrics(names={0: 'person', 1: 'car'})
+            >>> # ... accumulate predictions ...
+            >>> iou = metrics.miou
+            >>> print(f"Mean IoU: {iou:.3f}")
+        """
+        self._ensure_init()
+        eps = 1e-7
+        iou_c = self._iou_inter / (self._iou_union + eps)
+        valid = self._iou_union > eps
+        if not valid.any():
+            return 0.0
+        return float(iou_c[valid].mean().item())
+
+    @property
+    def mbf1(self) -> float:
+        """
+        Calculate mean boundary F1 score across all classes with detected boundaries.
+
+        Boundary F1 evaluates the quality of predicted object boundaries by computing precision and recall
+        on extracted boundary pixels (with optional tolerance). This metric is particularly useful for
+        applications where boundary accuracy is critical, such as medical image segmentation.
+
+        Returns:
+            (float): Mean boundary F1 in range [0, 1]. Returns 0.0 if no boundaries are detected.
+
+        Notes:
+            - Boundary pixels are extracted using morphological gradient (dilation - erosion).
+            - Tolerance parameter allows for slight misalignments (configured in update_mask_aggregates).
+            - Only classes with detected boundaries (TP+FP+FN > 0) contribute to the mean.
+
+        Example:
+            >>> metrics = SegmentMetrics(names={0: 'tumor', 1: 'organ'})
+            >>> # ... process medical image predictions ...
+            >>> bf1 = metrics.mbf1
+            >>> print(f"Mean Boundary F1: {bf1:.3f}")
+        """
+        self._ensure_init()
+        eps = 1e-7
+        prec = self._b_tp / (self._b_tp + self._b_fp + eps)
+        rec = self._b_tp / (self._b_tp + self._b_fn + eps)
+        f1 = 2 * prec * rec / (prec + rec + eps)
+        valid = (self._b_tp + self._b_fp + self._b_fn) > eps
+        if not valid.any():
+            return 0.0
+        return float(f1[valid].mean().item())
 
     def process(self, save_dir: Path = Path("."), plot: bool = False, on_plot=None) -> dict[str, np.ndarray]:
         """
-        Process the detection and segmentation metrics over the given set of predictions.
+        Process accumulated detection and segmentation statistics to compute final metrics.
+
+        This method processes both bounding box (from DetMetrics) and mask statistics, computing precision,
+        recall, mAP, and additional segmentation metrics (Dice, mIoU, boundary F1). It resets per-class
+        aggregates at the start to ensure fresh computation for the current evaluation pass.
 
         Args:
-            save_dir (Path): Directory to save plots. Defaults to Path(".").
-            plot (bool): Whether to plot precision-recall curves. Defaults to False.
-            on_plot (callable, optional): Function to call after plots are generated. Defaults to None.
+            save_dir (Path): Directory to save metric plots and results. Default is Path(".").
+            plot (bool): Whether to generate and save metric plots. Default is False.
+            on_plot (callable | None): Optional callback function for plot generation. Default is None.
 
         Returns:
-            (dict[str, np.ndarray]): Dictionary containing concatenated statistics arrays.
+            (dict[str, np.ndarray]): Dictionary containing processed statistics including:
+                - 'tp_m': Mask true positives per IoU threshold.
+                - 'conf': Confidence scores.
+                - 'pred_cls': Predicted class indices.
+                - 'target_cls': Ground truth class indices.
+
+        Notes:
+            - Automatically calls reset_mask_aggregates() before processing.
+            - Mask aggregates should be updated during validation using update_mask_aggregates().
+            - Returns empty dict if no valid statistics are available.
+
+        Example:
+            >>> metrics = SegmentMetrics(names={0: 'cat', 1: 'dog'})
+            >>> # ... during validation: metrics.update_mask_aggregates() ...
+            >>> results = metrics.process(save_dir=Path('./runs/val'), plot=True)
+            >>> print(f"Processed {len(results)} metric types")
         """
-        stats = DetMetrics.process(self, save_dir, plot, on_plot=on_plot)  # process box stats
+        # Start fresh aggregates for this evaluation
+        self.reset_mask_aggregates()
+
+        stats = DetMetrics.process(self, save_dir, plot, on_plot=on_plot)  # box metrics
+        if not stats:
+            return stats
+
         results_mask = ap_per_class(
             stats["tp_m"],
             stats["conf"],
@@ -1334,75 +1980,211 @@ class SegmentMetrics(DetMetrics):
 
     @property
     def keys(self) -> list[str]:
-        """Return a list of keys for accessing metrics."""
+        """
+        Return a list of all metric keys including detection and segmentation metrics.
+
+        Returns:
+            (list[str]): List of metric keys in the format 'metrics/<metric_name>' for logging and display.
+                Keys include standard detection metrics plus mask-based metrics:
+                - Detection: precision(B), recall(B), mAP50(B), mAP50-95(B)
+                - Segmentation: precision(M), recall(M), mAP50(M), mAP50-95(M), f2(M), dice(M), mIoU(M), boundaryF1(M)
+
+        Example:
+            >>> metrics = SegmentMetrics(names={0: 'cat', 1: 'dog'})
+            >>> keys = metrics.keys
+            >>> print(keys[-3:])  # Print last 3 keys
+            ['metrics/dice(M)', 'metrics/mIoU(M)', 'metrics/boundaryF1(M)']
+        """
         return DetMetrics.keys.fget(self) + [
             "metrics/precision(M)",
             "metrics/recall(M)",
             "metrics/mAP50(M)",
             "metrics/mAP50-95(M)",
+            "metrics/f1(M)",
             "metrics/f2(M)",
+            "metrics/dice(M)",
+            "metrics/mIoU(M)",
+            "metrics/boundaryF1(M)",
         ]
 
     def mean_results(self) -> list[float]:
-        """Return the mean metrics for bounding box and segmentation results."""
-        return DetMetrics.mean_results(self) + self.seg.mean_results() + [self.seg.mf2]  # ADD seg mf2
-    
-    def class_result(self, i: int) -> List[float]:
-        """Return classification results for a specified class index."""
+        """
+        Return mean results for all detection and segmentation metrics.
+
+        Combines mean results from detection metrics (bounding boxes) with segmentation-specific metrics
+        including mask precision/recall, F2, Dice, mIoU, and boundary F1. Used for logging and comparison.
+
+        Returns:
+            (list[float]): List of mean metric values in the order corresponding to self.keys property.
+                Typically includes: [box_metrics..., mask_p, mask_r, mask_map50, mask_map, mask_f2, dice, miou, bf1].
+
+        Example:
+            >>> metrics = SegmentMetrics(names={0: 'cat', 1: 'dog'})
+            >>> # ... process validation results ...
+            >>> results = metrics.mean_results()
+            >>> print(f"Mean Dice: {results[-3]:.3f}, Mean IoU: {results[-2]:.3f}, Mean BF1: {results[-1]:.3f}")
+        """
+        return DetMetrics.mean_results(self) + self.seg.mean_results() + [
+            self.seg.mf1,
+            self.seg.mf2, 
+            self.mdice, 
+            self.miou, 
+            self.mbf1
+        ]
+
+    def class_result(self, i: int) -> list[float]:
+        """
+        Return detection and segmentation metric results for a specific class.
+
+        Args:
+            i (int): Class index for which to retrieve results.
+
+        Returns:
+            (list[float]): List of metric values for the specified class, combining both detection (box)
+                and segmentation (mask) results.
+
+        Example:
+            >>> metrics = SegmentMetrics(names={0: 'cat', 1: 'dog'})
+            >>> # ... process results ...
+            >>> cat_metrics = metrics.class_result(0)
+            >>> print(f"Cat AP: {cat_metrics[2]:.3f}")
+        """
         return DetMetrics.class_result(self, i) + self.seg.class_result(i)
 
     @property
     def maps(self) -> np.ndarray:
-        """Return mAP scores for object detection and semantic segmentation models."""
+        """
+        Return mean Average Precision (mAP) values for both detection and segmentation.
+
+        Returns:
+            (np.ndarray): Array containing mAP values for bounding boxes and masks across different IoU thresholds.
+
+        Example:
+            >>> metrics = SegmentMetrics(names={0: 'cat', 1: 'dog'})
+            >>> maps = metrics.maps
+            >>> print(f"Box mAP@50: {maps[0]:.3f}, Mask mAP@50: {maps[-1]:.3f}")
+        """
         return DetMetrics.maps.fget(self) + self.seg.maps
 
     @property
     def fitness(self) -> float:
-        """Return the fitness score for both segmentation and bounding box models."""
-        return self.seg.fitness() + DetMetrics.fitness.fget(self)
+        """
+        Calculate overall fitness score combining detection and segmentation performance.
+        
+        Computes a weighted combination of box metrics (precision, recall, mAP), mask metrics (precision, recall, mAP),
+        and additional segmentation metrics (Dice, mIoU, boundary F1) based on configured fitness_weights. The result
+        is normalized by the sum of weights. If no weights are configured, falls back to averaging box and mask mAP50-95.
+
+        Returns:
+            (float): Combined fitness score in range [0.0, 1.0].
+
+        Examples:
+            >>> metrics = SegmentMetrics(names={0: 'person', 1: 'car'})
+            >>> # ... process validation results ...
+            >>> fitness = metrics.fitness
+            >>> print(f"Segmentation fitness: {fitness:.3f}")
+        """
+        # Map weight keys to actual metric values
+        metrics_map = {
+            # Box metrics
+            'box_precision': self.box.mp,
+            'box_recall': self.box.mr,
+            'box_mAP50': self.box.map50,
+            'box_mAP50_95': self.box.map,
+            'box_f1': self.box.mf1,
+            'box_f2': self.box.mf2,
+            # Mask metrics
+            'mask_precision': self.seg.mp,
+            'mask_recall': self.seg.mr,
+            'mask_mAP50': self.seg.map50,
+            'mask_mAP50_95': self.seg.map,
+            'mask_f1': self.seg.mf1,
+            'mask_f2': self.seg.mf2,
+            # Additional segmentation metrics
+            'dice': self.mdice,
+            'miou': self.miou,
+            'boundary_f1': self.mbf1
+        }
+        
+        fitness = 0.0
+        total_weight = 0.0
+        
+        for key, weight in self.fitness_weights.items():
+            if weight > 0 and key in metrics_map:
+                metric_value = metrics_map[key]
+                if not np.isnan(metric_value):
+                    fitness += weight * metric_value
+                    total_weight += weight
+        
+        # Normalize by total weight
+        if total_weight > 0:
+            return fitness / total_weight
+        
+        # Fallback: average of box and mask mAP50-95
+        return (self.box.map + self.seg.map) / 2
 
     @property
     def curves(self) -> list[str]:
-        """Return a list of curves for accessing specific metrics curves."""
+        """
+        Return names of all available metric curves for plotting.
+
+        Returns:
+            (list[str]): List of curve names including both detection and segmentation curves:
+                - Detection: Precision-Recall(B), F1-Confidence(B), etc.
+                - Segmentation: Precision-Recall(M), F1-Confidence(M), F2-Confidence(M), etc.
+
+        Example:
+            >>> metrics = SegmentMetrics(names={0: 'cat'})
+            >>> curves = metrics.curves
+            >>> print(f"Available curves: {curves}")
+        """
         return DetMetrics.curves.fget(self) + [
             "Precision-Recall(M)",
             "F1-Confidence(M)",
-            "F2-Confidence(M)",  # ADD this line for mask F2
+            "F2-Confidence(M)",
             "Precision-Confidence(M)",
             "Recall-Confidence(M)",
         ]
 
     @property
     def curves_results(self) -> list[list]:
-        """Return a list of computed performance metrics and statistics."""
+        """
+        Return curve data for all detection and segmentation metrics.
+
+        Returns:
+            (list[list]): Nested list containing curve data points for plotting precision-recall,
+                F1-confidence, and other metric curves.
+
+        Example:
+            >>> metrics = SegmentMetrics(names={0: 'cat', 1: 'dog'})
+            >>> curve_data = metrics.curves_results
+            >>> # Plot curves using curve_data
+        """
         return DetMetrics.curves_results.fget(self) + self.seg.curves_results
 
     def summary(self, normalize: bool = True, decimals: int = 5) -> list[dict[str, Any]]:
         """
-        Generate a summarized representation of per-class segmentation metrics as a list of dictionaries. Includes both
-        box and mask scalar metrics (mAP, mAP50, mAP75) alongside precision, recall, and F1-score for each class.
+        Generate a formatted summary of detection and segmentation metrics for each class.
 
         Args:
-            normalize (bool): For Segment metrics, everything is normalized  by default [0-1].
-            decimals (int): Number of decimal places to round the metrics values to.
+            normalize (bool): Whether to normalize metric values. Default is True.
+            decimals (int): Number of decimal places for rounding metric values. Default is 5.
 
         Returns:
-            (list[dict[str, Any]]): A list of dictionaries, each representing one class with corresponding metric values.
+            (list[dict[str, Any]]): List of dictionaries, one per class, containing metric names and values.
+                Each dictionary includes class name, detection metrics (Box-P, Box-R, etc.), and
+                segmentation metrics (Mask-P, Mask-R, Mask-F1, Mask-F2).
 
-        Examples:
-            >>> results = model.val(data="coco8-seg.yaml")
-            >>> seg_summary = results.summary(decimals=4)
-            >>> print(seg_summary)
+        Example:
+            >>> metrics = SegmentMetrics(names={0: 'cat', 1: 'dog'})
+            >>> summary = metrics.summary()
+            >>> for cls_metrics in summary:
+            ...     print(f"{cls_metrics['Class']}: Mask-F1={cls_metrics['Mask-F1']:.3f}")
         """
-        per_class = {
-            "Mask-P": self.seg.p,
-            "Mask-R": self.seg.r,
-            "Mask-F1": self.seg.f1,
-            "Mask-F2": self.seg.f2,  # ADD this line
-        }
-        summary = DetMetrics.summary(self, normalize, decimals)  # get box summary
+        per_class = {"Mask-P": self.seg.p, "Mask-R": self.seg.r, "Mask-F1": self.seg.f1, "Mask-F2": self.seg.f2}
+        summary = DetMetrics.summary(self, normalize, decimals)
         for i, s in enumerate(summary):
-            s.update({**{k: round(v[i], decimals) for k, v in per_class.items()}})
+            s.update({k: round(v[i], decimals) for k, v in per_class.items()})
         return summary
 
 

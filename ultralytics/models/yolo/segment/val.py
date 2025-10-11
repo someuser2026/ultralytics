@@ -50,7 +50,7 @@ class SegmentationValidator(DetectionValidator):
         super().__init__(dataloader, save_dir, args, _callbacks)
         self.process = None
         self.args.task = "segment"
-        self.metrics = SegmentMetrics()
+        self.metrics = SegmentMetrics(fitness_weights = self.args.fitness_weights)
 
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
         """
@@ -127,55 +127,117 @@ class SegmentationValidator(DetectionValidator):
 
         Args:
             si (int): Batch index.
-            batch (dict[str, Any]): Batch data containing images and annotations.
+            batch (Dict[str, Any]): Batch data containing images and annotations.
 
         Returns:
-            (dict[str, Any]): Prepared batch with processed annotations.
+            (Dict[str, Any]): Prepared batch with processed annotations.
         """
         prepared_batch = super()._prepare_batch(si, batch)
-        nl = prepared_batch["cls"].shape[0]
-        if self.args.overlap_mask:
-            masks = batch["masks"][si]
-            index = torch.arange(1, nl + 1, device=masks.device).view(nl, 1, 1)
-            masks = (masks == index).float()
-        else:
-            masks = batch["masks"][batch["batch_idx"] == si]
-        if nl:
-            mask_size = [s if self.process is ops.process_mask_native else s // 4 for s in prepared_batch["imgsz"]]
-            if masks.shape[1:] != mask_size:
-                masks = F.interpolate(masks[None], mask_size, mode="bilinear", align_corners=False)[0]
-                masks = masks.gt_(0.5)
-        prepared_batch["masks"] = masks
+        midx = [si] if self.args.overlap_mask else batch["batch_idx"] == si
+        prepared_batch["masks"] = batch["masks"][midx]
         return prepared_batch
 
     def _process_batch(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> dict[str, np.ndarray]:
         """
         Compute correct prediction matrix for a batch based on bounding boxes and optional masks.
-
-        Args:
-            preds (dict[str, torch.Tensor]): Dictionary containing predictions with keys like 'cls' and 'masks'.
-            batch (dict[str, Any]): Dictionary containing batch data with keys like 'cls' and 'masks'.
-
-        Returns:
-            (dict[str, np.ndarray]): A dictionary containing correct prediction matrices including 'tp_m' for mask IoU.
+        Also updates per-class aggregates for Dice, mIoU, and boundary-F1 from matched mask pairs.
 
         Notes:
-            - If `masks` is True, the function computes IoU between predicted and ground truth masks.
-            - If `overlap` is True and `masks` is True, overlapping masks are taken into account when computing IoU.
-
-        Examples:
-            >>> preds = {"cls": torch.tensor([1, 0]), "masks": torch.rand(2, 640, 640), "bboxes": torch.rand(2, 4)}
-            >>> batch = {"cls": torch.tensor([1, 0]), "masks": torch.rand(2, 640, 640), "bboxes": torch.rand(2, 4)}
-            >>> correct_preds = validator._process_batch(preds, batch)
+            - Uses greedy one-to-one matching among (gt, pred) pairs with IoU >= first threshold.
+            - Matching is deterministic and GPU-friendly (no Python sets in tight loops).
         """
         tp = super()._process_batch(preds, batch)
-        gt_cls = batch["cls"]
-        if gt_cls.shape[0] == 0 or preds["cls"].shape[0] == 0:
-            tp_m = np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)
-        else:
-            iou = mask_iou(batch["masks"].flatten(1), preds["masks"].flatten(1))
-            tp_m = self.match_predictions(preds["cls"], gt_cls, iou).cpu().numpy()
-        tp.update({"tp_m": tp_m})  # update tp with mask IoU
+        gt_cls, gt_masks = batch["cls"], batch["masks"]
+
+        # Early return if no ground truth or predictions
+        if len(gt_cls) == 0 or len(preds["cls"]) == 0:
+            tp_m = np.zeros((len(preds["cls"]), self.niou), dtype=bool)
+            tp.update({"tp_m": tp_m})
+            return tp
+
+        pred_masks = preds["masks"]
+        device = gt_masks.device
+        
+        # Handle overlap_mask case by expanding instance channels from an overlapped label mask
+        if getattr(self.args, "overlap_mask", False):
+            nl = len(gt_cls)
+            index = torch.arange(nl, device=device).view(nl, 1, 1) + 1
+            gt_masks = gt_masks.repeat(nl, 1, 1)  # (1,H,W) -> (nl,H,W)
+            gt_masks = torch.where(gt_masks == index, 1.0, 0.0)
+
+        # Shape alignment: resize GT to pred size if needed
+        if gt_masks.shape[1:] != pred_masks.shape[1:]:
+            gt_masks = F.interpolate(
+                gt_masks[None].float(), 
+                pred_masks.shape[1:], 
+                mode="bilinear", 
+                align_corners=False
+            )[0]
+            gt_masks = gt_masks.gt_(0.5)
+
+        # Compute mask IoU on flattened masks
+        iou = mask_iou(
+            gt_masks.reshape(gt_masks.shape[0], -1).float(),
+            pred_masks.reshape(pred_masks.shape[0], -1).float()
+        )
+
+        # Regular mask mAP TPs (per thresholds)
+        tp_m = self.match_predictions(preds["cls"], gt_cls, iou).cpu().numpy()
+
+        # -------- Aggregates: Dice / mIoU / Boundary-F1 (one-to-one greedy on first IoU threshold) --------
+        with torch.no_grad():
+            # Zero IoU for mismatched classes
+            class_ok = (gt_cls[:, None] == preds["cls"][None])
+            iou_c = iou * class_ok.float()  # Ensure float for proper masking
+            
+            # Get threshold (default to 0.5 if not available)
+            thr = float(self.iouv[0].item()) if hasattr(self, "iouv") and self.iouv is not None else 0.5
+
+            # Find all potential matches above threshold
+            matches = torch.nonzero(iou_c >= thr, as_tuple=False)  # [K, 2] (g, p)
+            
+            if matches.numel() > 0:
+                # Sort by IoU in descending order for greedy matching
+                ious_flat = iou_c[matches[:, 0], matches[:, 1]]
+                order = torch.argsort(ious_flat, descending=True)
+                matches = matches[order]
+
+                # Greedy unique assignment using boolean masks (no Python loops in critical path)
+                taken_g = torch.zeros(gt_cls.shape[0], dtype=torch.bool, device=device)
+                taken_p = torch.zeros(preds["cls"].shape[0], dtype=torch.bool, device=device)
+                
+                # Vectorized filtering of matches
+                keep_mask = torch.zeros(matches.shape[0], dtype=torch.bool, device=device)
+                for k in range(matches.shape[0]):
+                    g, p = matches[k, 0].item(), matches[k, 1].item()
+                    if not taken_g[g] and not taken_p[p]:
+                        keep_mask[k] = True
+                        taken_g[g] = True
+                        taken_p[p] = True
+
+                if keep_mask.any():
+                    # Get matched indices
+                    matched = matches[keep_mask]
+                    g_idx = matched[:, 0]
+                    p_idx = matched[:, 1]
+                    cls_indices = gt_cls[g_idx].to(torch.long)
+
+                    # Get matched masks (already aligned, convert to boolean)
+                    gsel = gt_masks[g_idx].bool()
+                    psel = pred_masks[p_idx].bool()
+
+                    # Validate mask shapes before updating
+                    if gsel.shape == psel.shape and gsel.numel() > 0:
+                        # Update per-class aggregates
+                        boundary_tolerance = getattr(self.args, "boundary_tolerance", 1)
+                        self.metrics.update_mask_aggregates(
+                            cls_indices, 
+                            gsel, 
+                            psel,
+                            boundary_tolerance=boundary_tolerance
+                        )
+
+        tp.update({"tp_m": tp_m})
         return tp
 
     def plot_predictions(self, batch: dict[str, Any], preds: list[dict[str, torch.Tensor]], ni: int) -> None:

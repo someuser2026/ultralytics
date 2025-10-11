@@ -158,6 +158,9 @@ CFG_FLOAT_KEYS = frozenset(
         "time",
         "workspace",
         "batch",
+        "seg_w_lovasz",
+        "seg_w_dice",
+        "seg_w_bce",
     }
 )
 CFG_FRACTION_KEYS = frozenset(
@@ -237,6 +240,7 @@ CFG_BOOL_KEYS = frozenset(
         "nms",
         "profile",
         "multi_scale",
+        "seg_use_mixed_loss",
     }
 )
 

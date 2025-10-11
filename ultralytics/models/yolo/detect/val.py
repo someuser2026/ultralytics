@@ -59,7 +59,7 @@ class DetectionValidator(BaseValidator):
         self.args.task = "detect"
         self.iouv = torch.linspace(0.5, 0.95, 10)  # IoU vector for mAP@0.5:0.95
         self.niou = self.iouv.numel()
-        self.metrics = DetMetrics()
+        self.metrics = DetMetrics(fitness_weights = self.args.fitness_weights)
 
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
         """
@@ -240,6 +240,12 @@ class DetectionValidator(BaseValidator):
     def print_results(self) -> None:
         """Print training/validation set metrics per class."""
         pf = "%22s" + "%11i" * 2 + "%11.3g" * len(self.metrics.keys)  # print format
+        # print("-"*50)
+        # print("Inisde detect/val.py 244")
+        # print("self.seen:", self.seen)
+        # print("self.metrics.nt_per_class.sum():", self.metrics.nt_per_class.sum())
+        # print("self.metrics.mean_results:", self.metrics.mean_results())
+        # print("-"*50)
         LOGGER.info(pf % ("all", self.seen, self.metrics.nt_per_class.sum(), *self.metrics.mean_results()))
         if self.metrics.nt_per_class.sum() == 0:
             LOGGER.warning(f"no labels found in {self.args.task} set, can not compute metrics without labels")

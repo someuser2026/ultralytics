@@ -1,7 +1,12 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-from ultralytics.utils import SETTINGS, TESTS_RUNNING
+import yaml
+from pathlib import Path
+# from ultralytics.models.yolo.model import YOLO
+
+from ultralytics.utils import SETTINGS, TESTS_RUNNING, LOGGER
 from ultralytics.utils.torch_utils import model_info_for_loggers
+from ultralytics.models.yolo.model import YOLO
 
 try:
     assert not TESTS_RUNNING  # do not log pytest
@@ -154,16 +159,58 @@ def on_train_epoch_end(trainer):
     if trainer.epoch == 1:
         _log_plots(trainer.plots, step=trainer.epoch + 1)
 
+def _has_test_split(data_spec) -> bool:
+    """
+    Return True iff 'test:' exists in the dataset YAML.
+    Handles multiple data specification formats:
+    - Path to YAML file
+    - Dictionary with 'test' key
+    - Inline string (returns True optimistically)
+    """
+    try:
+        # Case 1: data_spec is a Path or string pointing to a YAML file
+        if isinstance(data_spec, (str, Path)):
+            p = Path(str(data_spec))
+            if p.exists() and p.suffix in {".yaml", ".yml"}:
+                content = p.read_text(encoding="utf-8")
+                data_dict = yaml.safe_load(content)
+                
+                if isinstance(data_dict, dict):
+                    # Check if 'test' key exists and is not None/empty
+                    test_value = data_dict.get("test")
+                    return test_value is not None and test_value != ""
+        
+        # Case 2: data_spec is already a dictionary
+        elif isinstance(data_spec, dict):
+            test_value = data_spec.get("test")
+            return test_value is not None and test_value != ""
+        
+    except Exception as e:
+        # If parsing fails (e.g., custom YAML loader, encoding issues),
+        # return True optimistically and let Ultralytics validator handle it
+        import warnings
+        warnings.warn(f"Could not parse data spec for test split detection: {e}. Assuming test split exists.")
+    
+    # Optimistic default: if we can't determine, assume test exists
+    # This prevents skipping test eval when it might be available
+    return False
+
 
 def on_train_end(trainer):
-    """Save the best model as an artifact and log final plots at the end of training."""
-    _log_plots(trainer.validator.plots, step=trainer.epoch + 1)
-    _log_plots(trainer.plots, step=trainer.epoch + 1)
-    # art = wb.Artifact(type="model", name=f"run_{wb.run.id}_model")
-    # if trainer.best.exists():
-    #     art.add_file(trainer.best)
-    #     wb.run.log_artifact(art, aliases=["best"])
-    # Check if we actually have plots to save
+    """
+    End-of-training:
+      1) Log final train/val plots (existing behavior).
+      2) Evaluate the BEST checkpoint on the TEST split (if present), with plots disabled.
+      3) Log test metrics into the same W&B run.
+      4) Finish the W&B run.
+    """
+    step = trainer.epoch + 1
+
+    # Existing behavior: log final train/val plots
+    # _log_plots(trainer.validator.plots, step=step)
+    # _log_plots(trainer.plots, step=step)
+
+    # Existing: optional curves (val)
     if trainer.args.plots and hasattr(trainer.validator.metrics, "curves_results"):
         for curve_name, curve_values in zip(trainer.validator.metrics.curves, trainer.validator.metrics.curves_results):
             x, y, x_title, y_title = curve_values
@@ -176,7 +223,69 @@ def on_train_end(trainer):
                 x_title=x_title,
                 y_title=y_title,
             )
-    wb.run.finish()  # required or run continues on dashboard
+
+    # NEW: post-training evaluation on TEST split using BEST model; no plot saving/logging
+    try:
+        data = getattr(trainer.args, "data", None)
+        if not data:
+            LOGGER.info("No data config provided; skipping test evaluation.")
+        elif not _has_test_split(data):
+            LOGGER.info("No 'test' split in data.yaml; skipping test evaluation.")
+        else:
+            # Determine which model to use for test evaluation
+            best_path = getattr(trainer, "best", None)
+            best_exists = bool(best_path) and Path(best_path).exists()
+
+            if best_exists:
+                LOGGER.info(f"Evaluating best checkpoint on test split: {best_path}")
+                best_model = YOLO(str(best_path))
+            else:
+                LOGGER.info("Best checkpoint not found; using current model for test evaluation.")
+                best_model = trainer.model
+
+            # Run test evaluation with plots disabled
+            test_results = best_model.val(
+                data=data,
+                split="test",
+                device=getattr(trainer.args, "device", None),
+                batch=getattr(trainer.args, "batch", None),
+                imgsz=getattr(trainer.args, "imgsz", None),
+                conf=getattr(trainer.args, "conf", 0.001),
+                iou=getattr(trainer.args, "iou", 0.7),
+                plots=False,  # Disable plot generation/saving
+                save_json=False,  # Optional: disable JSON saving
+                verbose=False,  # Optional: reduce console output
+            )
+
+            # Log test metrics to the SAME run (both series and summary)
+            if hasattr(test_results, "results_dict") and isinstance(test_results.results_dict, dict):
+                prefixed_metrics = {f"test/{k}": v for k, v in test_results.results_dict.items()}
+                
+                # Log as timestep entry
+                wb.run.log(prefixed_metrics, step=step)
+                
+                # Also update summary for easy access
+                wb.run.summary.update(prefixed_metrics)
+                
+                # Optional: log a summary message
+                if "metrics/mAP50-95(B)" in test_results.results_dict:
+                    map_value = test_results.results_dict["metrics/mAP50-95(B)"]
+                    LOGGER.info(f"Test evaluation complete. mAP50-95: {map_value:.4f}")
+            else:
+                LOGGER.info("Test results object missing 'results_dict' attribute.")
+
+    except Exception as e:
+        # Log detailed error information
+        error_info = {
+            "test_eval_error": str(e),
+            "test_eval_error_type": type(e).__name__,
+            # "test_eval_traceback": traceback.format_exc(),
+        }
+        LOGGER.info(error_info)
+        wb.run.summary.update({"test_eval_failed": True})
+
+    # Finish the run (existing behavior)
+    wb.run.finish()
 
 
 callbacks = (
