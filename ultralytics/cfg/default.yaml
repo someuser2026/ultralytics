@@ -62,20 +62,20 @@ max_det: 300 # (int) maximum number of detections per image
 half: False # (bool) use half precision (FP16) if supported
 dnn: False # (bool) use OpenCV DNN for ONNX inference
 plots: True # (bool) save plots and images during train/val
-comparision_metric: fitness # (str) metric to use for comparison, choices=[fitness, f1, f2, custom]
+# comparision_metric: fitness # (str) metric to use for comparison, choices=[fitness, f1, f2, custom]
 
 # Fitness function configuration for model selection
 fitness_weights: # (dict) weights for different metrics in fitness calculation
   # Detection metrics
   precision: 0.0    # (float) weight for precision
-  recall: 0.0       # (float) weight for recall  
+  recall: 0.05       # (float) weight for recall  
   mAP50: 0.0        # (float) weight for mAP@0.5
   mAP50_95: 1.0     # (float) weight for mAP@0.5:0.95
   # Segmentation metrics (for segment task)
   mask_precision: 0.0    # (float) weight for mask precision
   mask_recall: 0.0       # (float) weight for mask recall
   mask_mAP50: 0.0        # (float) weight for mask mAP@0.5
-  mask_mAP50_95: 0.0     # (float) weight for mask mAP@0.5:0.95
+  mask_mAP50_95: 0.07     # (float) weight for mask mAP@0.5:0.95
   f1: 0.0           # (float) weight for F1 score
   f2: 0.0           # (float) weight for F2 score
   dice: 0.0         # (float) weight for Dice coefficient
@@ -83,7 +83,7 @@ fitness_weights: # (dict) weights for different metrics in fitness calculation
   boundary_f1: 0.0  # (float) weight for boundary F1 score
 
 # Additional segmentation metric settings ------------------------------------------------------------------------------
-boundary_tolerance: 1 # (int) pixel tolerance for boundary-F1 (segmentation metrics)
+boundary_tolerance: 2 # (int) pixel tolerance for boundary-F1 (segmentation metrics)
 
 # Predict settings -----------------------------------------------------------------------------------------------------
 source: # (str, optional) path/dir/URL/stream for images or videos; e.g. 'ultralytics/assets' or '0' for webcam

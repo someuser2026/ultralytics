@@ -1732,6 +1732,10 @@ class SegmentMetrics(DetMetrics):
         self._init_done = False
         self._dice_num = self._dice_den = self._iou_inter = self._iou_union = None
         self._b_tp = self._b_fp = self._b_fn = None
+    
+    def clear_stats(self):
+        super().clear_stats()
+        self.reset_mask_aggregates()
 
     def update_mask_aggregates(
     self,
@@ -1957,7 +1961,7 @@ class SegmentMetrics(DetMetrics):
             >>> print(f"Processed {len(results)} metric types")
         """
         # Start fresh aggregates for this evaluation
-        self.reset_mask_aggregates()
+        # self.reset_mask_aggregates()
 
         stats = DetMetrics.process(self, save_dir, plot, on_plot=on_plot)  # box metrics
         if not stats:
@@ -2064,7 +2068,7 @@ class SegmentMetrics(DetMetrics):
             >>> maps = metrics.maps
             >>> print(f"Box mAP@50: {maps[0]:.3f}, Mask mAP@50: {maps[-1]:.3f}")
         """
-        return DetMetrics.maps.fget(self) + self.seg.maps
+        return np.concatenate(DetMetrics.maps.fget(self), self.seg.maps)
 
     @property
     def fitness(self) -> float:
