@@ -390,34 +390,6 @@ def boundary_f1(
     
     return precision, recall, f1
 
-def boundary_iou(
-    mask_gt: torch.Tensor,
-    mask_pred: torch.Tensor,
-    tolerance: int = 1,
-    eps: float = 1e-7,
-) -> torch.Tensor:
-    """
-    Boundary IoU between GT and predicted masks with pixel tolerance.
-    Returns per-pair IoU (N,). Mirrors boundary_f1's tolerance behavior.
-    """
-    if mask_gt.dim() == 2:
-        mask_gt = mask_gt.unsqueeze(0)
-    if mask_pred.dim() == 2:
-        mask_pred = mask_pred.unsqueeze(0)
-
-    gt_b = _extract_boundary(mask_gt).bool()
-    pr_b = _extract_boundary(mask_pred).bool()
-
-    if tolerance > 0:
-        k = 2 * tolerance + 1
-        gt_b = F.max_pool2d(gt_b.unsqueeze(1).float(), kernel_size=k, stride=1, padding=tolerance).squeeze(1).bool()
-        pr_b = F.max_pool2d(pr_b.unsqueeze(1).float(), kernel_size=k, stride=1, padding=tolerance).squeeze(1).bool()
-
-    inter = (gt_b & pr_b).sum(dim=(1, 2)).float()
-    union = (gt_b | pr_b).sum(dim=(1, 2)).float()
-    return inter / (union + eps)
-
-
 
 
 def kpt_iou(
@@ -1709,7 +1681,7 @@ class SegmentMetrics(DetMetrics):
         self.task = "segment"
         self.stats["tp_m"] = []
 
-                # Aggregates for additional segmentation metrics
+        # Aggregates for additional segmentation metrics
         self._init_done = False
         self._device = torch.device("cpu")
         self._dice_num = None
@@ -1719,10 +1691,6 @@ class SegmentMetrics(DetMetrics):
         self._b_tp = None
         self._b_fp = None
         self._b_fn = None
-        # NEW: Boundary IoU accumulators
-        self._biou_inter = None   # NEW
-        self._biou_union = None   # NEW
-
 
     def _ensure_init(self):
         """
@@ -1747,9 +1715,6 @@ class SegmentMetrics(DetMetrics):
         self._b_tp = zeros.clone()
         self._b_fp = zeros.clone()
         self._b_fn = zeros.clone()
-        # NEW: Boundary IoU (double precision on CPU)
-        self._biou_inter = zeros.clone()   # NEW
-        self._biou_union = zeros.clone()   # NEW
         self._init_done = True
 
     def reset_mask_aggregates(self) -> None:
@@ -1767,7 +1732,6 @@ class SegmentMetrics(DetMetrics):
         self._init_done = False
         self._dice_num = self._dice_den = self._iou_inter = self._iou_union = None
         self._b_tp = self._b_fp = self._b_fn = None
-        self._biou_inter = self._biou_union = None
     
     def clear_stats(self):
         super().clear_stats()
@@ -1874,13 +1838,6 @@ class SegmentMetrics(DetMetrics):
         self._b_fp.scatter_add_(0, cls_indices_cpu, fp_b.cpu().double())
         self._b_fn.scatter_add_(0, cls_indices_cpu, fn_b.cpu().double())
 
-                # NEW: Boundary IoU accumulation using the same tolerance-dilated boundaries (gt_d, pr_d)
-        b_inter = (gt_d & pr_d).sum(dim=(1, 2)).float()
-        b_union = (gt_d | pr_d).sum(dim=(1, 2)).float()
-
-        self._biou_inter.scatter_add_(0, cls_indices_cpu, b_inter.cpu().double())
-        self._biou_union.scatter_add_(0, cls_indices_cpu, b_union.cpu().double())
-
     @property
     def mdice(self) -> float:
         """
@@ -1971,20 +1928,6 @@ class SegmentMetrics(DetMetrics):
         if not valid.any():
             return 0.0
         return float(f1[valid].mean().item())
-    
-    @property
-    def mboundary_iou(self) -> float:
-        """
-        Mean Boundary IoU across classes with non-zero boundary union (dataset-level scalar).
-        """
-        self._ensure_init()
-        eps = 1e-7
-        valid = self._biou_union > eps
-        if not valid.any():
-            return 0.0
-        biou_c = self._biou_inter / (self._biou_union + eps)
-        return float(biou_c[valid].mean().item())
-
 
     def process(self, save_dir: Path = Path("."), plot: bool = False, on_plot=None) -> dict[str, np.ndarray]:
         """
@@ -2066,9 +2009,7 @@ class SegmentMetrics(DetMetrics):
             "metrics/dice(M)",
             "metrics/mIoU(M)",
             "metrics/boundaryF1(M)",
-            "metrics/boundaryIoU(M)",   # NEW
         ]
-
 
     def mean_results(self) -> list[float]:
         """
@@ -2092,8 +2033,7 @@ class SegmentMetrics(DetMetrics):
             self.seg.mf2, 
             self.mdice, 
             self.miou, 
-            self.mbf1,
-            self.mboundary_iou
+            self.mbf1
         ]
 
     def class_result(self, i: int) -> list[float]:

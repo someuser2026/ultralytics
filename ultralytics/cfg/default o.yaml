@@ -40,20 +40,14 @@ multi_scale: False # (bool) multiscale training by varying image size
 compile: False # (bool | str) enable torch.compile() backend='inductor'; True="default", False=off, or "default|reduce-overhead|max-autotune-no-cudagraphs"
 
 # Segmentation
-overlap_mask: true # (bool) merge instance masks into one mask during training (segment only)
+overlap_mask: True # (bool) merge instance masks into one mask during training (segment only)
 mask_ratio: 4 # (int) mask downsample ratio (segment only)
-seg_use_mixed_loss: true # (bool) use mixed loss for segmentation
+seg_use_mixed_loss: False # (bool) use mixed loss for segmentation
 seg_w_lovasz: 0.3 # (float) weight for lovasz loss for segmentation
 seg_w_dice: 0.5 # (float) weight for dice loss for segmentation
 seg_w_bce: 0.2 # (float) weight for bce loss for segmentation
 seg_ignore_index: -100 # (int) ignore index for segmentation
-seg_area_normalize: false # (bool) False: no normalization, True: normalize by image area
-
-# In your model yaml (args section)
-use_soft_ignore_band: true
-ignore_band_width: 10.0        # pixels @ imgsz
-soft_ignore_transition_ratio: 0.5
-use_ultrafast_ignore_band: true
+seg_area_normalize: False # (bool) False: no normalization, True: normalize by image area
 
 # Classification
 dropout: 0.0 # (float) dropout for classification head (classify only)
@@ -87,7 +81,6 @@ fitness_weights:
 
 # Additional segmentation metric settings ------------------------------------------------------------------------------
 boundary_tolerance: 2 # (int) pixel tolerance for boundary-F1 (segmentation metrics)
-
 
 # Predict settings -----------------------------------------------------------------------------------------------------
 source: # (str, optional) path/dir/URL/stream for images or videos; e.g. 'ultralytics/assets' or '0' for webcam

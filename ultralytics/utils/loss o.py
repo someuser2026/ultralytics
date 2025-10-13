@@ -33,48 +33,53 @@ def _to_float_tensor(x: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def create_soft_ignore_weights_fast(gt_masks: torch.Tensor,
-                                    ignore_width: float,
-                                    transition_ratio: float = 0.5,
-                                    device: torch.device | None = None) -> torch.Tensor:
+def create_soft_ignore_weights_fast(
+    gt_masks: torch.Tensor,
+    ignore_width: float,
+    transition_ratio: float = 0.5,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
     """
-    Accurate version (EDT). Accepts (H,W) or (N,H,W). Returns (N,H,W).
+    Accurate soft-ignore using distance to the mask edge.
+    Zones:
+      - [0, hard): weight=0
+      - [hard, ignore): weight rises smoothly to 1 (Gaussian)
+      - [ignore, +inf): weight=1
     """
+    if ignore_width <= 0:
+        return torch.ones_like(gt_masks, dtype=torch.float32)
+
     if device is None:
         device = gt_masks.device
-    if ignore_width <= 0:
-        return gt_masks.new_ones((*((1,) if gt_masks.ndim == 2 else ()), *gt_masks.shape[-2:])).expand_as(
-            gt_masks if gt_masks.ndim == 3 else gt_masks.unsqueeze(0)
-        ).to(dtype=torch.float32)
-
-    x = (gt_masks > 0.5).to(torch.uint8)
-    if x.ndim == 2:
-        x = x.unsqueeze(0)
-    N, H, W = x.shape
 
     if not _HAS_SCI_CV:
-        return create_soft_ignore_weights_torch(x.to(torch.float32), ignore_width, transition_ratio, device=device)
+        # Fallback if SciPy/OpenCV is not present
+        return create_soft_ignore_weights_torch(gt_masks, ignore_width, transition_ratio, device=device)
 
-    import numpy as np, cv2
-    from scipy.ndimage import distance_transform_edt
-
-    masks_np = x.detach().to('cpu', torch.uint8).numpy()
+    masks_np = gt_masks.detach().to('cpu', torch.uint8).numpy()
+    N, H, W = masks_np.shape
     weight_maps = np.ones((N, H, W), dtype=np.float32)
 
-    hard_w = int(np.ceil(ignore_width * max(0.0, min(1.0, transition_ratio))))
-    trans_w = max(0, int(np.ceil(ignore_width - hard_w)))
+    hard_w = int(math.ceil(ignore_width * max(0.0, min(1.0, transition_ratio))))
+    trans_w = max(0, int(math.ceil(ignore_width - hard_w)))
     sigma = max(trans_w / 3.0, 0.5) if trans_w > 0 else 1.0
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
     for i in range(N):
-        m = masks_np[i]
-        if m.sum() == 0:
+        mask = masks_np[i]
+        if mask.sum() == 0:
             continue
-        edges = cv2.morphologyEx(m, cv2.MORPH_GRADIENT, kernel)
+        edges = cv2.morphologyEx(mask, cv2.MORPH_GRADIENT, kernel)
+        # distance from edges in pixels
         dist = distance_transform_edt(1 - edges).astype(np.float32)
+
         w = np.ones_like(dist, dtype=np.float32)
+
         if hard_w > 0:
-            w[dist < hard_w] = 0.0
+            hard_zone = dist < hard_w
+            w[hard_zone] = 0.0
+
         if trans_w > 0:
             band = (dist >= hard_w) & (dist < hard_w + trans_w)
             if band.any():
@@ -86,54 +91,58 @@ def create_soft_ignore_weights_fast(gt_masks: torch.Tensor,
 
 
 @torch.no_grad()
-def create_soft_ignore_weights_torch(gt_masks: torch.Tensor,
-                                     ignore_width: float,
-                                     transition_ratio: float = 0.5,
-                                     device: torch.device | None = None) -> torch.Tensor:
+def create_soft_ignore_weights_torch(
+    gt_masks: torch.Tensor,
+    ignore_width: float,
+    transition_ratio: float = 0.5,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
     """
-    Pure-Torch approximation. Accepts (H,W) or (N,H,W). Returns (N,H,W).
+    Ultra-fast, pure PyTorch approximation (no SciPy/OpenCV).
+    Uses iterative erosions to approximate a soft band.
     """
     if device is None:
         device = gt_masks.device
-    x = (gt_masks > 0.5).to(torch.float32)
-    if x.ndim == 2:
-        x = x.unsqueeze(0)
-    N, H, W = x.shape
 
     if ignore_width <= 0:
-        return torch.ones((N, H, W), device=device, dtype=torch.float32)
+        return torch.ones_like(gt_masks, dtype=torch.float32)
+
+    masks = (gt_masks > 0.5).to(torch.float32)
+    N, H, W = masks.shape
+    weight = torch.ones((N, H, W), device=device, dtype=torch.float32)
 
     hard_w = max(1, int(math.ceil(ignore_width * max(0.0, min(1.0, transition_ratio)))))
     trans_w = max(0, int(math.ceil(ignore_width - hard_w)))
 
+    # erosion utility (binary)
     def erode(bin_mask: torch.Tensor, r: int) -> torch.Tensor:
         if r <= 0:
             return bin_mask
         k = 2 * r + 1
-        inv = 1.0 - bin_mask.unsqueeze(1)  # (N,1,H,W)
-        mp = torch.nn.functional.max_pool2d(inv, kernel_size=k, stride=1, padding=r)
+        inv = 1.0 - bin_mask  # 1 where background
+        # If any background in the window -> max_pool > 0 => eroded becomes 0
+        mp = torch.nn.functional.max_pool2d(inv.unsqueeze(1), kernel_size=k, stride=1, padding=r)
         return (mp == 0).to(torch.float32).squeeze(1)
 
-    weights = torch.ones((N, H, W), device=device, dtype=torch.float32)
-    core = erode(x, hard_w) if hard_w > 0 else x
-    weights[core > 0.5] = 1.0
+    core = erode(masks, hard_w) if hard_w > 0 else masks
+    weight[core > 0.5] = 1.0  # core = full weight
 
     if trans_w > 0:
         steps = min(5, trans_w)
         step_size = max(1, trans_w // steps)
         for s in range(1, steps + 1):
             r = hard_w + s * step_size
-            er = erode(x, r)
-            band = (x > 0.5) & (core < 0.5) & (er < 0.5)
-            weights[band] = s / steps
+            er = erode(masks, r)
+            # band is the ring that disappears at this erosion step
+            band = (masks > 0.5) & (core < 0.5) & (er < 0.5)
+            weight[band] = s / steps
 
     if hard_w > 0:
-        inner = erode(x, max(1, hard_w - 1))
-        hard_zone = (x > 0.5) & (inner < 0.5)
-        weights[hard_zone] = 0.0
+        inner = erode(masks, max(1, hard_w - 1))
+        hard_zone = (masks > 0.5) & (inner < 0.5)
+        weight[hard_zone] = 0.0
 
-    return weights
-
+    return weight
 # ----------------------------------------------------------------------------- 
 
 
@@ -655,6 +664,7 @@ class v8SegmentationLoss(v8DetectionLoss):
     def __init__(self, model):  # model must be de-paralleled
         """Initialize the v8SegmentationLoss class with model parameters and mask overlap setting."""
         super().__init__(model)
+        
         self.overlap = model.args.overlap_mask
 
         self.use_mixed_loss = getattr(model.args, "seg_use_mixed_loss", False)
@@ -681,6 +691,7 @@ class v8SegmentationLoss(v8DetectionLoss):
 
     def __call__(self, preds: Any, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the combined loss for detection and segmentation."""
+
         self._weight_map_cache.clear()
 
         loss = torch.zeros(4, device=self.device)  # box, seg, cls, dfl
@@ -775,37 +786,36 @@ class v8SegmentationLoss(v8DetectionLoss):
     ) -> torch.Tensor:
 
         # 1) assemble logits from prototypes
-        # Assemble logits from prototypes
-        pred_mask = torch.einsum("in,nhw->ihw", pred, proto)  # (Npos, H, W)
-        Npos, H, W = pred_mask.shape
+        pred_mask = torch.einsum("in,nhw->ihw", pred, proto)  # (n,H,W)
 
-        # Generate weight map on the same per-anchor gt_mask tensor
+        # 2) optional soft-ignore weight map per-instance
         weight_map = None
         if self.use_soft_ignore_band:
+            # scale width from tile size to proto resolution (H)
             proto_h = proto.shape[-2]
             scale = float(proto_h) / float(max(1, self.tile_size))
             scaled_ignore = max(0.0, self.ignore_band_width * scale)
 
-            if _HAS_SCI_CV and not self.use_ultrafast_ignore:
-                wm = create_soft_ignore_weights_fast(gt_mask, scaled_ignore, self.soft_ignore_transition_ratio, device=gt_mask.device)
-            else:
-                wm = create_soft_ignore_weights_torch(gt_mask, scaled_ignore, self.soft_ignore_transition_ratio, device=gt_mask.device)
-
-            # Robust shape guard
-            if wm.ndim != 3:
-                wm = wm.view(Npos, H, W)
-            if wm.shape[0] != Npos or wm.shape[-2:] != (H, W):
-                # Fallback: per-instance generation
-                wms = []
-                for k in range(Npos):
-                    gk = gt_mask[k]  # (H, W)
-                    wmk = create_soft_ignore_weights_torch(gk, scaled_ignore, self.soft_ignore_transition_ratio, device=gt_mask.device)
-                    wms.append(wmk.unsqueeze(0))
-                wm = torch.cat(wms, dim=0)
-
-            weight_map = wm.to(dtype=pred_mask.dtype)
-
-
+            # cache key per tensor reference (local to this forward)
+            key = id(gt_mask)
+            if key not in self._weight_map_cache:
+                # choose accurate or fast generator
+                if _HAS_SCI_CV and not self.use_ultrafast_ignore:
+                    wm = create_soft_ignore_weights_fast(
+                        (gt_mask > 0.5).to(torch.float32),
+                        ignore_width=scaled_ignore,
+                        transition_ratio=self.soft_ignore_transition_ratio,
+                        device=gt_mask.device,
+                    )
+                else:
+                    wm = create_soft_ignore_weights_torch(
+                        (gt_mask > 0.5).to(torch.float32),
+                        ignore_width=scaled_ignore,
+                        transition_ratio=self.soft_ignore_transition_ratio,
+                        device=gt_mask.device,
+                    )
+                self._weight_map_cache[key] = wm
+            weight_map = self._weight_map_cache[key]
 
         # 3) route to MixedMaskLoss if enabled; else legacy BCE path
         if getattr(self, "use_mixed_loss", False) and hasattr(self, "mixed_mask_loss"):
@@ -819,16 +829,6 @@ class v8SegmentationLoss(v8DetectionLoss):
             )
 
         # 4) legacy BCE with optional weighting
-        # … then proceed:
-        loss_map = torch.nn.functional.binary_cross_entropy_with_logits(pred_mask, gt_mask, reduction="none")
-        if weight_map is not None:
-            loss_map = loss_map * weight_map
-            cropped_loss = crop_mask(loss_map, xyxy)
-            cropped_w    = crop_mask(weight_map, xyxy)
-            valid_sum = cropped_w.sum(dim=(1, 2)).clamp_min(1e-6)
-            return (cropped_loss.sum(dim=(1, 2)) / valid_sum / area.clamp_min(1e-6)).sum()
-        else:
-            return (crop_mask(loss_map, xyxy).mean(dim=(1, 2)) / area.clamp_min(1e-6)).sum()
         loss_map = torch.nn.functional.binary_cross_entropy_with_logits(pred_mask, gt_mask, reduction="none")
 
         if weight_map is not None:

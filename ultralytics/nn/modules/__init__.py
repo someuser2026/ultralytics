@@ -85,6 +85,7 @@ from .conv import (
     LightConv,
     RepConv,
     SpatialAttention,
+    DeformableConv2d
 )
 from .head import (
     OBB,
