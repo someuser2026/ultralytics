@@ -1714,8 +1714,8 @@ class SegmentMetrics(DetMetrics):
         self.fitness_weights = fitness_weights or default_weights
         
         # Initialize parent with box-specific weights
-        # box_weights = {k: v for k, v in self.fitness_weights.items() if k.startswith('box_')}
-        super().__init__(names, fitness_weights=fitness_weights)
+        box_weights = {k: v for k, v in self.fitness_weights.items() if k.startswith('box_')}
+        super().__init__(names, fitness_weights=box_weights)
         
         # Initialize mask metrics with mask-specific weights
         mask_weights = {k.replace('mask_', ''): v for k, v in self.fitness_weights.items() if k.startswith('mask_')}
@@ -1781,10 +1781,6 @@ class SegmentMetrics(DetMetrics):
         self._dice_num = self._dice_den = self._iou_inter = self._iou_union = None
         self._b_tp = self._b_fp = self._b_fn = None
         self._biou_inter = self._biou_union = None
-    
-    def clear_stats(self):
-        super().clear_stats()
-        self.reset_mask_aggregates()
 
     def update_mask_aggregates(
     self,
