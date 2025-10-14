@@ -8,7 +8,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-from torchvision.ops import DeformConv2d
+import torchvision
 
 __all__ = (
     "Conv",
@@ -25,7 +25,7 @@ __all__ = (
     "Concat",
     "RepConv",
     "Index",
-    "DeformableConv2d"
+    "DeformableConv2d",
 )
 
 
@@ -761,124 +761,113 @@ class SE(nn.Module):
 
 class DeformableConv2d(nn.Module):
     """
-    Deformable Convolution v1/v2 block (torchvision-backed).
+    Deformable Convolution v2 layer.
 
-    Wraps `torchvision.ops.DeformConv2d` and predicts per-location offsets and
-    (optionally) a modulation mask. The offset/mask heads share the same stride,
-    padding and dilation as the DCN to ensure spatial size agreement.
+    Wraps torchvision.ops.DeformConv2d with learnable offset and mask prediction. Offsets allow sampling locations
+    to adapt spatially, and masks modulate each location's contribution for enhanced feature learning.
 
     Args:
-        in_ch (int): Input channels.
-        out_ch (int): Output channels.
-        k (int | tuple[int, int], optional): Kernel size. Default: 3.
-        s (int | tuple[int, int], optional): Stride. Default: 1.
-        p (int | tuple[int, int] | None, optional): Padding. If None, uses
-            "same" padding for given k and d. Default: None.
-        d (int | tuple[int, int], optional): Dilation. Default: 1.
-        g (int, optional): Convolution groups for the DCN weight. Default: 1.
-        dg (int, optional): Deformable groups (split for offsets/masks). Default: 1.
-        bias (bool, optional): If True, add bias to DCN weight. Default: True.
-        modulated (bool, optional): If True, DCNv2 (with mask). If False, DCNv1. Default: True.
+        c1 (int): Number of input channels.
+        c2 (int): Number of output channels.
+        k (int | tuple[int, int]): Kernel size. Default is 3.
+        s (int | tuple[int, int]): Stride. Default is 1.
+        p (int | tuple[int, int] | None): Padding. If None, applies 'same' padding. Default is None.
+        d (int | tuple[int, int]): Dilation rate. Default is 1.
+        g (int): Number of groups for grouped convolution. Default is 1.
+        offset_groups (int): Number of offset groups. Default is 1.
+        act (bool): Apply activation function. Default is True.
+        bias (bool): Use bias in convolution. Default is False.
 
-    Returns:
-        (torch.Tensor): Output feature map of shape (N, out_ch, H_out, W_out).
-
-    Notes:
-        - Offsets tensor shape is (N, 2 * dg * kH * kW, H_out, W_out).
-        - Mask tensor (DCNv2) shape is (N, dg * kH * kW, H_out, W_out), values in [0, 1].
-        - Initialization sets offsets≈0 and mask≈0.5 (after sigmoid), so the block
-          starts close to a regular convolution for stable training.
+    Attributes:
+        cv (DeformConv2d): The deformable convolution layer.
+        offset (nn.Conv2d): Convolution layer for predicting offsets.
+        mask (nn.Conv2d): Convolution layer for predicting modulation masks.
 
     Examples:
-        >>> m = DeformableConv2dBlock(64, 128, k=3, s=1, d=1, modulated=True, dg=1)
-        >>> y = m(x)  # x: (N, 64, H, W)
+        >>> dcn = DeformableConv2d(64, 128, k=3, s=1)
+        >>> x = torch.randn(1, 64, 56, 56)
+        >>> y = dcn(x)
+        >>> print(y.shape)
+        torch.Size([1, 128, 56, 56])
     """
+
     def __init__(
         self,
-        in_ch: int,
-        out_ch: int,
-        k: int | tuple[int, int] = 3,
-        s: int | tuple[int, int] = 1,
-        p: int | tuple[int, int] | None = None,
-        d: int | tuple[int, int] = 1,
-        g: int = 1,
-        dg: int = 1,
-        bias: bool = True,
-        modulated: bool = True,
-    ) -> None:
+        c1,
+        c2,
+        k=3,
+        s=1,
+        p=None,
+        d=1,
+        g=1,
+        offset_groups=1,
+        act=True,
+        bias=False,
+    ):
+        """Initialize DeformableConv2d with offset and mask prediction capabilities."""
         super().__init__()
-        kH, kW = self._pair(k)
-        sH, sW = self._pair(s)
-        dH, dW = self._pair(d)
-        pH, pW = self._autopad((kH, kW), p, (dH, dW))
+        self.k = k if isinstance(k, tuple) else (k, k)
+        self.s = s if isinstance(s, tuple) else (s, s)
+        self.d = d if isinstance(d, tuple) else (d, d)
+        self.p = autopad(k, p, d) if p is None else (p if isinstance(p, tuple) else (p, p))
 
-        K = kH * kW
-        self.modulated = modulated
-        self.dg = dg
-        self.k = (kH, kW)
-        self.s = (sH, sW)
-        self.p = (pH, pW)
-        self.d = (dH, dW)
-        self.g = g
+        # Calculate kernel area
+        kernel_area = self.k[0] * self.k[1]
 
-        # Offset head: predicts 2 values per kernel point per deformable group
-        self.conv_offset = nn.Conv2d(
-            in_ch, 2 * dg * K, kernel_size=(kH, kW), stride=(sH, sW),
-            padding=(pH, pW), dilation=(dH, dW), bias=True, groups=1
+        # Offset prediction: 2 * offset_groups * kernel_area channels (x, y offsets for each position)
+        self.offset = nn.Conv2d(
+            c1,
+            2 * offset_groups * kernel_area,
+            kernel_size=self.k,
+            stride=self.s,
+            padding=self.p,
+            dilation=self.d,
+            bias=True,
         )
 
-        # Mask head (DCNv2): predicts 1 value per kernel point per deformable group
-        self.conv_mask = None
-        if modulated:
-            self.conv_mask = nn.Conv2d(
-                in_ch, dg * K, kernel_size=(kH, kW), stride=(sH, sW),
-                padding=(pH, pW), dilation=(dH, dW), bias=True, groups=1
-            )
-
-        # Main deformable convolution (offset groups inferred at forward)
-        self.dcn = DeformConv2d(
-            in_ch, out_ch, kernel_size=(kH, kW), stride=(sH, sW),
-            padding=(pH, pW), dilation=(dH, dW), groups=g, bias=bias
+        # Mask prediction: offset_groups * kernel_area channels (modulation weight for each position)
+        self.mask = nn.Conv2d(
+            c1,
+            offset_groups * kernel_area,
+            kernel_size=self.k,
+            stride=self.s,
+            padding=self.p,
+            dilation=self.d,
+            bias=True,
         )
 
-        # Init: start near regular conv (offsets≈0, mask≈0.5)
-        nn.init.constant_(self.conv_offset.weight, 0.0)
-        nn.init.constant_(self.conv_offset.bias, 0.0)
-        if self.conv_mask is not None:
-            nn.init.constant_(self.conv_mask.weight, 0.0)
-            nn.init.constant_(self.conv_mask.bias, 0.0)
+        # Main deformable convolution
+        from torchvision.ops import DeformConv2d
+        self.cv = DeformConv2d(
+            c1,
+            c2,
+            kernel_size=self.k,
+            stride=self.s,
+            padding=self.p,
+            dilation=self.d,
+            groups=g,
+            bias=bias,
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Initialize weights for stable training
+        nn.init.constant_(self.offset.weight, 0.0)
+        nn.init.constant_(self.offset.bias, 0.0)
+        nn.init.constant_(self.mask.weight, 0.0)
+        nn.init.constant_(self.mask.bias, 0.0)
+
+        # Optional activation
+        self.act = nn.SiLU() if act else nn.Identity()
+
+    def forward(self, x):
         """
-        Forward pass.
+        Applies deformable convolution with learned offsets and masks.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (N, C_in, H_in, W_in).
+            x (torch.Tensor): Input tensor of shape (N, C_in, H, W).
 
         Returns:
             (torch.Tensor): Output tensor of shape (N, C_out, H_out, W_out).
         """
-        offset = self.conv_offset(x)                 # (N, 2*dg*K, H_out, W_out)
-        mask = self.conv_mask(x).sigmoid() if self.conv_mask is not None else None
-        return self.dcn(x, offset, mask)            # DCNv1 if mask is None, else DCNv2
-
-    # --------------------------------------------------------------------- #
-    # Helpers
-    # --------------------------------------------------------------------- #
-    @staticmethod
-    def _pair(v: int | tuple[int, int]) -> tuple[int, int]:
-        """Ensure a 2-tuple."""
-        return v if isinstance(v, tuple) else (v, v)
-
-    @staticmethod
-    def _autopad(k: tuple[int, int], p: int | tuple[int, int] | None, d: tuple[int, int]) -> tuple[int, int]:
-        """
-        Auto-pads to mimic 'same' output shape for given k and d if p is None.
-        Matches Ultralytics-style autopad behavior for conv layers.
-        """
-        if p is None:
-            ph = (k[0] - 1) * d[0] // 2
-            pw = (k[1] - 1) * d[1] // 2
-            return ph, pw
-        return p if isinstance(p, tuple) else (p, p)
-
+        offset = self.offset(x)
+        mask = self.mask(x).sigmoid()
+        return self.act(self.cv(x, offset, mask))

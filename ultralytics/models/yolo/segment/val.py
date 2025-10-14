@@ -50,7 +50,18 @@ class SegmentationValidator(DetectionValidator):
         super().__init__(dataloader, save_dir, args, _callbacks)
         self.process = None
         self.args.task = "segment"
+        # print("-"*50)
+        # print("Inside segment/val.py 54")
+        # print(self.args.fitness_weights)
+        # print("-"*50)
         self.metrics = SegmentMetrics(fitness_weights = self.args.fitness_weights)
+    
+    def __call__(self, trainer=None, model=None):
+        """Run validation."""
+        # Reset aggregates at START of validation
+        if hasattr(self.metrics, 'reset_mask_aggregates'):
+            self.metrics.reset_mask_aggregates()
+        return super().__call__(trainer, model)
 
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
         """

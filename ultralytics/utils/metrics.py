@@ -259,36 +259,15 @@ def dice_score(mask1: torch.Tensor, mask2: torch.Tensor, eps: float = 1e-7) -> t
 
 
 def _extract_boundary(mask: torch.Tensor) -> torch.Tensor:
-    """
-    Extract a 1-pixel boundary map from a binary mask using morphological gradient.
-
-    This function computes the boundary by taking the difference between morphological dilation and erosion
-    operations. Uses max-pool identities for GPU efficiency; differentiability is not required for evaluation.
-
-    Args:
-        mask (torch.Tensor): Binary mask tensor of shape (H, W) or (N, H, W) with values in {0, 1}.
-
-    Returns:
-        (torch.Tensor): Binary boundary map of the same shape as input with values in {0, 1}.
-
-    Notes:
-        - The boundary is defined as pixels where dilation ≠ erosion.
-        - Uses 3×3 structuring element (8-connectivity).
-        - Preserves input device and dtype.
-
-    Example:
-        >>> mask = torch.zeros(100, 100)
-        >>> mask[25:75, 25:75] = 1  # Create a square
-        >>> boundary = _extract_boundary(mask)
-        >>> boundary.sum()  # Count boundary pixels
-        tensor(196)
-    """
+    """Extract a 1-pixel boundary map from a binary mask using morphological gradient."""
     original_shape = mask.shape
+    original_device = mask.device
+    original_dtype = mask.dtype
+    
     if mask.dim() == 2:
         mask = mask.unsqueeze(0)
     
-    # Preserve device and dtype
-    device = mask.device
+    # Convert to float for processing
     x = mask.float()
     
     # Add channel dimension for max_pool2d
@@ -305,13 +284,13 @@ def _extract_boundary(mask: torch.Tensor) -> torch.Tensor:
     
     # Gradient (dilation - erosion)
     boundary = (dil - er).clamp_(0, 1)
-    result = (boundary > 0.5).to(mask.dtype)
+    result = (boundary > 0.5).to(original_dtype)
     
     # Restore original shape
     if len(original_shape) == 2:
         result = result.squeeze(0)
     
-    return result
+    return result.to(original_device)
 
 
 def boundary_f1(
@@ -397,8 +376,33 @@ def boundary_iou(
     eps: float = 1e-7,
 ) -> torch.Tensor:
     """
-    Boundary IoU between GT and predicted masks with pixel tolerance.
-    Returns per-pair IoU (N,). Mirrors boundary_f1's tolerance behavior.
+    Compute boundary IoU between ground truth and predicted masks with pixel tolerance.
+    
+    This metric evaluates boundary quality by computing IoU on extracted boundary pixels,
+    with optional tolerance for slight misalignments. Useful for tasks where precise
+    boundary localization is critical.
+    
+    Args:
+        mask_gt (torch.Tensor): Ground truth binary mask of shape (H, W) or (N, H, W).
+        mask_pred (torch.Tensor): Predicted binary mask of shape (H, W) or (N, H, W).
+        tolerance (int): Dilation radius in pixels for boundary matching. Default is 1.
+        eps (float): Small constant for numerical stability. Default is 1e-7.
+        
+    Returns:
+        (torch.Tensor): Boundary IoU for each mask, shape (N,).
+        
+    Notes:
+        - Boundaries are extracted using morphological gradient (dilation - erosion).
+        - Tolerance creates a band around boundaries where matches are allowed.
+        - Returns per-pair IoU values, unlike boundary_f1 which returns precision/recall/f1.
+        
+    Example:
+        >>> gt = torch.zeros(100, 100)
+        >>> gt[20:80, 20:80] = 1
+        >>> pred = torch.zeros(100, 100)
+        >>> pred[22:78, 22:78] = 1
+        >>> biou = boundary_iou(gt, pred, tolerance=2)
+        >>> print(f"Boundary IoU: {biou.item():.3f}")
     """
     if mask_gt.dim() == 2:
         mask_gt = mask_gt.unsqueeze(0)
@@ -410,13 +414,22 @@ def boundary_iou(
 
     if tolerance > 0:
         k = 2 * tolerance + 1
-        gt_b = F.max_pool2d(gt_b.unsqueeze(1).float(), kernel_size=k, stride=1, padding=tolerance).squeeze(1).bool()
-        pr_b = F.max_pool2d(pr_b.unsqueeze(1).float(), kernel_size=k, stride=1, padding=tolerance).squeeze(1).bool()
+        gt_b = F.max_pool2d(
+            gt_b.unsqueeze(1).float(), 
+            kernel_size=k, 
+            stride=1, 
+            padding=tolerance
+        ).squeeze(1).bool()
+        pr_b = F.max_pool2d(
+            pr_b.unsqueeze(1).float(), 
+            kernel_size=k, 
+            stride=1, 
+            padding=tolerance
+        ).squeeze(1).bool()
 
     inter = (gt_b & pr_b).sum(dim=(1, 2)).float()
     union = (gt_b | pr_b).sum(dim=(1, 2)).float()
     return inter / (union + eps)
-
 
 
 
@@ -1678,12 +1691,12 @@ class SegmentMetrics(DetMetrics):
         # Default weights for segmentation: balance box and mask metrics
         default_weights = {
             # Box metrics
-            'box_precision': 0.0,
-            'box_recall': 0.0,
-            'box_mAP50': 0.0,
-            'box_mAP50_95': 0.5,
-            'box_f1': 0.0,
-            'box_f2': 0.0,
+            'precision': 0.0,
+            'recall': 0.0,
+            'mAP50': 0.0,
+            'mAP50_95': 0.5,
+            'f1': 0.0,
+            'f2': 0.0,
             # Mask metrics
             'mask_precision': 0.0,
             'mask_recall': 0.0,
@@ -1694,14 +1707,15 @@ class SegmentMetrics(DetMetrics):
             # Additional segmentation metrics
             'dice': 0.0,
             'miou': 0.0,
-            'boundary_f1': 0.0
+            'boundary_f1': 0.0,
+            'boundary_iou': 0.0
         }
         
         self.fitness_weights = fitness_weights or default_weights
         
         # Initialize parent with box-specific weights
-        box_weights = {k.replace('box_', ''): v for k, v in self.fitness_weights.items() if k.startswith('box_')}
-        super().__init__(names, fitness_weights=box_weights)
+        # box_weights = {k: v for k, v in self.fitness_weights.items() if k.startswith('box_')}
+        super().__init__(names, fitness_weights=fitness_weights)
         
         # Initialize mask metrics with mask-specific weights
         mask_weights = {k.replace('mask_', ''): v for k, v in self.fitness_weights.items() if k.startswith('mask_')}
@@ -1709,7 +1723,7 @@ class SegmentMetrics(DetMetrics):
         self.task = "segment"
         self.stats["tp_m"] = []
 
-                # Aggregates for additional segmentation metrics
+        # Aggregates for additional segmentation metrics
         self._init_done = False
         self._device = torch.device("cpu")
         self._dice_num = None
@@ -1719,10 +1733,9 @@ class SegmentMetrics(DetMetrics):
         self._b_tp = None
         self._b_fp = None
         self._b_fn = None
-        # NEW: Boundary IoU accumulators
-        self._biou_inter = None   # NEW
-        self._biou_union = None   # NEW
-
+        # Boundary IoU accumulators
+        self._biou_inter = None
+        self._biou_union = None
 
     def _ensure_init(self):
         """
@@ -1739,7 +1752,7 @@ class SegmentMetrics(DetMetrics):
         if self._init_done:
             return
         nc = len(self.names)
-        zeros = torch.zeros(nc, dtype=torch.float64, device=self._device)  # Use float64 for better precision
+        zeros = torch.zeros(nc, dtype=torch.float64, device=self._device)
         self._dice_num = zeros.clone()
         self._dice_den = zeros.clone()
         self._iou_inter = zeros.clone()
@@ -1747,9 +1760,9 @@ class SegmentMetrics(DetMetrics):
         self._b_tp = zeros.clone()
         self._b_fp = zeros.clone()
         self._b_fn = zeros.clone()
-        # NEW: Boundary IoU (double precision on CPU)
-        self._biou_inter = zeros.clone()   # NEW
-        self._biou_union = zeros.clone()   # NEW
+        # Boundary IoU accumulators
+        self._biou_inter = zeros.clone()
+        self._biou_union = zeros.clone()
         self._init_done = True
 
     def reset_mask_aggregates(self) -> None:
@@ -1861,6 +1874,9 @@ class SegmentMetrics(DetMetrics):
         tp_b = (pr_b & gt_d).sum(dim=(1, 2)).float()
         fp_b = (pr_b & (~gt_d)).sum(dim=(1, 2)).float()
         fn_b = (gt_b & (~pr_d)).sum(dim=(1, 2)).float()
+        b_inter = (gt_d & pr_d).sum(dim=(1, 2)).float()
+        b_union = (gt_d | pr_d).sum(dim=(1, 2)).float()
+        
         
         # Move to CPU for accumulation
         cls_indices_cpu = cls_indices.cpu()
@@ -1873,11 +1889,6 @@ class SegmentMetrics(DetMetrics):
         self._b_tp.scatter_add_(0, cls_indices_cpu, tp_b.cpu().double())
         self._b_fp.scatter_add_(0, cls_indices_cpu, fp_b.cpu().double())
         self._b_fn.scatter_add_(0, cls_indices_cpu, fn_b.cpu().double())
-
-                # NEW: Boundary IoU accumulation using the same tolerance-dilated boundaries (gt_d, pr_d)
-        b_inter = (gt_d & pr_d).sum(dim=(1, 2)).float()
-        b_union = (gt_d | pr_d).sum(dim=(1, 2)).float()
-
         self._biou_inter.scatter_add_(0, cls_indices_cpu, b_inter.cpu().double())
         self._biou_union.scatter_add_(0, cls_indices_cpu, b_union.cpu().double())
 
@@ -1975,7 +1986,25 @@ class SegmentMetrics(DetMetrics):
     @property
     def mboundary_iou(self) -> float:
         """
-        Mean Boundary IoU across classes with non-zero boundary union (dataset-level scalar).
+        Calculate mean boundary IoU across all classes with detected boundaries.
+        
+        Boundary IoU measures the overlap of boundary pixels between predicted and ground truth
+        masks, providing an alternative to boundary F1 that directly measures boundary overlap
+        rather than precision/recall trade-offs.
+        
+        Returns:
+            (float): Mean boundary IoU in range [0, 1]. Returns 0.0 if no boundaries are detected.
+            
+        Notes:
+            - Computed using tolerance-dilated boundaries (same as boundary F1).
+            - Only classes with non-zero boundary union contribute to the mean.
+            - More lenient than boundary F1 for asymmetric boundary errors.
+            
+        Example:
+            >>> metrics = SegmentMetrics(names={0: 'cell', 1: 'nucleus'})
+            >>> # ... process microscopy predictions ...
+            >>> biou = metrics.mboundary_iou
+            >>> print(f"Mean Boundary IoU: {biou:.3f}")
         """
         self._ensure_init()
         eps = 1e-7
@@ -1984,7 +2013,6 @@ class SegmentMetrics(DetMetrics):
             return 0.0
         biou_c = self._biou_inter / (self._biou_union + eps)
         return float(biou_c[valid].mean().item())
-
 
     def process(self, save_dir: Path = Path("."), plot: bool = False, on_plot=None) -> dict[str, np.ndarray]:
         """
@@ -2066,9 +2094,8 @@ class SegmentMetrics(DetMetrics):
             "metrics/dice(M)",
             "metrics/mIoU(M)",
             "metrics/boundaryF1(M)",
-            "metrics/boundaryIoU(M)",   # NEW
+            "metrics/boundaryIoU(M)",
         ]
-
 
     def mean_results(self) -> list[float]:
         """
@@ -2128,7 +2155,7 @@ class SegmentMetrics(DetMetrics):
             >>> maps = metrics.maps
             >>> print(f"Box mAP@50: {maps[0]:.3f}, Mask mAP@50: {maps[-1]:.3f}")
         """
-        return np.concatenate(DetMetrics.maps.fget(self), self.seg.maps)
+        return np.concatenate([DetMetrics.maps.fget(self), self.seg.maps])
 
     @property
     def fitness(self) -> float:
@@ -2167,8 +2194,14 @@ class SegmentMetrics(DetMetrics):
             # Additional segmentation metrics
             'dice': self.mdice,
             'miou': self.miou,
-            'boundary_f1': self.mbf1
+            'boundary_f1': self.mbf1,
+            'boundary_iou': self.mboundary_iou
         }
+
+        print("-"*50)
+        print("Inside metrics.py 2202")
+        print(self.fitness_weights)
+        print("-"*50)
         
         fitness = 0.0
         total_weight = 0.0
