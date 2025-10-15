@@ -2,6 +2,8 @@
 
 import yaml
 from pathlib import Path
+import os
+from copy import deepcopy
 # from ultralytics.models.yolo.model import YOLO
 
 from ultralytics.utils import SETTINGS, TESTS_RUNNING, LOGGER
@@ -136,10 +138,21 @@ def _log_plots(plots, step):
 def on_pretrain_routine_start(trainer):
     """Initialize and start wandb project if module is present."""
     if not wb.run:
+        # Create a copy of the config
+        config = deepcopy(vars(trainer.args))
+        
+        # Shorten the 'data' path if it exists
+        if 'data' in config and config['data']:
+            config['data'] = str(Path(config['data']).parts[-2:]) if len(Path(config['data']).parts) >= 2 else os.path.basename(config['data'])
+        
+        # Shorten the 'model' path if it exists
+        if 'model' in config and config['model']:
+            config['model'] = os.path.basename(config['model'])
+        
         wb.init(
             project=str(trainer.args.project).replace("/", "-") if trainer.args.project else "Ultralytics",
             name=str(trainer.args.name).replace("/", "-"),
-            config=vars(trainer.args),
+            config=config,
         )
 
 

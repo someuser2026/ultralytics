@@ -157,20 +157,20 @@ clahe_clip_limit: 2.5
 clahe_tile_grid_size: [8, 8]
 gamma_min: 60
 gamma_max: 120
-rand_gamma_p: 0.5
+rand_gamma_p: 0.0
 unsharp_blur_limit_min: 3
 unsharp_blur_limit_max: 5
 unsharp_sigma_limit: 0.6
 unsharp_alpha_min: 0.6
 unsharp_alpha_max: 0.8
-unsharp_p: 0.25
+unsharp_p: 0.1
 unsharp_threshold: 10
 edgeboost_alpha: 0.25
 edgeboost_ksize: 3
-edgeboost_p: 0.25
+edgeboost_p: 0.1
 homomorphic_gain: 0.5
 homomorphic_sigma: 12
-homomorphic_p: 0.25
+homomorphic_p: 0.0
 
 # Custom config.yaml ---------------------------------------------------------------------------------------------------
 cfg: # (str, optional) path to a config.yaml that overrides defaults

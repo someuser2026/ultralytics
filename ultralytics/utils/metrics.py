@@ -1714,8 +1714,8 @@ class SegmentMetrics(DetMetrics):
         self.fitness_weights = fitness_weights or default_weights
         
         # Initialize parent with box-specific weights
-        box_weights = {k: v for k, v in self.fitness_weights.items() if k.startswith('box_')}
-        super().__init__(names, fitness_weights=box_weights)
+        # box_weights = {k: v for k, v in self.fitness_weights.items() if k.startswith('box_')}
+        super().__init__(names, fitness_weights=fitness_weights)
         
         # Initialize mask metrics with mask-specific weights
         mask_weights = {k.replace('mask_', ''): v for k, v in self.fitness_weights.items() if k.startswith('mask_')}
