@@ -712,6 +712,7 @@ class BaseTrainer:
         # Update best metric if current is better
         # if not self.best_comp_metric or self.best_comp_metric < self.comp_metric:
         #     self.best_comp_metric = copy(self.comp_metric)
+        self.fitness = metrics.get("fitness", None)
         if not self.best_fitness or self.best_fitness < self.fitness:
             self.best_fitness = copy(self.fitness)
             
@@ -838,7 +839,7 @@ class BaseTrainer:
         start_epoch = ckpt.get("epoch", -1) + 1
         if ckpt.get("optimizer") is not None:
             self.optimizer.load_state_dict(ckpt["optimizer"])  # optimizer
-            best_fitness = ckpt["best_fitness"]
+            self.best_fitness = ckpt["best_fitness"]
         if ckpt.get("scaler") is not None:
             self.scaler.load_state_dict(ckpt["scaler"])
         if self.ema and ckpt.get("ema"):

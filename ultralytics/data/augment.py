@@ -1995,8 +1995,8 @@ class Albumentations:
 
             # Transforms
             T = [
-                A.Blur(p=0.01),
-                A.MedianBlur(p=0.01),
+                # A.Blur(p=0.01),
+                # A.MedianBlur(p=0.01),
                 A.ToGray(p=0.01),
                 # A.CLAHE(p=0.01),
                 A.RandomBrightnessContrast(p=0.0),
@@ -2004,15 +2004,15 @@ class Albumentations:
                 A.ImageCompression(quality_range=(75, 100), p=0.0),
             ]
 
-            albu_photometric = [
-                A.CLAHE(clip_limit = cfg.clahe_clip_limit, tile_grid_size = cfg.clahe_tile_grid_size, p = cfg.clahe_p),
-                A.RandomGamma(gamma_limit = (cfg.gamma_min, cfg.gamma_max), p = cfg.rand_gamma_p),
-                A.UnsharpMask(blur_limit = (cfg.unsharp_blur_limit_min, cfg.unsharp_blur_limit_max), sigma_limit = cfg.unsharp_sigma_limit, alpha = (cfg.unsharp_alpha_min, cfg.unsharp_alpha_max), threshold = cfg.unsharp_threshold, p = cfg.unsharp_p),
-                EdgeBoost(alpha = cfg.edgeboost_alpha, ksize = cfg.edgeboost_ksize, always_apply = False, p = cfg.edgeboost_p),
-                HomomorphicLightNorm(sigma = cfg.homomorphic_sigma, gain = cfg.homomorphic_gain, always_apply = False, p = cfg.homomorphic_p)
-            ]
+            # albu_photometric = [
+            #     A.CLAHE(clip_limit = cfg.clahe_clip_limit, tile_grid_size = cfg.clahe_tile_grid_size, p = cfg.clahe_p),
+            #     A.RandomGamma(gamma_limit = (cfg.gamma_min, cfg.gamma_max), p = cfg.rand_gamma_p),
+            #     A.UnsharpMask(blur_limit = (cfg.unsharp_blur_limit_min, cfg.unsharp_blur_limit_max), sigma_limit = cfg.unsharp_sigma_limit, alpha = (cfg.unsharp_alpha_min, cfg.unsharp_alpha_max), threshold = cfg.unsharp_threshold, p = cfg.unsharp_p),
+            #     EdgeBoost(alpha = cfg.edgeboost_alpha, ksize = cfg.edgeboost_ksize, always_apply = False, p = cfg.edgeboost_p),
+            #     HomomorphicLightNorm(sigma = cfg.homomorphic_sigma, gain = cfg.homomorphic_gain, always_apply = False, p = cfg.homomorphic_p)
+            # ]
 
-            T += albu_photometric
+            # T += albu_photometric
             # Compose transforms
             self.contains_spatial = any(transform.__class__.__name__ in spatial_transforms for transform in T)
             self.transform = (
@@ -2221,6 +2221,308 @@ class HomomorphicLightNorm(A.ImageOnlyTransform):
     def get_transform_init_args_names(self):
         """Return names of arguments that are used in __init__."""
         return ("sigma", "gain")
+
+class RandomCLAHE:
+    """
+    Apply Contrast Limited Adaptive Histogram Equalization (CLAHE) with random parameters.
+
+    This class applies CLAHE to enhance local contrast in images. It works with both RGB
+    and multispectral images by applying CLAHE to each channel independently.
+
+    Attributes:
+        clip_limit (tuple): Range for random clip limit values (min, max). Default is (1.0, 4.0).
+        tile_grid_size (tuple): Grid size for CLAHE tiles. Default is (8, 8).
+        p (float): Probability of applying the augmentation. Default is 0.5.
+
+    Methods:
+        __call__: Apply random CLAHE augmentation to an image.
+
+    Examples:
+        >>> import numpy as np
+        >>> from ultralytics.data.augment import RandomCLAHE
+        >>> augmenter = RandomCLAHE(clip_limit=(2.0, 4.0), tile_grid_size=(8, 8), p=0.5)
+        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        >>> labels = {"img": image}
+        >>> augmented_labels = augmenter(labels)
+        >>> augmented_image = augmented_labels["img"]
+    """
+
+    def __init__(
+        self,
+        clip_limit: float = 2.5,
+        tile_grid_size: tuple[int, int] = (8, 8),
+        p: float = 0.5,
+    ) -> None:
+        """
+        Initialize the RandomCLAHE object for Contrast Limited Adaptive Histogram Equalization.
+
+        Args:
+            clip_limit (tuple[float, float]): Range for random clip limit (min, max). Controls contrast
+                limiting threshold. Higher values allow more contrast.
+            tile_grid_size (tuple[int, int]): Size of grid for histogram equalization. Smaller tiles
+                result in more local enhancement.
+            p (float): Probability of applying the augmentation. Should be in range [0, 1].
+
+        Examples:
+            >>> clahe_aug = RandomCLAHE(clip_limit=(2.0, 4.0), tile_grid_size=(8, 8), p=0.5)
+        """
+        self.clip_limit = clip_limit
+        self.tile_grid_size = tile_grid_size
+        self.p = p
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Apply random CLAHE augmentation to an image.
+
+        This method enhances the local contrast of the image by applying CLAHE to each channel
+        independently. Works with both RGB and multispectral images.
+
+        Args:
+            labels (dict[str, Any]): A dictionary containing image data and metadata. Must include
+                an 'img' key with the image as a numpy array.
+
+        Returns:
+            (dict[str, Any]): A dictionary containing the augmented image and unchanged labels.
+
+        Examples:
+            >>> clahe_augmenter = RandomCLAHE(clip_limit=(2.0, 4.0), p=0.5)
+            >>> labels = {"img": np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)}
+            >>> labels = clahe_augmenter(labels)
+            >>> augmented_img = labels["img"]
+        """
+        if np.random.random() > self.p:
+            return labels
+
+        img = labels["img"]
+        dtype = img.dtype
+
+        # Randomly sample clip limit
+        # clip_limit = np.random.uniform(0.0, self.clip_limit)
+
+        # Create CLAHE object
+        clahe = cv2.createCLAHE(clipLimit=self.clip_limit, tileGridSize=self.tile_grid_size)
+
+        # Apply CLAHE to each channel independently (works for any number of channels)
+        if len(img.shape) == 2:
+            # Grayscale image
+            img = clahe.apply(img)
+        else:
+            # Multi-channel image (RGB or multispectral)
+            channels = cv2.split(img)
+            channels = [clahe.apply(ch) for ch in channels]
+            img = cv2.merge(channels)
+
+        labels["img"] = img.astype(dtype)
+        return labels
+
+
+class RandomGamma:
+    """
+    Apply random gamma correction to adjust image brightness.
+
+    This class applies gamma correction with randomly selected gamma values within a specified range.
+    It works with both RGB and multispectral images by applying gamma correction to each channel.
+
+    Attributes:
+        gamma_range (tuple): Range for random gamma values (min, max). Default is (0.5, 2.0).
+            Values < 1.0 brighten the image, values > 1.0 darken it.
+        p (float): Probability of applying the augmentation. Default is 0.5.
+
+    Methods:
+        __call__: Apply random gamma correction to an image.
+
+    Examples:
+        >>> import numpy as np
+        >>> from ultralytics.data.augment import RandomGamma
+        >>> augmenter = RandomGamma(gamma_range=(0.7, 1.5), p=0.5)
+        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        >>> labels = {"img": image}
+        >>> augmented_labels = augmenter(labels)
+        >>> augmented_image = augmented_labels["img"]
+    """
+
+    def __init__(self, gamma_range: tuple[float, float] = (0.5, 2.0), p: float = 0.5) -> None:
+        """
+        Initialize the RandomGamma object for random gamma correction augmentation.
+
+        Args:
+            gamma_range (tuple[float, float]): Range for random gamma values (min, max).
+                Values < 1.0 brighten the image, values > 1.0 darken it. Typical range is (0.5, 2.0).
+            p (float): Probability of applying the augmentation. Should be in range [0, 1].
+
+        Examples:
+            >>> gamma_aug = RandomGamma(gamma_range=(0.7, 1.5), p=0.5)
+        """
+        self.gamma_range = gamma_range
+        self.p = p
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Apply random gamma correction to an image.
+
+        This method adjusts the brightness of the image by applying gamma correction with a randomly
+        selected gamma value. For multispectral images, only the first 3 channels (RGB) are corrected,
+        while additional channels remain unchanged.
+
+        Args:
+            labels (dict[str, Any]): A dictionary containing image data and metadata. Must include
+                an 'img' key with the image as a numpy array.
+
+        Returns:
+            (dict[str, Any]): A dictionary containing the gamma-corrected image and unchanged labels.
+
+        Examples:
+            >>> gamma_augmenter = RandomGamma(gamma_range=(0.7, 1.5), p=0.5)
+            >>> labels = {"img": np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)}
+            >>> labels = gamma_augmenter(labels)
+            >>> augmented_img = labels["img"]
+        """
+        if np.random.random() > self.p:
+            return labels
+
+        img = labels["img"]
+        dtype = img.dtype
+
+        # Randomly sample gamma value
+        gamma = np.random.uniform(self.gamma_range[0], self.gamma_range[1])
+
+        # Build lookup table for gamma correction
+        inv_gamma = 1.0 / gamma
+        table = np.array([(i / 255.0) ** inv_gamma * 255 for i in range(256)]).astype(dtype)
+
+        # Apply gamma correction only to first 3 channels (RGB)
+        if len(img.shape) == 2:
+            # Grayscale image
+            img = cv2.LUT(img, table)
+        elif img.shape[-1] <= 3:
+            # RGB or fewer channels - apply to all
+            img = cv2.LUT(img, table)
+        else:
+            # Multispectral image - apply only to first 3 channels (RGB)
+            rgb_channels = img[..., :3]
+            other_channels = img[..., 3:]
+            rgb_channels = cv2.LUT(rgb_channels, table)
+            img = np.concatenate([rgb_channels, other_channels], axis=-1)
+
+        labels["img"] = img
+        return labels
+
+
+class RandomUnsharpMask:
+    """
+    Apply unsharp masking for image sharpening with random parameters.
+
+    This class enhances image details by subtracting a blurred version from the original image.
+    It works with both RGB and multispectral images by applying the operation to each channel.
+
+    Attributes:
+        kernel_size_range (tuple): Range for random kernel sizes (min, max). Must be odd numbers.
+            Default is (3, 9).
+        sigma_range (tuple): Range for random sigma values (min, max) for Gaussian blur.
+            Default is (0.5, 2.0).
+        amount_range (tuple): Range for random amount values (min, max). Controls sharpening strength.
+            Default is (0.5, 1.5).
+        threshold (int): Threshold for sharpening. Only pixels differing by more than this value
+            are sharpened. Default is 0.
+        p (float): Probability of applying the augmentation. Default is 0.5.
+
+    Methods:
+        __call__: Apply random unsharp mask augmentation to an image.
+
+    Examples:
+        >>> import numpy as np
+        >>> from ultralytics.data.augment import RandomUnsharpMask
+        >>> augmenter = RandomUnsharpMask(kernel_size_range=(3, 7), amount_range=(0.5, 1.5), p=0.5)
+        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        >>> labels = {"img": image}
+        >>> augmented_labels = augmenter(labels)
+        >>> augmented_image = augmented_labels["img"]
+    """
+
+    def __init__(
+        self,
+        kernel_size_range: tuple[int, int] = (3, 9),
+        sigma_limit: float = 2.0,
+        amount_range: tuple[float, float] = (0.5, 1.5),
+        threshold: int = 0,
+        p: float = 0.5,
+    ) -> None:
+        """
+        Initialize the RandomUnsharpMask object for unsharp masking augmentation.
+
+        Args:
+            kernel_size_range (tuple[int, int]): Range for random kernel sizes (min, max).
+                Values must be odd numbers. Larger kernels create stronger blur.
+            sigma_range (tuple[float, float]): Range for random sigma values (min, max) for
+                Gaussian blur. Larger values create more blur.
+            amount_range (tuple[float, float]): Range for random amount values (min, max).
+                Controls the strength of sharpening. Values > 1.0 create strong sharpening.
+            threshold (int): Minimum brightness change required for sharpening to be applied.
+                Helps avoid amplifying noise.
+            p (float): Probability of applying the augmentation. Should be in range [0, 1].
+
+        Examples:
+            >>> unsharp_aug = RandomUnsharpMask(kernel_size_range=(3, 7), amount_range=(0.5, 1.5), p=0.5)
+        """
+        self.kernel_size_range = kernel_size_range
+        self.sigma_limit = sigma_limit
+        self.amount_range = amount_range
+        self.threshold = threshold
+        self.p = p
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Apply random unsharp mask augmentation to an image.
+
+        This method sharpens the image by subtracting a blurred version from the original.
+        Works with both RGB and multispectral images.
+
+        Args:
+            labels (dict[str, Any]): A dictionary containing image data and metadata. Must include
+                an 'img' key with the image as a numpy array.
+
+        Returns:
+            (dict[str, Any]): A dictionary containing the sharpened image and unchanged labels.
+
+        Examples:
+            >>> unsharp_augmenter = RandomUnsharpMask(kernel_size_range=(3, 7), p=0.5)
+            >>> labels = {"img": np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)}
+            >>> labels = unsharp_augmenter(labels)
+            >>> augmented_img = labels["img"]
+        """
+        if np.random.random() > self.p:
+            return labels
+
+        img = labels["img"]
+        dtype = img.dtype
+
+        # Randomly sample parameters
+        # Ensure kernel size is odd
+        kernel_size = np.random.randint(
+            self.kernel_size_range[0] // 2, (self.kernel_size_range[1] + 1) // 2
+        ) * 2 + 1
+        sigma = np.random.uniform(0.1, self.sigma_limit)
+        amount = np.random.uniform(self.amount_range[0], self.amount_range[1])
+
+        # Convert to float for processing
+        img_float = img.astype(np.float32)
+
+        # Create blurred version
+        blurred = cv2.GaussianBlur(img_float, (kernel_size, kernel_size), sigma)
+
+        # Calculate the difference
+        sharpened = img_float + amount * (img_float - blurred)
+
+        # Apply threshold if specified
+        if self.threshold > 0:
+            low_contrast_mask = np.abs(img_float - blurred) < self.threshold
+            sharpened = np.where(low_contrast_mask, img_float, sharpened)
+
+        # Clip values and convert back to original dtype
+        sharpened = np.clip(sharpened, 0, 255).astype(dtype)
+
+        labels["img"] = sharpened
+        return labels
 
 class Format:
     """
@@ -2740,6 +3042,22 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
             MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
             CutMix(dataset, pre_transform=pre_transform, p=hyp.cutmix),
             Albumentations(cfg=hyp, p=1.0),
+            RandomCLAHE(
+                clip_limit=getattr(hyp, "clahe_clip_limit", 2.5),
+                tile_grid_size=(8, 8),
+                p=getattr(hyp, "clahe_p", 0.1),
+            ),
+            RandomGamma(
+                gamma_range=(getattr(hyp, "gamma_min", 0.7), getattr(hyp, "gamma_max", 0.9)),
+                p=getattr(hyp, "rand_gamma_p", 0.25),
+            ),
+            RandomUnsharpMask(
+                kernel_size_range=(3, 5),
+                sigma_limit=(getattr(hyp, "unsharp_sigma_limit", 0.6)),
+                amount_range=(getattr(hyp, "unsharp_alpha_min", 0.6), getattr(hyp, "unsharp_alpha_max", 0.8)),
+                threshold=(getattr(hyp, "unsharp_threshold", 10)),
+                p=getattr(hyp, "unsharp_p", 0.15),
+            ),
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             RandomFlip(direction="vertical", p=hyp.flipud, flip_idx=flip_idx),
             RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),

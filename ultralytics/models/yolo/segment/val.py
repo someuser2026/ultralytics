@@ -193,7 +193,8 @@ class SegmentationValidator(DetectionValidator):
         )
 
         # Regular mask mAP TPs (per thresholds)
-        tp_m = self.match_predictions(preds["cls"], gt_cls, iou).cpu().numpy()
+        tp_m, _ = self.match_predictions(preds["cls"], gt_cls, iou)
+        tp_m = tp_m.cpu().numpy()
 
         # -------- Aggregates: Dice / mIoU / Boundary-F1 (one-to-one greedy on first IoU threshold) --------
         with torch.no_grad():

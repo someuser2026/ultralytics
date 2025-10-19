@@ -1043,6 +1043,7 @@ def compute_f2(precision: np.ndarray, recall: np.ndarray, eps: float = 1e-16) ->
         F2 = 5 * (precision * recall) / (4 * precision + recall)
     """
     return 5 * (precision * recall) / (4 * precision + recall + eps)
+
 def ap_per_class(
     tp: np.ndarray,
     conf: np.ndarray,
@@ -1054,99 +1055,140 @@ def ap_per_class(
     names: dict[int, str] = {},
     eps: float = 1e-16,
     prefix: str = "",
+    target_areas: np.ndarray = None,  # ADD
+    matched_gt_idx: np.ndarray = None,  # ADD
 ) -> tuple:
     """
-    Compute the average precision per class for object detection evaluation.
-
-    Args:
-        tp (np.ndarray): Binary array indicating whether the detection is correct (True) or not (False).
-        conf (np.ndarray): Array of confidence scores of the detections.
-        pred_cls (np.ndarray): Array of predicted classes of the detections.
-        target_cls (np.ndarray): Array of true classes of the detections.
-        plot (bool, optional): Whether to plot PR curves or not.
-        on_plot (callable, optional): A callback to pass plots path and data when they are rendered.
-        save_dir (Path, optional): Directory to save the PR curves.
-        names (dict[int, str], optional): Dictionary of class names to plot PR curves.
-        eps (float, optional): A small value to avoid division by zero.
-        prefix (str, optional): A prefix string for saving the plot files.
-
-    Returns:
-        tp (np.ndarray): True positive counts at threshold given by max F1 metric for each class.
-        fp (np.ndarray): False positive counts at threshold given by max F1 metric for each class.
-        p (np.ndarray): Precision values at threshold given by max F1 metric for each class.
-        r (np.ndarray): Recall values at threshold given by max F1 metric for each class.
-        f1 (np.ndarray): F1-score values at threshold given by max F1 metric for each class.
-        f2 (np.ndarray): F2-score values at threshold given by max F2 metric for each class.
-        ap (np.ndarray): Average precision for each class at different IoU thresholds.
-        unique_classes (np.ndarray): An array of unique classes that have data.
-        p_curve (np.ndarray): Precision curves for each class.
-        r_curve (np.ndarray): Recall curves for each class.
-        f1_curve (np.ndarray): F1-score curves for each class.
-        f2_curve (np.ndarray): F2-score curves for each class.
-        x (np.ndarray): X-axis values for the curves.
-        prec_values (np.ndarray): Precision values at mAP@0.5 for each class.
+    Compute AP per class with size-based breakdown.
+    
+    Size categories (COCO standard):
+    - Small: area < 32²  (1024 pixels²)
+    - Medium: 32² ≤ area < 96² (1024-9216 pixels²)
+    - Large: area ≥ 96² (≥9216 pixels²)
     """
     # Sort by objectness
     i = np.argsort(-conf)
     tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
+    if matched_gt_idx is not None:
+        matched_gt_idx = matched_gt_idx[i]
 
     # Find unique classes
     unique_classes, nt = np.unique(target_cls, return_counts=True)
-    nc = unique_classes.shape[0]  # number of classes, number of detections
+    nc = unique_classes.shape[0]
 
-    # Create Precision-Recall curve and compute AP for each class
+    # Create Precision-Recall curve
     x, prec_values = np.linspace(0, 1, 1000), []
 
     # Average precision, precision and recall curves
     ap, p_curve, r_curve = np.zeros((nc, tp.shape[1])), np.zeros((nc, 1000)), np.zeros((nc, 1000))
+    
+    # Size-based AP
+    SMALL_THRESHOLD = 32 * 32
+    MEDIUM_THRESHOLD = 96 * 96
+    ap_small = np.zeros(nc)
+    ap_medium = np.zeros(nc)
+    ap_large = np.zeros(nc)
+    
     for ci, c in enumerate(unique_classes):
-        i = pred_cls == c
-        n_l = nt[ci]  # number of labels
-        n_p = i.sum()  # number of predictions
+        i_pred = pred_cls == c
+        i_gt = target_cls == c
+        n_l = nt[ci]
+        n_p = i_pred.sum()
         if n_p == 0 or n_l == 0:
             continue
 
         # Accumulate FPs and TPs
-        fpc = (1 - tp[i]).cumsum(0)
-        tpc = tp[i].cumsum(0)
+        fpc = (1 - tp[i_pred]).cumsum(0)
+        tpc = tp[i_pred].cumsum(0)
 
         # Recall
-        recall = tpc / (n_l + eps)  # recall curve
-        r_curve[ci] = np.interp(-x, -conf[i], recall[:, 0], left=0)  # negative x, xp because xp decreases
+        recall = tpc / (n_l + eps)
+        r_curve[ci] = np.interp(-x, -conf[i_pred], recall[:, 0], left=0)
 
         # Precision
-        precision = tpc / (tpc + fpc)  # precision curve
-        p_curve[ci] = np.interp(-x, -conf[i], precision[:, 0], left=1)  # p at pr_score
+        precision = tpc / (tpc + fpc)
+        p_curve[ci] = np.interp(-x, -conf[i_pred], precision[:, 0], left=1)
 
         # AP from recall-precision curve
         for j in range(tp.shape[1]):
             ap[ci, j], mpre, mrec = compute_ap(recall[:, j], precision[:, j])
             if j == 0:
-                prec_values.append(np.interp(x, mrec, mpre))  # precision at mAP@0.5
+                prec_values.append(np.interp(x, mrec, mpre))
 
-    prec_values = np.array(prec_values) if prec_values else np.zeros((1, 1000))  # (nc, 1000)
+        # Size-based AP (only at first IoU threshold for efficiency)
+        if target_areas is not None and matched_gt_idx is not None:
+            # Get matched GT indices for this class's predictions
+            class_preds_idx = np.where(i_pred)[0]
+            class_matched_gt = matched_gt_idx[class_preds_idx]
+            
+            # Separate by size category
+            for size_name, size_var, area_min, area_max in [
+                ('small', 'ap_small', 0, SMALL_THRESHOLD),
+                ('medium', 'ap_medium', SMALL_THRESHOLD, MEDIUM_THRESHOLD),
+                ('large', 'ap_large', MEDIUM_THRESHOLD, float('inf'))
+            ]:
+                # Find GT instances of this class in this size range
+                gt_indices_this_class = np.where(i_gt)[0]
+                class_areas = target_areas[gt_indices_this_class]
+                size_mask = (class_areas >= area_min) & (class_areas < area_max)
+                size_gt_global_idx = gt_indices_this_class[size_mask]
+                n_size = len(size_gt_global_idx)
+                
+                if n_size == 0:
+                    continue
+                
+                # Filter predictions that matched to size-category GTs
+                size_pred_mask = np.isin(class_matched_gt, size_gt_global_idx)
+                
+                # Get TP/FP for size category
+                tp_size = tp[class_preds_idx[size_pred_mask], 0]  # First IoU threshold
+                conf_size = conf[class_preds_idx[size_pred_mask]]
+                
+                if len(tp_size) == 0:
+                    continue
+                
+                # Sort by confidence
+                sort_idx = np.argsort(-conf_size)
+                tp_size = tp_size[sort_idx]
+                
+                # Compute precision-recall for this size
+                fpc_size = (1 - tp_size).cumsum()
+                tpc_size = tp_size.cumsum()
+                recall_size = tpc_size / (n_size + eps)
+                precision_size = tpc_size / (tpc_size + fpc_size + eps)
+                
+                # Compute AP
+                ap_size, _, _ = compute_ap(recall_size, precision_size)
+                
+                if size_name == 'small':
+                    ap_small[ci] = ap_size
+                elif size_name == 'medium':
+                    ap_medium[ci] = ap_size
+                else:
+                    ap_large[ci] = ap_size
 
-    # Compute F1 (harmonic mean of precision and recall)
+    prec_values = np.array(prec_values) if prec_values else np.zeros((1, 1000))
+
+    # Compute F1 and F2
     f1_curve = 2 * p_curve * r_curve / (p_curve + r_curve + eps)
-    
-    # ADD: Compute F2 score (weights recall twice as much as precision)
     f2_curve = compute_f2(p_curve, r_curve, eps)
     
     names = {i: names[k] for i, k in enumerate(unique_classes) if k in names}  # dict: only classes that have data
     if plot:
         plot_pr_curve(x, prec_values, ap, save_dir / f"{prefix}PR_curve.png", names, on_plot=on_plot)
         plot_mc_curve(x, f1_curve, save_dir / f"{prefix}F1_curve.png", names, ylabel="F1", on_plot=on_plot)
-        # ADD: Plot F2 curve
         plot_mc_curve(x, f2_curve, save_dir / f"{prefix}F2_curve.png", names, ylabel="F2", on_plot=on_plot)
         plot_mc_curve(x, p_curve, save_dir / f"{prefix}P_curve.png", names, ylabel="Precision", on_plot=on_plot)
         plot_mc_curve(x, r_curve, save_dir / f"{prefix}R_curve.png", names, ylabel="Recall", on_plot=on_plot)
 
-    i = smooth(f1_curve.mean(0), 0.1).argmax()  # max F1 index
-    p, r, f1, f2 = p_curve[:, i], r_curve[:, i], f1_curve[:, i], f2_curve[:, i]  # MODIFIED: added f2
-    tp = (r * nt).round()  # true positives
-    fp = (tp / (p + eps) - tp).round()  # false positives
-    return tp, fp, p, r, f1, f2, ap, unique_classes.astype(int), p_curve, r_curve, f1_curve, f2_curve, x, prec_values  # MODIFIED: added f2, f2_curve
-
+    i = smooth(f1_curve.mean(0), 0.1).argmax()
+    p, r, f1, f2 = p_curve[:, i], r_curve[:, i], f1_curve[:, i], f2_curve[:, i]
+    tp = (r * nt).round()
+    fp = (tp / (p + eps) - tp).round()
+    
+    return (tp, fp, p, r, f1, f2, ap, unique_classes.astype(int), 
+            p_curve, r_curve, f1_curve, f2_curve, x, prec_values,
+            ap_small, ap_medium, ap_large)
 
 class Metric(SimpleClass):
     """
@@ -1205,6 +1247,11 @@ class Metric(SimpleClass):
         self.all_ap = []  # (nc, 10)
         self.ap_class_index = []  # (nc, )
         self.nc = 0
+
+        # self.r_at_low_iou = []  # ADD: (nc, ) - Recall at IoU=0.15
+        self.ap_small = []  # ADD: (nc, ) - AP for small objects
+        self.ap_medium = []  # ADD: (nc, ) - AP for medium objects
+        self.ap_large = []  # ADD: (nc, ) - AP for large objects
         
         # Default weights: focus on mAP50-95
         self.fitness_weights = fitness_weights or {
@@ -1321,6 +1368,26 @@ class Metric(SimpleClass):
         for i, c in enumerate(self.ap_class_index):
             maps[c] = self.ap[i]
         return maps
+    
+    # @property
+    # def mr_low_iou(self) -> float:
+    #     """Mean Recall at IoU=0.15."""
+    #     return self.r_at_low_iou.mean() if len(self.r_at_low_iou) else 0.0
+    
+    @property
+    def map_small(self) -> float:
+        """Mean AP for small objects (area < 32²)."""
+        return self.ap_small.mean() if len(self.ap_small) else 0.0
+    
+    @property
+    def map_medium(self) -> float:
+        """Mean AP for medium objects (32² ≤ area < 96²)."""
+        return self.ap_medium.mean() if len(self.ap_medium) else 0.0
+    
+    @property
+    def map_large(self) -> float:
+        """Mean AP for large objects (area ≥ 96²)."""
+        return self.ap_large.mean() if len(self.ap_large) else 0.0
 
     def fitness(self) -> float:
         """
@@ -1399,6 +1466,10 @@ class Metric(SimpleClass):
         self.f2_curve,     # ADD this line
         self.px,
         self.prec_values,
+        # self.r_at_low_iou,  # ADD
+        self.ap_small,      # ADD
+        self.ap_medium,     # ADD
+        self.ap_large,      # ADD
     ) = results
 
     @property
@@ -1481,7 +1552,14 @@ class DetMetrics(SimpleClass, DataExportMixin):
         self.box = Metric(fitness_weights=self.fitness_weights)
         self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
         self.task = "detect"
-        self.stats = dict(tp=[], conf=[], pred_cls=[], target_cls=[], target_img=[])
+        self.stats = dict(
+            tp=[],
+            matched_gt_idx = [],
+            conf=[],
+            pred_cls=[], target_cls=[],
+            target_areas = [],
+            target_img=[]
+        )
         self.nt_per_class = None
         self.nt_per_image = None
 
@@ -1521,6 +1599,8 @@ class DetMetrics(SimpleClass, DataExportMixin):
             names=self.names,
             on_plot=on_plot,
             prefix="Box",
+            target_areas=stats.get("target_areas", None),  # ADD
+            matched_gt_idx=stats.get("matched_gt_idx", None),  # ADD
         )[2:]
         self.box.nc = len(self.names)
         self.box.update(results)
@@ -1538,16 +1618,26 @@ class DetMetrics(SimpleClass, DataExportMixin):
         """Return a list of keys for accessing specific metrics."""
         return [
             "metrics/precision(B)", 
-            "metrics/recall(B)", 
+            "metrics/recall(B)",
+            # "metrics/recall@0.15(B)",  # ADD 
             "metrics/mAP50(B)", 
             "metrics/mAP50-95(B)",
             "metrics/f1(B)",
-            "metrics/f2(B)"
+            "metrics/f2(B)",
+            "metrics/mAP_small(B)",    # ADD
+            "metrics/mAP_medium(B)",   # ADD
+            "metrics/mAP_large(B)",    # ADD
         ]
 
     def mean_results(self) -> List[float]:
         """Calculate mean of detected objects & return precision, recall, mAP50, mAP50-95, and mF2."""
-        return self.box.mean_results() + [self.box.mf1, self.box.mf2]
+        return self.box.mean_results() + [
+            self.box.mf1, self.box.mf2,
+            # self.box.mr_low_iou,  # ADD
+            self.box.map_small,   # ADD
+            self.box.map_medium,  # ADD
+            self.box.map_large    # ADD
+        ]
 
     def class_result(self, i: int) -> tuple[float, float, float, float]:
         """Return the result of evaluating the performance of an object detection model on a specific class."""
@@ -1783,12 +1873,12 @@ class SegmentMetrics(DetMetrics):
         self._biou_inter = self._biou_union = None
 
     def update_mask_aggregates(
-    self,
-    cls_indices: torch.Tensor,
-    gt_masks: torch.Tensor,
-    pred_masks: torch.Tensor,
-    boundary_tolerance: int = 1,
-) -> None:
+        self,
+        cls_indices: torch.Tensor,
+        gt_masks: torch.Tensor,
+        pred_masks: torch.Tensor,
+        boundary_tolerance: int = 1,
+    ) -> None:
         """
         Update per-class aggregates for Dice, mIoU, and boundary F1 using matched mask pairs.
 
@@ -2058,6 +2148,8 @@ class SegmentMetrics(DetMetrics):
             save_dir=save_dir,
             names=self.names,
             prefix="Mask",
+            target_areas=None,        # ADD: No size-based AP for masks
+            matched_gt_idx=None,
         )[2:]
         self.seg.nc = len(self.names)
         self.seg.update(results_mask)
@@ -2174,12 +2266,12 @@ class SegmentMetrics(DetMetrics):
         # Map weight keys to actual metric values
         metrics_map = {
             # Box metrics
-            'box_precision': self.box.mp,
-            'box_recall': self.box.mr,
-            'box_mAP50': self.box.map50,
-            'box_mAP50_95': self.box.map,
-            'box_f1': self.box.mf1,
-            'box_f2': self.box.mf2,
+            'precision': self.box.mp,
+            'recall': self.box.mr,
+            'mAP50': self.box.map50,
+            'mAP50_95': self.box.map,
+            'f1': self.box.mf1,
+            'f2': self.box.mf2,
             # Mask metrics
             'mask_precision': self.seg.mp,
             'mask_recall': self.seg.mr,
@@ -2195,7 +2287,7 @@ class SegmentMetrics(DetMetrics):
         }
 
         print("-"*50)
-        print("Inside metrics.py 2202")
+        print("Inside metrics.py 2290")
         print(self.fitness_weights)
         print("-"*50)
         
@@ -2523,13 +2615,13 @@ class OBBMetrics(DetMetrics):
         https://arxiv.org/pdf/2106.06072.pdf
     """
 
-    def __init__(self, names: dict[int, str] = {}) -> None:
+    def __init__(self, names: dict[int, str] = {}, fitness_weights: dict = None) -> None:
         """
         Initialize an OBBMetrics instance with directory, plotting, and class names.
 
         Args:
             names (dict[int, str], optional): Dictionary of class names.
         """
-        DetMetrics.__init__(self, names)
+        DetMetrics.__init__(self, names, fitness_weights = fitness_weights)
         # TODO: probably remove task as well
         self.task = "obb"

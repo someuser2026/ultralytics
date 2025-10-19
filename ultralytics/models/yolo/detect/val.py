@@ -58,6 +58,7 @@ class DetectionValidator(BaseValidator):
         self.class_map = None
         self.args.task = "detect"
         self.iouv = torch.linspace(0.5, 0.95, 10)  # IoU vector for mAP@0.5:0.95
+        self.iouv_low = torch.tensor([0.15])
         self.niou = self.iouv.numel()
         self.metrics = DetMetrics(fitness_weights = self.args.fitness_weights)
 
@@ -148,9 +149,13 @@ class DetectionValidator(BaseValidator):
         ratio_pad = batch["ratio_pad"][si]
         if cls.shape[0]:
             bbox = ops.xywh2xyxy(bbox) * torch.tensor(imgsz, device=self.device)[[1, 0, 1, 0]]  # target boxes
+            areas = (bbox[:, 2] - bbox[:, 0]) * (bbox[:, 3] - bbox[:, 1])
+        else:
+            areas = torch.zeros(0, device=self.device)
         return {
             "cls": cls,
             "bboxes": bbox,
+            "areas": areas,
             "ori_shape": ori_shape,
             "imgsz": imgsz,
             "ratio_pad": ratio_pad,
@@ -185,12 +190,14 @@ class DetectionValidator(BaseValidator):
             predn = self._prepare_pred(pred)
 
             cls = pbatch["cls"].cpu().numpy()
+            areas = pbatch["areas"].cpu().numpy()
             no_pred = predn["cls"].shape[0] == 0
             self.metrics.update_stats(
                 {
                     **self._process_batch(predn, pbatch),
                     "target_cls": cls,
                     "target_img": np.unique(cls),
+                    "target_areas": areas,
                     "conf": np.zeros(0) if no_pred else predn["conf"].cpu().numpy(),
                     "pred_cls": np.zeros(0) if no_pred else predn["cls"].cpu().numpy(),
                 }
@@ -275,9 +282,20 @@ class DetectionValidator(BaseValidator):
             (dict[str, np.ndarray]): Dictionary containing 'tp' key with correct prediction matrix of shape (N, 10) for 10 IoU levels.
         """
         if batch["cls"].shape[0] == 0 or preds["cls"].shape[0] == 0:
-            return {"tp": np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)}
+            return {
+                "tp": np.zeros((preds["cls"].shape[0], self.niou), dtype=bool),
+                "matched_gt_idx": np.full(preds["cls"].shape[0], -1, dtype=np.int32),
+            }
+        
         iou = box_iou(batch["bboxes"], preds["bboxes"])
-        return {"tp": self.match_predictions(preds["cls"], batch["cls"], iou).cpu().numpy()}
+        tp, matched_gt_idx = self.match_predictions(
+            preds["cls"], batch["cls"], iou, return_matched_indices=True
+        )
+        
+        return {
+            "tp": tp.cpu().numpy(),
+            "matched_gt_idx": matched_gt_idx,  # ADD: Which GT each prediction matched to
+        }
 
     def build_dataset(self, img_path: str, mode: str = "val", batch: int | None = None) -> torch.utils.data.Dataset:
         """

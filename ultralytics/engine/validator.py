@@ -266,47 +266,69 @@ class BaseValidator:
             return stats
 
     def match_predictions(
-        self, pred_classes: torch.Tensor, true_classes: torch.Tensor, iou: torch.Tensor, use_scipy: bool = False
-    ) -> torch.Tensor:
+        self, 
+        pred_classes: torch.Tensor, 
+        true_classes: torch.Tensor, 
+        iou: torch.Tensor, 
+        use_scipy: bool = False,
+        return_matched_indices: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, np.ndarray]:
         """
         Match predictions to ground truth objects using IoU.
 
         Args:
             pred_classes (torch.Tensor): Predicted class indices of shape (N,).
             true_classes (torch.Tensor): Target class indices of shape (M,).
-            iou (torch.Tensor): An NxM tensor containing the pairwise IoU values for predictions and ground truth.
+            iou (torch.Tensor): An MxN tensor containing the pairwise IoU values for predictions and ground truth.
             use_scipy (bool, optional): Whether to use scipy for matching (more precise).
+            return_matched_indices (bool, optional): If True, also return which GT each pred matched to.
 
         Returns:
             (torch.Tensor): Correct tensor of shape (N, 10) for 10 IoU thresholds.
+            OR
+            (tuple): (correct tensor, matched_gt_indices) if return_matched_indices=True
+                matched_gt_indices shape: (N,) with -1 for no match at first IoU threshold
         """
         # Dx10 matrix, where D - detections, 10 - IoU thresholds
         correct = np.zeros((pred_classes.shape[0], self.iouv.shape[0])).astype(bool)
+        matched_gt_idx = np.full(pred_classes.shape[0], -1, dtype=np.int32)  # Track matches at first threshold
+        
         # LxD matrix where L - labels (rows), D - detections (columns)
         correct_class = true_classes[:, None] == pred_classes
-        iou = iou * correct_class  # zero out the wrong classes
-        iou = iou.cpu().numpy()
+        iou_filtered = iou * correct_class  # zero out the wrong classes
+        iou_np = iou_filtered.cpu().numpy()
+        
         for i, threshold in enumerate(self.iouv.cpu().tolist()):
             if use_scipy:
-                # WARNING: known issue that reduces mAP in https://github.com/ultralytics/ultralytics/pull/4708
-                import scipy  # scope import to avoid importing for all commands
-
-                cost_matrix = iou * (iou >= threshold)
+                import scipy
+                cost_matrix = iou_np * (iou_np >= threshold)
                 if cost_matrix.any():
-                    labels_idx, detections_idx = scipy.optimize.linear_sum_assignment(cost_matrix)
+                    labels_idx, detections_idx = scipy.optimize.linear_sum_assignment(cost_matrix, maximize=True)
                     valid = cost_matrix[labels_idx, detections_idx] > 0
                     if valid.any():
-                        correct[detections_idx[valid], i] = True
+                        valid_labels = labels_idx[valid]
+                        valid_detections = detections_idx[valid]
+                        correct[valid_detections, i] = True
+                        if return_matched_indices and i == 0:  # Store matches at first threshold
+                            matched_gt_idx[valid_detections] = valid_labels
             else:
-                matches = np.nonzero(iou >= threshold)  # IoU > threshold and classes match
-                matches = np.array(matches).T
+                matches = np.nonzero(iou_np >= threshold)  # IoU > threshold and classes match
+                matches = np.array(matches).T  # Shape: (K, 2) where columns are [gt_idx, pred_idx]
                 if matches.shape[0]:
                     if matches.shape[0] > 1:
-                        matches = matches[iou[matches[:, 0], matches[:, 1]].argsort()[::-1]]
+                        matches = matches[iou_np[matches[:, 0], matches[:, 1]].argsort()[::-1]]
                         matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
                         matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
                     correct[matches[:, 1].astype(int), i] = True
-        return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
+                    if return_matched_indices and i == 0:  # Store matches at first threshold (0.5)
+                        matched_gt_idx[matches[:, 1].astype(int)] = matches[:, 0].astype(int)
+        
+        correct_tensor = torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
+        
+        if return_matched_indices:
+            return correct_tensor, matched_gt_idx
+        else:
+            return correct_tensor, None
 
     def add_callback(self, event: str, callback):
         """Append the given callback to the specified event."""
