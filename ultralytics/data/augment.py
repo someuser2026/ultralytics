@@ -2299,7 +2299,7 @@ class RandomCLAHE:
             >>> labels = clahe_augmenter(labels)
             >>> augmented_img = labels["img"]
         """
-        print("random clahe:", self.p)
+        # print("random clahe:", self.p)
         if np.random.random() > self.p:
             return labels
 
@@ -2387,7 +2387,7 @@ class RandomGamma:
             >>> labels = gamma_augmenter(labels)
             >>> augmented_img = labels["img"]
         """
-        print("random gamms:", self.p)
+        # print("random gamms:", self.p)
         if np.random.random() > self.p:
             return labels
 
@@ -2501,7 +2501,7 @@ class RandomUnsharpMask:
             >>> labels = unsharp_augmenter(labels)
             >>> augmented_img = labels["img"]
         """
-        print("randomunsharpmask:", self.p)
+        # print("randomunsharpmask:", self.p)
         if np.random.random() > self.p:
             return labels
 
