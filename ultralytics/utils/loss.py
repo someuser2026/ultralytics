@@ -95,7 +95,7 @@ def create_soft_ignore_weights_torch(gt_masks: torch.Tensor,
     """
     if device is None:
         device = gt_masks.device
-    x = (gt_masks > 0.5).to(torch.float32)
+    x = (gt_masks >= 0.5).to(torch.float32)
     if x.ndim == 2:
         x = x.unsqueeze(0)
     N, H, W = x.shape
@@ -116,7 +116,7 @@ def create_soft_ignore_weights_torch(gt_masks: torch.Tensor,
 
     weights = torch.ones((N, H, W), device=device, dtype=torch.float32)
     core = erode(x, hard_w) if hard_w > 0 else x
-    weights[core > 0.5] = 1.0
+    weights[core >= 0.5] = 1.0
 
     if trans_w > 0:
         steps = min(5, trans_w)
@@ -124,12 +124,12 @@ def create_soft_ignore_weights_torch(gt_masks: torch.Tensor,
         for s in range(1, steps + 1):
             r = hard_w + s * step_size
             er = erode(x, r)
-            band = (x > 0.5) & (core < 0.5) & (er < 0.5)
+            band = (x >= 0.5) & (core < 0.5) & (er < 0.5)
             weights[band] = s / steps
 
     if hard_w > 0:
         inner = erode(x, max(1, hard_w - 1))
-        hard_zone = (x > 0.5) & (inner < 0.5)
+        hard_zone = (x >= 0.5) & (inner < 0.5)
         weights[hard_zone] = 0.0
 
     return weights
@@ -604,19 +604,37 @@ class MixedMaskLoss(nn.Module):
         # (1) Lovasz-Hinge per instance (N,)
         # Approximation: evaluate Lovasz only on "core" (high-confidence) pixels if weight_map is provided
         if weight_map is not None:
-            core_mask = (weights_c >= 0.99).to(logits_c.dtype)
+            core_mask = (weights_c >= 0.90).to(logits_c.dtype)
             # mark non-core as ignore by setting targets to ignore_index
             t_for_lovasz = targets_c.clone()
-            t_for_lovasz[core_mask < 0.5] = self.lovasz.ignore_index
+            if core_mask.any():
+                t_for_lovasz[core_mask < 0.5] = self.lovasz.ignore_index
             lovasz_vec = self.lovasz(logits_c, t_for_lovasz)  # per-instance
         else:
             lovasz_vec = self.lovasz(logits_c, targets_c)
+        
+        # boost positive contribution and clamp bg to reduce pos-neg imbalance
+        # only valid for soft ignore boundary loss
+        pos_boost = 2.0
+        bg_cap = 0.5
+        if weights_c is not None:
+            w = weights_c.clone()
+            pos = targets_c > 0.5
+            w_pos = w * pos_boost
+            w_bg = torch.clamp_max(w, bg_cap)
+            w_eff = torch.where(pos, w_pos, w_bg)
+            # print("-"*50)
+            # print("Inisde utils/loss.py 627")
+            # print("weff:", w_eff)
+            # print("wc:", weights_c)
+            # print("target:", (targets_c[0, :, :] > 0.5).to(w.dtype).mean())
+            # print("-"*50)
 
         # (2) Weighted Dice per instance (N,)
         probs = torch.sigmoid(logits_c)
         if weights_c is not None:
-            num = 2.0 * (weights_c * probs * targets_c).sum(dim=(1, 2))
-            den = (weights_c * probs * probs).sum(dim=(1, 2)) + (weights_c * targets_c * targets_c).sum(dim=(1, 2)) + 1e-6
+            num = 2.0 * (w_eff * probs * targets_c).sum(dim=(1, 2))
+            den = (w_eff * probs * probs).sum(dim=(1, 2)) + (w_eff * targets_c * targets_c).sum(dim=(1, 2)) + 1e-6
             dice_vec = 1.0 - (num + 1e-6) / den
         else:
             dice_vec = dice_loss_with_logits(logits_c, targets_c)
@@ -624,19 +642,19 @@ class MixedMaskLoss(nn.Module):
         # (3) Weighted BCE per instance (N,)
         if weights_c is not None:
             bce_map = torch.nn.functional.binary_cross_entropy_with_logits(logits_c, targets_c, reduction="none")
-            bce_sum = (bce_map * weights_c).sum(dim=(1, 2))
+            bce_sum = (bce_map * w_eff).sum(dim=(1, 2))
             bce_vec = bce_sum / valid_w
-        else:
-            # existing per-instance BCE
-            N = logits_c.shape[0]
-            bce_vals = []
-            for i in range(N):
-                bce_vals.append(
-                    torch.nn.functional.binary_cross_entropy_with_logits(
-                        logits_c[i:i+1, ...], targets_c[i:i+1, ...], reduction="mean"
-                    )
-                )
-            bce_vec = torch.stack(bce_vals) if bce_vals else logits_c.new_zeros(1)
+        # else:
+        #     # existing per-instance BCE
+        #     N = logits_c.shape[0]
+        #     bce_vals = []
+        #     for i in range(N):
+        #         bce_vals.append(
+        #             torch.nn.functional.binary_cross_entropy_with_logits(
+        #                 logits_c[i:i+1, ...], targets_c[i:i+1, ...], reduction="mean"
+        #             )
+        #         )
+        #     bce_vec = torch.stack(bce_vals) if bce_vals else logits_c.new_zeros(1)
 
         # Optional area normalization (unchanged)
         if self.area_normalize:
@@ -676,12 +694,12 @@ class v8SegmentationLoss(v8DetectionLoss):
         self.use_ultrafast_ignore = bool(getattr(model.args, "use_ultrafast_ignore_band", False))
 
         # cache for weight maps within a forward pass
-        self._weight_map_cache: dict[int, torch.Tensor] = {}
+        # self._weight_map_cache: dict[int, torch.Tensor] = {}
 
 
     def __call__(self, preds: Any, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the combined loss for detection and segmentation."""
-        self._weight_map_cache.clear()
+        # self._weight_map_cache.clear()
 
         loss = torch.zeros(4, device=self.device)  # box, seg, cls, dfl
         feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
@@ -758,7 +776,7 @@ class v8SegmentationLoss(v8DetectionLoss):
             loss[1] += (proto * 0).sum() + (pred_masks * 0).sum()  # inf sums may lead to nan loss
 
         loss[0] *= self.hyp.box  # box gain
-        loss[1] *= self.hyp.box  # seg gain
+        loss[1] *= self.hyp.mask  # seg gain
         loss[2] *= self.hyp.cls  # cls gain
         loss[3] *= self.hyp.dfl  # dfl gain
 
@@ -828,18 +846,6 @@ class v8SegmentationLoss(v8DetectionLoss):
             valid_sum = cropped_w.sum(dim=(1, 2)).clamp_min(1e-6)
             return (cropped_loss.sum(dim=(1, 2)) / valid_sum / area.clamp_min(1e-6)).sum()
         else:
-            return (crop_mask(loss_map, xyxy).mean(dim=(1, 2)) / area.clamp_min(1e-6)).sum()
-        loss_map = torch.nn.functional.binary_cross_entropy_with_logits(pred_mask, gt_mask, reduction="none")
-
-        if weight_map is not None:
-            # element-wise weighting then crop + normalize over valid weights
-            loss_map = loss_map * weight_map
-            cropped_loss = crop_mask(loss_map, xyxy)
-            cropped_w    = crop_mask(weight_map, xyxy)
-            valid_sum = cropped_w.sum(dim=(1, 2)).clamp_min(1e-6)
-            return (cropped_loss.sum(dim=(1, 2)) / valid_sum / area.clamp_min(1e-6)).sum()
-        else:
-            # original mean over crop
             return (crop_mask(loss_map, xyxy).mean(dim=(1, 2)) / area.clamp_min(1e-6)).sum()
 
 

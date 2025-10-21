@@ -1940,6 +1940,7 @@ class Albumentations:
         self.p = p
         self.transform = None
         prefix = colorstr("albumentations: ")
+        self.allow_multi_channel = cfg.multi_ch_albu
 
         try:
             import os
@@ -1997,11 +1998,16 @@ class Albumentations:
             T = [
                 # A.Blur(p=0.01),
                 # A.MedianBlur(p=0.01),
-                A.ToGray(p=0.01),
+                # A.ToGray(p=0.01),
                 # A.CLAHE(p=0.01),
-                A.RandomBrightnessContrast(p=0.0),
+                # A.RandomBrightnessContrast(p=0.0),
                 # A.RandomGamma(p=0.0),
-                A.ImageCompression(quality_range=(75, 100), p=0.0),
+                # A.ImageCompression(quality_range=(75, 100), p=0.0),
+                A.GaussianBlur(p = cfg.gaussian_blur_p, sigma_limit = (0.5, 1.5)),
+                A.MotionBlur(p = cfg.motion_blur_p),
+                A.AdditiveNoise(p = cfg.additive_noise_p, noise_type = "gaussian", spatial_mode = "constant",
+                noise_params = {"std_range": (0.01, 0.03), "mean_range": (0.0, 0.0)}),
+                A.MultiplicativeNoise(p = cfg.multi_spec_noise_p, multiplier = (1.0, 1.05))
             ]
 
             # albu_photometric = [
@@ -2064,8 +2070,11 @@ class Albumentations:
             return labels
 
         im = labels["img"]
-        if im.shape[2] != 3:  # Only apply Albumentation on 3-channel images
+        if im.shape[2] != 3 and self.allow_multi_channel:  # Only apply Albumentation on 3-channel images
+            LOGGER.warning(colorstr("albumentations: ") + "Multi channel images detected and 'multi_ch_albu' is set to True. Set it to False to switch off transfomrs for multi channel.")
+        elif not self.allow_multi_channel:
             return labels
+        orig_dtype = im.dtype
 
         if self.contains_spatial:
             cls = labels["cls"]
@@ -2081,7 +2090,7 @@ class Albumentations:
                     bboxes = np.array(new["bboxes"], dtype=np.float32)
                 labels["instances"].update(bboxes=bboxes)
         else:
-            labels["img"] = self.transform(image=labels["img"])["image"]  # transformed
+            labels["img"] = self.transform(image=labels["img"])["image"].astype(orig_dtype)  # transformed
 
         return labels
 
@@ -2290,6 +2299,7 @@ class RandomCLAHE:
             >>> labels = clahe_augmenter(labels)
             >>> augmented_img = labels["img"]
         """
+        print("random clahe:", self.p)
         if np.random.random() > self.p:
             return labels
 
@@ -2377,6 +2387,7 @@ class RandomGamma:
             >>> labels = gamma_augmenter(labels)
             >>> augmented_img = labels["img"]
         """
+        print("random gamms:", self.p)
         if np.random.random() > self.p:
             return labels
 
@@ -2490,6 +2501,7 @@ class RandomUnsharpMask:
             >>> labels = unsharp_augmenter(labels)
             >>> augmented_img = labels["img"]
         """
+        print("randomunsharpmask:", self.p)
         if np.random.random() > self.p:
             return labels
 

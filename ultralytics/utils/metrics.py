@@ -2286,10 +2286,10 @@ class SegmentMetrics(DetMetrics):
             'boundary_iou': self.mboundary_iou
         }
 
-        print("-"*50)
-        print("Inside metrics.py 2290")
-        print(self.fitness_weights)
-        print("-"*50)
+        # print("-"*50)
+        # print("Inside metrics.py 2290")
+        # print(self.fitness_weights)
+        # print("-"*50)
         
         fitness = 0.0
         total_weight = 0.0

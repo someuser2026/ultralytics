@@ -129,6 +129,7 @@ warmup_epochs: 3.0 # (float) warmup epochs (fractions allowed)
 warmup_momentum: 0.8 # (float) initial momentum during warmup
 warmup_bias_lr: 0.1 # (float) bias learning rate during warmup
 box: 7.5 # (float) box loss gain
+mask: 5.0 # (float) mask loss gain
 cls: 0.5 # (float) classification loss gain
 dfl: 1.5 # (float) distribution focal loss gain
 pose: 12.0 # (float) pose loss gain (pose tasks)
@@ -171,6 +172,12 @@ edgeboost_p: 0.0
 homomorphic_gain: 0.5
 homomorphic_sigma: 12
 homomorphic_p: 0.0
+gaussian_blur_p: 0.0
+motion_blur_p: 0.0
+additive_noise_p: 0.0
+multi_spec_noise_p: 0.0
+multi_ch_albu: True
+
 
 # Custom config.yaml ---------------------------------------------------------------------------------------------------
 cfg: # (str, optional) path to a config.yaml that overrides defaults

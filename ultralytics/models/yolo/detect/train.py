@@ -128,6 +128,10 @@ class DetectionTrainer(BaseTrainer):
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
         batch["img"] = batch["img"].float() / 255
+        # print("-"*50)
+        # print("inside detect/train.py 132")
+        # print("slef.stride:", self.stride)
+        # print("-"*50)
         if self.args.multi_scale:
             imgs = batch["img"]
             sz = (
