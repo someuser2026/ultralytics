@@ -9,6 +9,10 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from torchvision.ops import box_iou
+import torch.nn.functional as F
+
+from ultralytics.nn.modules.roi_heads import encode_boxes
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -74,7 +78,9 @@ from ultralytics.nn.modules import (
     Timm,
     # DinoV3Backbone
     MaxViTBlock,
-    DeformableConv2d
+    DeformableConv2d,
+    # Mask2FormerHead,
+    # CascadeRCNNHead,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -636,6 +642,237 @@ class PoseModel(DetectionModel):
     def init_criterion(self):
         """Initialize the loss criterion for the PoseModel."""
         return v8PoseLoss(self)
+
+# class CascadeRCNNModel(DetectionModel):
+#     """
+#     Cascade R-CNN model for object detection and instance segmentation.
+    
+#     Extends DetectionModel to support multi-stage cascaded refinement with RPN.
+#     """
+
+#     def __init__(self, cfg="cascade-rcnn.yaml", ch=3, nc=None, verbose=True):
+#         """
+#         Initialize Cascade R-CNN model.
+        
+#         Args:
+#             cfg: Model configuration file path
+#             ch: Number of input channels
+#             nc: Number of classes
+#             verbose: Print model information
+#         """
+#         super().__init__(cfg, ch, nc, verbose)
+#         self.task = "detect"  # Can be overridden to "segment"
+#         self.end2end = True  # Model outputs final predictions
+        
+#         # Loss configuration
+#         self.loss_weights = {
+#             "rpn_obj": 1.0,
+#             "rpn_box": 1.0,
+#             "rcnn_cls": 1.0,
+#             "rcnn_box": 1.0,
+#             "mask": 1.0,
+#         }
+#         self.bce = nn.BCEWithLogitsLoss(reduction="mean")
+#         self.ce = nn.CrossEntropyLoss(reduction="mean")
+#         self.smoothl1 = nn.SmoothL1Loss(reduction="mean", beta=1 / 9)
+
+#     def _predict_once(self, x, profile=False, visualize=False, embed=None):
+#         """
+#         Perform single forward pass for Cascade R-CNN.
+        
+#         Returns model outputs (training) or final predictions (inference).
+#         """
+#         y = []
+#         for m in self.model:
+#             if m.f != -1:  # If not from previous layer
+#                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+#             x = m(x)
+#             y.append(x if m.i in self.save else None)
+        
+#         return x
+
+#     def forward(self, x, *args, **kwargs):
+#         """
+#         Forward pass through Cascade R-CNN.
+        
+#         Args:
+#             x: Input tensor [B, C, H, W]
+#             **kwargs: Can include 'targets' for training
+        
+#         Returns:
+#             Training: Dict with RPN/cascade outputs
+#             Inference: List[Dict] per image with detections
+#         """
+#         # Run through backbone and neck to get FPN features
+#         y = []
+#         for m in self.model[:-1]:  # All except head
+#             if m.f != -1:
+#                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+#             x = m(x)
+#             y.append(x if m.i in self.save else None)
+        
+#         # Collect FPN features (assume neck outputs list)
+#         feats = x if isinstance(x, list) else [x]
+        
+#         # Head forward
+#         head = self.model[-1]
+#         batch_img = kwargs.get("batch", {}).get("img", kwargs.get("img", None))
+#         imgsz = batch_img.shape[-2:] if batch_img is not None else x.shape[-2:] if not isinstance(x, list) else x[0].shape[-2:]
+        
+#         out = head(feats, targets=kwargs.get("targets"), imgsz=imgsz, train=self.training)
+#         return out
+
+#     def loss(self, batch: dict, preds: dict):
+#         """
+#         Compute Cascade R-CNN loss.
+        
+#         Args:
+#             batch: Training batch with 'img', 'cls', 'bboxes', 'batch_idx'
+#             preds: Model predictions dict
+        
+#         Returns:
+#             Tuple[Tensor, Tensor]: (total_loss, loss_items)
+#         """
+#         device = batch["img"].device
+#         B, _, H, W = batch["img"].shape
+
+#         # Initialize losses
+#         rpn_obj_loss = torch.tensor(0.0, device=device)
+#         rpn_box_loss = torch.tensor(0.0, device=device)
+#         rcnn_cls_loss = torch.tensor(0.0, device=device)
+#         rcnn_box_loss = torch.tensor(0.0, device=device)
+#         mask_loss = torch.tensor(0.0, device=device)
+
+#         # Build per-image GT
+#         per_img_gt = []
+#         for i in range(B):
+#             idx = batch["batch_idx"].view(-1) == i
+#             if idx.any():
+#                 cls_i = batch["cls"].view(-1)[idx].long()
+#                 xywh = batch["bboxes"][idx]
+#                 xyxy = xywh.clone()
+#                 xyxy[:, 0] = (xywh[:, 0] - xywh[:, 2] / 2.0) * W
+#                 xyxy[:, 1] = (xywh[:, 1] - xywh[:, 3] / 2.0) * H
+#                 xyxy[:, 2] = (xywh[:, 0] + xywh[:, 2] / 2.0) * W
+#                 xyxy[:, 3] = (xywh[:, 1] + xywh[:, 3] / 2.0) * H
+#                 per_img_gt.append((xyxy, cls_i))
+#             else:
+#                 per_img_gt.append((torch.zeros((0, 4), device=device), torch.zeros((0,), dtype=torch.long, device=device)))
+
+#         # RPN loss
+#         rpn = preds["rpn"]
+#         anchors = rpn["anchors"]
+#         rpn_cfg = preds.get("rpn_cfg")
+
+#         for i in range(B):
+#             gt_boxes, _ = per_img_gt[i]
+#             if len(anchors) == 0:
+#                 continue
+            
+#             A = torch.cat(anchors, dim=0)
+#             if A.numel() == 0:
+#                 continue
+
+#             logits = torch.cat([p[i].flatten() for p in rpn["logits"]], dim=0)
+#             deltas = torch.cat([p[i].permute(1, 2, 0).reshape(-1, 4) for p in rpn["deltas"]], dim=0)
+
+#             if gt_boxes.numel() == 0:
+#                 targets_obj = torch.zeros_like(logits)
+#                 rpn_obj_loss = rpn_obj_loss + F.binary_cross_entropy_with_logits(logits, targets_obj)
+#                 continue
+
+#             ious = box_iou(A, gt_boxes)
+#             iou_max, gt_idx = ious.max(dim=1)
+
+#             fg_thr = rpn_cfg.fg_iou if rpn_cfg else 0.7
+#             bg_thr = rpn_cfg.bg_iou if rpn_cfg else 0.3
+#             rpn_fg = iou_max >= fg_thr
+#             rpn_bg = iou_max < bg_thr
+
+#             targets_obj = torch.full_like(logits, -1.0)
+#             targets_obj[rpn_fg] = 1.0
+#             targets_obj[rpn_bg] = 0.0
+#             valid = targets_obj >= 0
+#             rpn_obj_loss = rpn_obj_loss + F.binary_cross_entropy_with_logits(logits[valid], targets_obj[valid])
+
+#             # Box regression on positives
+#             pos_idx = torch.nonzero(rpn_fg, as_tuple=False).flatten()
+#             if pos_idx.numel() > 0:
+#                 gt = gt_boxes[gt_idx[pos_idx]]
+#                 std = (0.1, 0.1, 0.2, 0.2)
+                
+#                 # Encode deltas
+#                 wa = A[pos_idx][:, 2] - A[pos_idx][:, 0]
+#                 ha = A[pos_idx][:, 3] - A[pos_idx][:, 1]
+#                 xa = A[pos_idx][:, 0] + 0.5 * wa
+#                 ya = A[pos_idx][:, 1] + 0.5 * ha
+                
+#                 wg = gt[:, 2] - gt[:, 0]
+#                 hg = gt[:, 3] - gt[:, 1]
+#                 xg = gt[:, 0] + 0.5 * wg
+#                 yg = gt[:, 1] + 0.5 * hg
+                
+#                 dx = (xg - xa) / (wa + 1e-8) / std[0]
+#                 dy = (yg - ya) / (ha + 1e-8) / std[1]
+#                 dw = torch.log((wg + 1e-8) / (wa + 1e-8)) / std[2]
+#                 dh = torch.log((hg + 1e-8) / (ha + 1e-8)) / std[3]
+#                 t = torch.stack((dx, dy, dw, dh), dim=1)
+#                 rpn_box_loss = rpn_box_loss + self.smoothl1(deltas[pos_idx], t)
+
+#         # Cascade losses
+#         head = self.model[-1]
+#         roi_samples = preds["roi_samples"]
+#         cascade = preds["cascade"]
+
+#         start = 0
+#         for s, stage in enumerate(cascade):
+#             cls_logits = stage["cls_logits"]
+#             bbox_deltas = stage["bbox_deltas"]
+#             std = head.stage_std[s]
+
+#             cur = 0
+#             for i in range(B):
+#                 info = roi_samples[s][i]
+#                 inds = info["indices"]
+#                 if inds.numel() == 0:
+#                     continue
+
+#                 n_all = preds["proposals"][i].shape[0]
+#                 logits_i = cls_logits[cur : cur + n_all][inds]
+#                 deltas_i = bbox_deltas[cur : cur + n_all][inds]
+#                 labels_i = info["labels"]
+#                 gt_cls_i = info["matched_cls"].clamp(min=0)
+#                 gt_boxes_i = info["matched_gt"]
+
+#                 # Classification loss
+#                 rcnn_cls_loss = rcnn_cls_loss + F.cross_entropy(logits_i, gt_cls_i, reduction="mean")
+
+#                 # Box regression on positives
+#                 pos = torch.nonzero(labels_i > 0, as_tuple=False).flatten()
+#                 if pos.numel():
+#                     cls_sel = gt_cls_i[pos]
+#                     idx = cls_sel[:, None] * 4 + torch.tensor([0, 1, 2, 3], device=deltas_i.device)[None, :]
+#                     deltas_sel = torch.gather(deltas_i[pos], 1, idx)
+#                     props = preds["proposals"][i][inds[pos]]
+#                     t = encode_boxes(props, gt_boxes_i[pos], std)
+#                     rcnn_box_loss = rcnn_box_loss + self.smoothl1(deltas_sel, t)
+#                 cur += n_all
+
+#         # Mask loss (TODO: implement if with_mask=True)
+#         # Would require pooling mask features and computing per-pixel BCE
+
+#         # Total loss
+#         total = (
+#             self.loss_weights["rpn_obj"] * rpn_obj_loss
+#             + self.loss_weights["rpn_box"] * rpn_box_loss
+#             + self.loss_weights["rcnn_cls"] * rcnn_cls_loss
+#             + self.loss_weights["rcnn_box"] * rcnn_box_loss
+#             + self.loss_weights["mask"] * mask_loss
+#         )
+
+#         # Return as (total, loss_items) for Ultralytics
+#         loss_items = torch.stack([rpn_obj_loss, rpn_box_loss, rcnn_cls_loss, rcnn_box_loss, mask_loss]).detach()
+#         return total, loss_items
 
 
 class ClassificationModel(BaseModel):
@@ -1697,7 +1934,7 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
+            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}#, Mask2FormerHead}
         ):
             # print("f:", f)
             # print("ch:", ch)
@@ -1708,6 +1945,8 @@ def parse_model(d, ch, verbose=True):
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
+        # elif m in frozenset({CascadeRCNNHead}):
+        #     args = [[ch[x] for x in f], *args]
         elif m in frozenset({CBLinear, DeformableConv2d}):
             c2 = args[0]
             c1 = ch[f]

@@ -39,6 +39,7 @@ def create_soft_ignore_weights_fast(gt_masks: torch.Tensor,
                                     device: torch.device | None = None) -> torch.Tensor:
     """
     Accurate version (EDT). Accepts (H,W) or (N,H,W). Returns (N,H,W).
+    Creates soft ignore band OUTSIDE the mask boundary.
     """
     if device is None:
         device = gt_masks.device
@@ -65,25 +66,47 @@ def create_soft_ignore_weights_fast(gt_masks: torch.Tensor,
     trans_w = max(0, int(np.ceil(ignore_width - hard_w)))
     sigma = max(trans_w / 3.0, 0.5) if trans_w > 0 else 1.0
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     for i in range(N):
         m = masks_np[i]
         if m.sum() == 0:
             continue
-        edges = cv2.morphologyEx(m, cv2.MORPH_GRADIENT, kernel)
-        dist = distance_transform_edt(1 - edges).astype(np.float32)
-        w = np.ones_like(dist, dtype=np.float32)
+        
+        # KEY FIX: Calculate distance from OUTSIDE the mask boundary
+        # dist_inside: distance from edge going inward (positive inside mask)
+        # dist_outside: distance from edge going outward (positive outside mask)
+        dist_inside = distance_transform_edt(m).astype(np.float32)
+        dist_outside = distance_transform_edt(1 - m).astype(np.float32)
+        
+        # Start with all weights = 1.0
+        w = np.ones_like(m, dtype=np.float32)
+        
+        # Apply ignore band OUTSIDE the mask
+        # Hard ignore zone: 0 to hard_w pixels outside
         if hard_w > 0:
-            w[dist < hard_w] = 0.0
+            outside_hard = (m == 0) & (dist_outside <= hard_w)
+            w[outside_hard] = 0.0
+        
+        # Soft transition zone: hard_w to (hard_w + trans_w) pixels outside
         if trans_w > 0:
-            band = (dist >= hard_w) & (dist < hard_w + trans_w)
-            if band.any():
-                d = dist[band] - hard_w
-                w[band] = 1.0 - np.exp(-(d ** 2) / (2.0 * sigma ** 2))
+            outside_soft = (m == 0) & (dist_outside > hard_w) & (dist_outside <= hard_w + trans_w)
+            if outside_soft.any():
+                d = dist_outside[outside_soft] - hard_w
+                # Gaussian transition from 0 to 1
+                w[outside_soft] = 1.0 - np.exp(-(d ** 2) / (2.0 * sigma ** 2))
+        
+        # Optional: Also apply smaller ignore band INSIDE near boundary
+        # (for uncertain boundary pixels)
+        inner_margin = min(2, hard_w // 2) if hard_w > 0 else 0
+        if inner_margin > 0:
+            inside_band = (m == 1) & (dist_inside <= inner_margin)
+            if inside_band.any():
+                # Soft transition from edge to core
+                d_in = dist_inside[inside_band]
+                w[inside_band] = d_in / inner_margin  # Linear: 0 at edge, 1 at inner_margin
+        
         weight_maps[i] = w
 
     return torch.from_numpy(weight_maps).to(device=device, dtype=torch.float32)
-
 
 @torch.no_grad()
 def create_soft_ignore_weights_torch(gt_masks: torch.Tensor,
@@ -92,6 +115,7 @@ def create_soft_ignore_weights_torch(gt_masks: torch.Tensor,
                                      device: torch.device | None = None) -> torch.Tensor:
     """
     Pure-Torch approximation. Accepts (H,W) or (N,H,W). Returns (N,H,W).
+    Creates soft ignore band OUTSIDE the mask boundary.
     """
     if device is None:
         device = gt_masks.device
@@ -106,31 +130,65 @@ def create_soft_ignore_weights_torch(gt_masks: torch.Tensor,
     hard_w = max(1, int(math.ceil(ignore_width * max(0.0, min(1.0, transition_ratio)))))
     trans_w = max(0, int(math.ceil(ignore_width - hard_w)))
 
-    def erode(bin_mask: torch.Tensor, r: int) -> torch.Tensor:
+    def dilate(bin_mask: torch.Tensor, r: int) -> torch.Tensor:
+        """Dilate binary mask by r pixels."""
         if r <= 0:
             return bin_mask
         k = 2 * r + 1
-        inv = 1.0 - bin_mask.unsqueeze(1)  # (N,1,H,W)
-        mp = torch.nn.functional.max_pool2d(inv, kernel_size=k, stride=1, padding=r)
-        return (mp == 0).to(torch.float32).squeeze(1)
+        # Use max pooling to dilate
+        dilated = torch.nn.functional.max_pool2d(
+            bin_mask.unsqueeze(1),  # (N,1,H,W)
+            kernel_size=k,
+            stride=1,
+            padding=r
+        )
+        return dilated.squeeze(1)  # (N,H,W)
 
+    # Start with all weights = 1.0
     weights = torch.ones((N, H, W), device=device, dtype=torch.float32)
-    core = erode(x, hard_w) if hard_w > 0 else x
-    weights[core >= 0.5] = 1.0
-
-    if trans_w > 0:
-        steps = min(5, trans_w)
-        step_size = max(1, trans_w // steps)
-        for s in range(1, steps + 1):
-            r = hard_w + s * step_size
-            er = erode(x, r)
-            band = (x >= 0.5) & (core < 0.5) & (er < 0.5)
-            weights[band] = s / steps
-
+    
+    # Hard ignore zone: dilate mask by hard_w, then subtract original
     if hard_w > 0:
-        inner = erode(x, max(1, hard_w - 1))
-        hard_zone = (x >= 0.5) & (inner < 0.5)
-        weights[hard_zone] = 0.0
+        expanded_hard = dilate(x, hard_w)
+        hard_ignore_zone = (expanded_hard > 0.5) & (x < 0.5)  # Outside original, inside expanded
+        weights[hard_ignore_zone] = 0.0
+    
+    # Soft transition zone: between hard_w and (hard_w + trans_w)
+    if trans_w > 0:
+        expanded_soft = dilate(x, hard_w + trans_w)
+        soft_zone = (expanded_soft > 0.5) & (x < 0.5)
+        if hard_w > 0:
+            soft_zone = soft_zone & ~hard_ignore_zone  # Exclude hard ignore zone
+        
+        if soft_zone.any():
+            # Approximate gradient: use multiple dilations
+            steps = min(5, trans_w)
+            step_size = max(1, trans_w // steps)
+            
+            for s in range(1, steps + 1):
+                r = hard_w + s * step_size
+                expanded_s = dilate(x, r)
+                band_s = (expanded_s > 0.5) & (x < 0.5) & soft_zone
+                # Linear gradient in transition zone
+                weights[band_s] = torch.maximum(weights[band_s], torch.tensor(s / steps, device=device))
+    
+    # Optional: Small ignore band INSIDE near boundary (for uncertain pixels)
+    inner_margin = min(2, hard_w // 2) if hard_w > 0 else 0
+    if inner_margin > 0:
+        # Erode mask to find core
+        def erode(bin_mask: torch.Tensor, r: int) -> torch.Tensor:
+            if r <= 0:
+                return bin_mask
+            k = 2 * r + 1
+            inv = 1.0 - bin_mask.unsqueeze(1)
+            mp = torch.nn.functional.max_pool2d(inv, kernel_size=k, stride=1, padding=r)
+            return (mp == 0).to(torch.float32).squeeze(1)
+        
+        core = erode(x, inner_margin)
+        inner_band = (x > 0.5) & (core < 0.5)
+        if inner_band.any():
+            # Linear transition from 0.5 at edge to 1.0 at core
+            weights[inner_band] = 0.7  # Simple approximation
 
     return weights
 
@@ -644,17 +702,17 @@ class MixedMaskLoss(nn.Module):
             bce_map = torch.nn.functional.binary_cross_entropy_with_logits(logits_c, targets_c, reduction="none")
             bce_sum = (bce_map * w_eff).sum(dim=(1, 2))
             bce_vec = bce_sum / valid_w
-        # else:
-        #     # existing per-instance BCE
-        #     N = logits_c.shape[0]
-        #     bce_vals = []
-        #     for i in range(N):
-        #         bce_vals.append(
-        #             torch.nn.functional.binary_cross_entropy_with_logits(
-        #                 logits_c[i:i+1, ...], targets_c[i:i+1, ...], reduction="mean"
-        #             )
-        #         )
-        #     bce_vec = torch.stack(bce_vals) if bce_vals else logits_c.new_zeros(1)
+        else:
+            # existing per-instance BCE
+            N = logits_c.shape[0]
+            bce_vals = []
+            for i in range(N):
+                bce_vals.append(
+                    torch.nn.functional.binary_cross_entropy_with_logits(
+                        logits_c[i:i+1, ...], targets_c[i:i+1, ...], reduction="mean"
+                    )
+                )
+            bce_vec = torch.stack(bce_vals) if bce_vals else logits_c.new_zeros(1)
 
         # Optional area normalization (unchanged)
         if self.area_normalize:

@@ -5,6 +5,7 @@ from .tasks import (
     ClassificationModel,
     DetectionModel,
     SegmentationModel,
+    # CascadeRCNNModel,
     guess_model_scale,
     guess_model_task,
     load_checkpoint,
@@ -24,4 +25,5 @@ __all__ = (
     "SegmentationModel",
     "ClassificationModel",
     "BaseModel",
+    # "CascadeRCNNModel"
 )

@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import copy
 import math
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.init import constant_, xavier_uniform_
+from torchvision.ops import box_iou, nms
+
 
 from ultralytics.utils import NOT_MACOS14
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
@@ -20,7 +23,10 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"
+# from .roi_heads import MaskHead, TwoFCBBoxHead, decode_boxes, encode_boxes, roi_align_pyramid
+# from .rpn import AnchorGenerator, RPNConfig, RPNHead, rpn_inference_single_image
+
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"#, "CascadeRCNNHead"
 
 
 class Detect(nn.Module):
@@ -1231,3 +1237,289 @@ class v10Detect(Detect):
     def fuse(self):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = nn.ModuleList([nn.Identity()] * self.nl)
+
+# # from .roi_heads import MaskHead, TwoFCBBoxHead, decode_boxes, encode_boxes, roi_align_pyramid
+# # from .rpn import AnchorGenerator, RPNConfig, RPNHead, rpn_inference_single_image
+
+# def _assign_samples(
+#     proposals: torch.Tensor,
+#     gt_boxes: torch.Tensor,
+#     gt_classes: torch.Tensor,
+#     iou_thr_pos: float,
+#     iou_thr_neg: float,
+#     samples_per_img: int,
+#     fg_fraction: float,
+# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+#     """
+#     Assign proposals to GT and sample for training.
+    
+#     Returns:
+#         sampled_inds: Indices in proposals [Ni]
+#         labels: -1=ignore, 0=bg, >0=class_id [Ni]
+#         matched_gt: GT boxes for positives [Ni, 4]
+#         matched_cls: Class ids [Ni]
+#     """
+#     if gt_boxes.numel() == 0 or proposals.numel() == 0:
+#         return (
+#             torch.zeros(0, dtype=torch.long, device=proposals.device),
+#             torch.zeros(0, dtype=torch.long, device=proposals.device),
+#             torch.zeros((0, 4), device=proposals.device),
+#             torch.zeros(0, dtype=torch.long, device=proposals.device),
+#         )
+
+#     ious = box_iou(proposals, gt_boxes)
+#     iou_vals, gt_idx = ious.max(dim=1)
+
+#     labels = torch.full((proposals.shape[0],), -1, dtype=torch.long, device=proposals.device)
+#     labels[iou_vals < iou_thr_neg] = 0
+#     pos = iou_vals >= iou_thr_pos
+#     labels[pos] = gt_classes[gt_idx[pos]]
+
+#     # Sample positives and negatives
+#     num_samples = min(samples_per_img, proposals.shape[0])
+#     num_pos = int(fg_fraction * num_samples)
+#     pos_idx = torch.nonzero(labels > 0, as_tuple=False).flatten()
+#     neg_idx = torch.nonzero(labels == 0, as_tuple=False).flatten()
+
+#     if pos_idx.numel() > num_pos:
+#         perm = torch.randperm(pos_idx.numel(), device=proposals.device)[:num_pos]
+#         pos_idx = pos_idx[perm]
+#     if neg_idx.numel() > (num_samples - pos_idx.numel()):
+#         perm = torch.randperm(neg_idx.numel(), device=proposals.device)[: (num_samples - pos_idx.numel())]
+#         neg_idx = neg_idx[perm]
+
+#     sampled_inds = torch.cat([pos_idx, neg_idx], dim=0)
+#     matched_gt = gt_boxes[gt_idx[sampled_inds].clamp(min=0)]
+#     matched_cls = torch.clamp(labels[sampled_inds], min=0)
+#     return sampled_inds, labels[sampled_inds], matched_gt, matched_cls
+
+
+# class CascadeRCNNHead(nn.Module):
+#     """
+#     Cascade R-CNN head with RPN and multi-stage refinement.
+    
+#     Supports both detection and instance segmentation.
+#     """
+
+#     def __init__(
+#         self,
+#         in_channels: List[int],
+#         nc: int,
+#         cfg: dict,
+#         strides: List[int] | None = None,
+#     ):
+#         """
+#         Initialize Cascade R-CNN head.
+        
+#         Args:
+#             in_channels: FPN feature channels per level
+#             nc: Number of classes
+#             rpn_cfg: RPN configuration dict
+#             roi_cfg: ROI pooling configuration
+#             cas_cfg: Cascade configuration
+#             mask_cfg: Mask head configuration (optional)
+#             strides: Feature map strides
+#         """
+#         super().__init__()
+#         self.nc = int(nc)
+#         self.strides = strides or [8, 16, 32, 64]
+#         print(cfg)
+
+#         # RPN
+#         rpn_cfg = cfg["rpn"]
+#         self.rpn_cfg = RPNConfig(**rpn_cfg)
+#         num_anchors = len(self.rpn_cfg.ratios)
+#         self.rpn_head = nn.ModuleList([RPNHead(c, num_anchors) for c in in_channels])
+#         self.anchor_gen = AnchorGenerator(self.rpn_cfg.anchor_sizes, self.rpn_cfg.ratios, self.strides)
+
+#         # ROI heads
+#         roi_cfg = cfg["roi"]
+#         self.pooler_resolution = int(roi_cfg.get("pooler_resolution", 7))
+#         self.pooler_sampling = int(roi_cfg.get("pooler_sampling", 2))
+        
+#         cas_cfg = cfg["cas"]
+#         stages = int(cas_cfg.get("stages", 3))
+#         iou_thr = cas_cfg.get("iou_thr", [0.5, 0.6, 0.7])
+#         bbox_std = cas_cfg.get("bbox_std", [[0.1, 0.1, 0.2, 0.2], [0.05, 0.05, 0.1, 0.1], [0.033, 0.033, 0.067, 0.067]])
+        
+#         self.stage_iou = [float(x) for x in iou_thr][:stages]
+#         self.stage_std = [tuple(map(float, s)) for s in bbox_std][:stages]
+#         self.stage_heads = nn.ModuleList([TwoFCBBoxHead(in_channels[0], self.pooler_resolution, self.nc) for _ in range(stages)])
+
+#         # Mask head (optional)
+#         mask_cfg = cfg["mask"]
+#         self.with_mask = bool(mask_cfg and mask_cfg.get("with_mask", False))
+#         self.mask_size = int(mask_cfg.get("mask_size", 28)) if mask_cfg else 28
+#         if self.with_mask:
+#             self.mask_pool_res = max(14, self.pooler_resolution * 2)
+#             self.mask_head = MaskHead(in_channels[0], self.nc, mask_size=self.mask_size)
+
+#     def _get_name(self):
+#         """Return model name for YOLO rerouting."""
+#         return "CascadeRCNNHead"
+
+#     @staticmethod
+#     def _level_assign(boxes: torch.Tensor, strides: List[int]) -> List[int]:
+#         """Assign ROIs to FPN levels based on box size."""
+#         if boxes.numel() == 0:
+#             return []
+#         ws = boxes[:, 2] - boxes[:, 0]
+#         hs = boxes[:, 3] - boxes[:, 1]
+#         s = torch.sqrt(torch.clamp(ws * hs, min=1.0))
+#         lvl = torch.clamp(((s / 224.0).log2() * 4.0 + 4.0).round().long(), min=0, max=len(strides) - 1)
+#         return lvl.tolist()
+
+#     def forward(
+#         self,
+#         feats: List[torch.Tensor]
+#     ):
+#         """
+#         Forward pass.
+        
+#         Training returns dict for loss computation.
+#         Inference returns raw predictions
+#         """
+#         B = feats[0].shape[0]
+#         # H, W = imgsz if imgsz is not None else (feats[0].shape[-2], feats[0].shape[-1])
+
+#         # RPN forward
+#         rpn_logits_per_level, rpn_deltas_per_level = [], []
+#         for l, head in enumerate(self.rpn_head):
+#             lo, dr = head([feats[l]])
+#             rpn_logits_per_level.append(lo[0])
+#             rpn_deltas_per_level.append(dr[0])
+        
+#         anchors_per_level = self.anchor_gen(feats)
+#         if self.training:
+#             return {
+#                 "rpn_logits": rpn_logits_per_level,
+#                 "rpn_deltas": rpn_deltas_per_level,
+#                 "anchors": anchors_per_level,
+#                 "feats": feats,
+#                 "pooler_resolution": self.pooler_resolution,
+#                 "pooler_samplinng": self.pooler_sampling,
+#                 "stage_std": self.stage_std,
+#                 "stage_iou": self.stage_iou,
+#             }
+        
+#         H = int(feats[0].shape[-2] * self.stride[0])
+#         W = int(feats[0].shape[-1] * self.stride[0])
+
+#         proposals = []
+#         for i in range(B):
+#             props_i = rpn_inference_single_image(
+#                 [x[i] for x in rpn_logits_per_level],
+#                 [x[i] for x in rpn_deltas_per_level],
+#                 anchors_per_level,
+#                 (H, W),
+#                 self.rpn_cfg,
+#             )
+#             proposals.append(props_i[:, :4])
+
+#         # Cascade stages
+#         cascade_out = []
+#         proposals_s = proposals
+
+#         for s, head in enumerate(self.stage_heads):
+#             std = self.stage_std[s]
+            
+#             # Assign levels and pool
+#             levels_all = []
+#             rois_all = []
+#             for i in range(B):
+#                 pi = proposals_s[i]
+#                 rois_all.append(pi)
+#                 levels_all += self._level_assign(pi, self.strides)
+            
+#             pooled = roi_align_pyramid(feats, rois_all, levels_all, self.pooler_resolution, self.pooler_sampling)
+
+#             # Split by image
+#             counts = [p.shape[0] for p in proposals_s]
+#             if sum(counts) == 0:
+#                 cascade_out.append(
+#                     {"cls_logits": torch.zeros((0, self.nc), device=feats[0].device), "bbox_deltas": torch.zeros((0, 4 * self.nc), device=feats[0].device)}
+#                 )
+#                 continue
+
+#             splits = torch.split(pooled, counts, dim=0)
+#             out_logits, out_deltas = [], []
+#             for x in splits:
+#                 if x.numel() == 0:
+#                     out_logits.append(torch.zeros((0, self.nc), device=x.device))
+#                     out_deltas.append(torch.zeros((0, 4 * self.nc), device=x.device))
+#                     continue
+#                 out = head(x)
+#                 out_logits.append(out["cls_logits"])
+#                 out_deltas.append(out["bbox_deltas"])
+
+#             cls_logits = torch.cat(out_logits, dim=0)
+#             bbox_deltas = torch.cat(out_deltas, dim=0)
+#             cascade_out.append({"cls_logits": cls_logits, "bbox_deltas": bbox_deltas})
+
+#             # Refine proposals for next stage
+#             start = 0
+#             new_props = []
+#             for i, n in enumerate(counts):
+#                 if n == 0:
+#                     new_props.append(proposals_s[i])
+#                     continue
+#                 end = start + n
+#                 pl = proposals_s[i]
+#                 logit_i = cls_logits[start:end]
+#                 delta_i = bbox_deltas[start:end]
+                
+#                 cls_ids = logit_i.argmax(dim=1).clamp(min=0)
+#                 idx = cls_ids[:, None] * 4 + torch.tensor([0, 1, 2, 3], device=delta_i.device)[None, :]
+#                 deltas_sel = torch.gather(delta_i, 1, idx)
+#                 boxes_ref = decode_boxes(pl, deltas_sel, std)
+                
+#                 boxes_ref[:, [0, 2]] = boxes_ref[:, [0, 2]].clamp(0, W - 1)
+#                 boxes_ref[:, [1, 3]] = boxes_ref[:, [1, 3]].clamp(0, H - 1)
+#                 new_props.append(boxes_ref)
+#                 start = end
+#             proposals_s = new_props
+
+#         # Inference: convert last stage to results
+#         last = cascade_out[-1]
+#         start = 0
+#         results = []
+#         for i, props in enumerate(proposals_s):
+#             n = props.shape[0]
+#             if n == 0:
+#                 results.append(
+#                     {
+#                         "bboxes": torch.zeros((0, 4), device=feats[0].device),
+#                         "conf": torch.zeros((0,), device=feats[0].device),
+#                         "cls": torch.zeros((0,), dtype=torch.long, device=feats[0].device),
+#                     }
+#                 )
+#                 continue
+
+#             end = start + n
+#             logits_i = last["cls_logits"][start:end]
+#             deltas_i = last["bbox_deltas"][start:end]
+            
+#             probs = logits_i.softmax(dim=1)
+#             scores, labels = probs.max(dim=1)
+            
+#             idx = labels[:, None] * 4 + torch.tensor([0, 1, 2, 3], device=deltas_i.device)[None, :]
+#             deltas_sel = torch.gather(deltas_i, 1, idx)
+#             boxes = decode_boxes(props, deltas_sel, self.stage_std[-1])
+            
+#             boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, W - 1)
+#             boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, H - 1)
+            
+#             # Per-class NMS
+#             keep_all = []
+#             for c in range(self.nc):
+#                 m = (labels == c).nonzero(as_tuple=False).flatten()
+#                 if m.numel() == 0:
+#                     continue
+#                 keep_c = nms(boxes[m], scores[m], 0.5)
+#                 keep_all.append(m[keep_c])
+            
+#             keep = torch.cat(keep_all, dim=0) if keep_all else torch.zeros((0,), dtype=torch.long, device=feats[0].device)
+#             results.append({"bboxes": boxes[keep], "conf": scores[keep], "cls": labels[keep]})
+#             start = end
+
+#         return results

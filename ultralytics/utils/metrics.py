@@ -1117,54 +1117,69 @@ def ap_per_class(
 
         # Size-based AP (only at first IoU threshold for efficiency)
         if target_areas is not None and matched_gt_idx is not None:
-            # Get matched GT indices for this class's predictions
-            class_preds_idx = np.where(i_pred)[0]
-            class_matched_gt = matched_gt_idx[class_preds_idx]
+            # SMALL_THRESHOLD = 32 * 32
+            # MEDIUM_THRESHOLD = 96 * 96
             
-            # Separate by size category
-            for size_name, size_var, area_min, area_max in [
-                ('small', 'ap_small', 0, SMALL_THRESHOLD),
-                ('medium', 'ap_medium', SMALL_THRESHOLD, MEDIUM_THRESHOLD),
-                ('large', 'ap_large', MEDIUM_THRESHOLD, float('inf'))
-            ]:
-                # Find GT instances of this class in this size range
-                gt_indices_this_class = np.where(i_gt)[0]
-                class_areas = target_areas[gt_indices_this_class]
+            # Get indices for this class
+            gt_indices_this_class = np.where(i_gt)[0]
+            class_areas = target_areas[gt_indices_this_class]
+            
+            # Define size categories
+            size_categories = [
+                ('small', ap_small, 0, SMALL_THRESHOLD),
+                ('medium', ap_medium, SMALL_THRESHOLD, MEDIUM_THRESHOLD),
+                ('large', ap_large, MEDIUM_THRESHOLD, float('inf'))
+            ]
+            
+            for size_name, size_ap_array, area_min, area_max in size_categories:
+                # Find GT instances in this size range
                 size_mask = (class_areas >= area_min) & (class_areas < area_max)
                 size_gt_global_idx = gt_indices_this_class[size_mask]
                 n_size = len(size_gt_global_idx)
                 
                 if n_size == 0:
+                    # No ground truth objects in this size category for this class
                     continue
                 
-                # Filter predictions that matched to size-category GTs
-                size_pred_mask = np.isin(class_matched_gt, size_gt_global_idx)
+                # Get all predictions for this class
+                class_preds_idx = np.where(i_pred)[0]
+                class_matched_gt = matched_gt_idx[class_preds_idx]
                 
-                # Get TP/FP for size category
-                tp_size = tp[class_preds_idx[size_pred_mask], 0]  # First IoU threshold
-                conf_size = conf[class_preds_idx[size_pred_mask]]
+                # Determine which predictions are TP/FP for this size category:
+                # - TP: prediction matched a GT in this size category
+                # - FP: prediction either matched a GT outside this size category or didn't match any GT
                 
-                if len(tp_size) == 0:
-                    continue
+                # Create TP array: True if matched GT is in size category
+                tp_size = np.isin(class_matched_gt, size_gt_global_idx).astype(float)
                 
-                # Sort by confidence
+                # Get confidence scores for all predictions
+                conf_size = conf[class_preds_idx]
+                
+                # Sort by confidence (descending)
                 sort_idx = np.argsort(-conf_size)
-                tp_size = tp_size[sort_idx]
+                tp_size_sorted = tp_size[sort_idx]
+                conf_size_sorted = conf_size[sort_idx]
                 
-                # Compute precision-recall for this size
-                fpc_size = (1 - tp_size).cumsum()
-                tpc_size = tp_size.cumsum()
-                recall_size = tpc_size / (n_size + eps)
-                precision_size = tpc_size / (tpc_size + fpc_size + eps)
+                # Compute cumulative TP and FP
+                tp_cumsum = np.cumsum(tp_size_sorted)
+                fp_cumsum = np.cumsum(1 - tp_size_sorted)
                 
-                # Compute AP
+                # Compute precision and recall
+                # Recall: TP / total number of GTs in this size category
+                recall_size = tp_cumsum / n_size
+                
+                # Precision: TP / (TP + FP)
+                precision_size = tp_cumsum / (tp_cumsum + fp_cumsum)
+                
+                # Compute AP using the standard method
                 ap_size, _, _ = compute_ap(recall_size, precision_size)
                 
+                # Store in appropriate array
                 if size_name == 'small':
                     ap_small[ci] = ap_size
                 elif size_name == 'medium':
                     ap_medium[ci] = ap_size
-                else:
+                else:  # large
                     ap_large[ci] = ap_size
 
     prec_values = np.array(prec_values) if prec_values else np.zeros((1, 1000))

@@ -99,6 +99,7 @@ from .head import (
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
+    # CascadeRCNNHead
 )
 from .transformer import (
     AIFI,
@@ -112,6 +113,12 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
+from .mask2formerhead import (
+    Mask2FormerHead
+)
+
+from .rpn import AnchorGenerator, RPNHead
+from .roi_heads import MaskHead, TwoFCBBoxHead
 
 __all__ = (
     "Conv",
@@ -198,5 +205,7 @@ __all__ = (
     "GRN",
     "ConvNeXtV2Block",
     "Timm",
-    "DinoV3Backbone"
+    "DinoV3Backbone",
+    # "Mask2FormerHead",
+    # "CascadeRCNNHead"
 )

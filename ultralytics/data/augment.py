@@ -2070,9 +2070,9 @@ class Albumentations:
             return labels
 
         im = labels["img"]
-        if im.shape[2] != 3 and self.allow_multi_channel:  # Only apply Albumentation on 3-channel images
-            LOGGER.warning(colorstr("albumentations: ") + "Multi channel images detected and 'multi_ch_albu' is set to True. Set it to False to switch off transfomrs for multi channel.")
-        elif not self.allow_multi_channel:
+        # if im.shape[2] != 3 and self.allow_multi_channel:  # Only apply Albumentation on 3-channel images
+            # LOGGER.warning(colorstr("albumentations: ") + "Multi channel images detected and 'multi_ch_albu' is set to True. Set it to False to switch off transfomrs for multi channel.")
+        if not self.allow_multi_channel:
             return labels
         orig_dtype = im.dtype
 
