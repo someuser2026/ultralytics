@@ -950,6 +950,10 @@ def entrypoint(debug: str = "") -> None:
         from ultralytics import RTDETR
 
         model = RTDETR(model)  # no task argument
+    elif "cascade" in stem:
+        from ultralytics import CascadeRCNN
+
+        model = CascadeRCNN(model, task=task)
     elif "fastsam" in stem:
         from ultralytics import FastSAM
 

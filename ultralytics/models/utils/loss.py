@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from typing import Any
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ultralytics.utils.loss import FocalLoss, VarifocalLoss
+from ultralytics.utils.loss import FocalLoss, VarifocalLoss, v8DetectionLoss, v8SegmentationLoss
 from ultralytics.utils.metrics import bbox_iou
 
 from .ops import HungarianMatcher
@@ -476,3 +477,109 @@ class RTDETRDetectionLoss(DETRLoss):
             else:
                 dn_match_indices.append((torch.zeros([0], dtype=torch.long), torch.zeros([0], dtype=torch.long)))
         return dn_match_indices
+
+
+class _CascadeLossAdapter:
+    """Wrap a cascade stage to satisfy the v8 loss interface."""
+
+    def __init__(self, head: nn.Module, args) -> None:
+        self.model = [head]
+        if args is None:
+            args = SimpleNamespace(box=1.0, cls=1.0, dfl=1.0, mask=1.0, overlap_mask=True)
+        else:
+            for key, value in {"box": 1.0, "cls": 1.0, "dfl": 1.0, "mask": 1.0, "overlap_mask": True}.items():
+                if not hasattr(args, key):
+                    setattr(args, key, value)
+        self.args = args
+        self._head = head
+
+    def parameters(self, recurse: bool = True):
+        return self._head.parameters(recurse=recurse)
+
+
+class CascadeRCNNLoss(nn.Module):
+    """Aggregate YOLO detection losses across cascade stages."""
+
+    def __init__(self, model) -> None:
+        super().__init__()
+        from ultralytics.nn.modules.cascade import CascadeRCNNHead
+
+        head = model.model[-1]
+        if not isinstance(head, CascadeRCNNHead):
+            raise TypeError("CascadeRCNNLoss requires CascadeRCNNHead as the terminal module.")
+
+        args = getattr(model, "args", None)
+        self.head = head
+        self.loss_fns = [v8DetectionLoss(_CascadeLossAdapter(stage_head, args)) for stage_head in head.stage_heads]
+        device = next(head.stage_heads[0].parameters()).device if head.stage_heads else torch.device("cpu")
+        self.register_buffer(
+            "stage_weights",
+            torch.tensor(head.stage_weights, dtype=torch.float32, device=device),
+            persistent=False,
+        )
+
+    def _extract_stage_outputs(self, preds):
+        if hasattr(preds, "stage_outputs"):
+            return preds.stage_outputs
+        cached = getattr(self.head, "_last_stage_outputs", None)
+        if cached is None:
+            raise RuntimeError("Cascade stage outputs unavailable for loss computation.")
+        return cached
+
+    def forward(self, preds, batch):
+        stage_outputs = self._extract_stage_outputs(preds)
+        if len(stage_outputs) != len(self.loss_fns):
+            raise ValueError("Cascade stage count mismatch between outputs and loss wrappers.")
+
+        weights = self.stage_weights.to(self.stage_weights.device)
+        total_loss = None
+        total_items = None
+        for weight, loss_fn, stage_pred in zip(weights, self.loss_fns, stage_outputs):
+            loss, items = loss_fn(stage_pred, batch)
+            total_loss = loss * weight if total_loss is None else total_loss + loss * weight
+            total_items = items * weight if total_items is None else total_items + items * weight
+        return total_loss, total_items
+
+
+class CascadeMaskRCNNLoss(nn.Module):
+    """Aggregate YOLO segmentation losses across cascade stages."""
+
+    def __init__(self, model) -> None:
+        super().__init__()
+        from ultralytics.nn.modules.cascade import CascadeMaskRCNNHead
+
+        head = model.model[-1]
+        if not isinstance(head, CascadeMaskRCNNHead):
+            raise TypeError("CascadeMaskRCNNLoss requires CascadeMaskRCNNHead as the terminal module.")
+
+        args = getattr(model, "args", None)
+        self.head = head
+        self.loss_fns = [v8SegmentationLoss(_CascadeLossAdapter(stage_head, args)) for stage_head in head.stage_heads]
+        device = next(head.stage_heads[0].parameters()).device if head.stage_heads else torch.device("cpu")
+        self.register_buffer(
+            "stage_weights",
+            torch.tensor(head.stage_weights, dtype=torch.float32, device=device),
+            persistent=False,
+        )
+
+    def _extract_stage_outputs(self, preds):
+        if hasattr(preds, "stage_outputs"):
+            return preds.stage_outputs
+        cached = getattr(self.head, "_last_stage_outputs", None)
+        if cached is None:
+            raise RuntimeError("Cascade stage outputs unavailable for loss computation.")
+        return cached
+
+    def forward(self, preds, batch):
+        stage_outputs = self._extract_stage_outputs(preds)
+        if len(stage_outputs) != len(self.loss_fns):
+            raise ValueError("Cascade stage count mismatch between outputs and loss wrappers.")
+
+        weights = self.stage_weights.to(self.stage_weights.device)
+        total_loss = None
+        total_items = None
+        for weight, loss_fn, stage_pred in zip(weights, self.loss_fns, stage_outputs):
+            loss, items = loss_fn(stage_pred, batch)
+            total_loss = loss * weight if total_loss is None else total_loss + loss * weight
+            total_items = items * weight if total_items is None else total_items + items * weight
+        return total_loss, total_items

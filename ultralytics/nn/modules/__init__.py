@@ -99,8 +99,8 @@ from .head import (
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
-    # CascadeRCNNHead
 )
+from .cascade import CascadeMaskRCNNHead, CascadeRCNNHead
 from .transformer import (
     AIFI,
     MLP,
@@ -178,6 +178,8 @@ __all__ = (
     "YOLOESegment",
     "v10Detect",
     "LRPCHead",
+    "CascadeRCNNHead",
+    "CascadeMaskRCNNHead",
     "ImagePoolingAttn",
     "MaxSigmoidAttnBlock",
     "ContrastiveHead",

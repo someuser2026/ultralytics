@@ -5,7 +5,8 @@ from .tasks import (
     ClassificationModel,
     DetectionModel,
     SegmentationModel,
-    # CascadeRCNNModel,
+    CascadeMaskRCNNModel,
+    CascadeRCNNDetectionModel,
     guess_model_scale,
     guess_model_task,
     load_checkpoint,
@@ -23,7 +24,8 @@ __all__ = (
     "torch_safe_load",
     "DetectionModel",
     "SegmentationModel",
+    "CascadeRCNNDetectionModel",
+    "CascadeMaskRCNNModel",
     "ClassificationModel",
     "BaseModel",
-    # "CascadeRCNNModel"
 )

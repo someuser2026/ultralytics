@@ -76,11 +76,12 @@ from ultralytics.nn.modules import (
     ConvNeXtStem,
     ConvNeXtDownsample,
     Timm,
+    CascadeMaskRCNNHead,
+    CascadeRCNNHead,
     # DinoV3Backbone
     MaxViTBlock,
     DeformableConv2d,
     # Mask2FormerHead,
-    # CascadeRCNNHead,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -430,7 +431,8 @@ class DetectionModel(BaseModel):
 
         # Build strides
         m = self.model[-1]  # Detect()
-        if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
+        cascade_heads = (CascadeRCNNHead, CascadeMaskRCNNHead)
+        if isinstance(m, (Detect, *cascade_heads)):
             s = deepcopy(self.yaml["stride"])  # 2x min stride
             # s = self.yaml.pop("stride")
             # s = 256
@@ -440,11 +442,25 @@ class DetectionModel(BaseModel):
                 """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
                 if self.end2end:
                     return self.forward(x)["one2many"]
-                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
+                if isinstance(m, (Segment, YOLOESegment, Pose, OBB, CascadeMaskRCNNHead)):
+                    out = self.forward(x)
+                    return out[0] if isinstance(out, (tuple, list)) else out
+                return self.forward(x)
 
             self.model.eval()  # Avoid changing batch statistics until training begins
             m.training = True  # Setting it to True to properly return strides
-            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
+            outputs = _forward(torch.zeros(1, ch, s, s))
+            if isinstance(outputs, (tuple, list)):
+                flat_outputs = []
+                for item in outputs:
+                    if isinstance(item, (list, tuple)):
+                        flat_outputs.extend(item)
+                    else:
+                        flat_outputs.append(item)
+                outputs = flat_outputs
+            else:
+                outputs = [outputs]
+            m.stride = torch.tensor([s / x.shape[-2] for x in outputs])  # forward
             # print("-"*50)
             # print("Inside task.py 439")
             # print("m.stride:", m.stride)
@@ -1094,6 +1110,30 @@ class RTDETRDetectionModel(DetectionModel):
         head = self.model[-1]
         x = head([y[j] for j in head.f], batch)  # head inference
         return x
+
+
+class CascadeRCNNDetectionModel(DetectionModel):
+    """Cascade R-CNN detection model built on top of YOLO detection backbones."""
+
+    def __init__(self, cfg="cascade-rcnn.yaml", ch=3, nc=None, verbose=True):
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+
+    def init_criterion(self):
+        from ultralytics.models.utils.loss import CascadeRCNNLoss
+
+        return CascadeRCNNLoss(self)
+
+
+class CascadeMaskRCNNModel(SegmentationModel):
+    """Cascade Mask R-CNN model that extends YOLO segmentation utilities."""
+
+    def __init__(self, cfg="cascade-mask-rcnn.yaml", ch=3, nc=None, verbose=True):
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+
+    def init_criterion(self):
+        from ultralytics.models.utils.loss import CascadeMaskRCNNLoss
+
+        return CascadeMaskRCNNLoss(self)
 
 
 class WorldModel(DetectionModel):
@@ -1934,12 +1974,24 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}#, Mask2FormerHead}
+            {
+                Detect,
+                WorldDetect,
+                YOLOEDetect,
+                Segment,
+                YOLOESegment,
+                Pose,
+                OBB,
+                ImagePoolingAttn,
+                v10Detect,
+                CascadeRCNNHead,
+                CascadeMaskRCNNHead,
+            }#, Mask2FormerHead}
         ):
             # print("f:", f)
             # print("ch:", ch)
             args.append([ch[x] for x in f])
-            if m is Segment or m is YOLOESegment:
+            if m in {Segment, YOLOESegment, CascadeMaskRCNNHead}:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
                 m.legacy = legacy

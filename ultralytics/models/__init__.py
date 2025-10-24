@@ -5,6 +5,6 @@ from .nas import NAS
 from .rtdetr import RTDETR
 from .sam import SAM
 from .yolo import YOLO, YOLOE, YOLOWorld
-# from .casrcnn import CascadeRCNN
+from .cascade_rcnn import CascadeRCNN
 
-__all__ = "YOLO", "RTDETR", "SAM", "FastSAM", "NAS", "YOLOWorld", "YOLOE"#, "CascadeRCNN"  # allow simpler import
+__all__ = "YOLO", "RTDETR", "SAM", "FastSAM", "NAS", "YOLOWorld", "YOLOE", "CascadeRCNN"
