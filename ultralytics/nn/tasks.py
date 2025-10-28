@@ -12,8 +12,6 @@ import torch.nn as nn
 from torchvision.ops import box_iou
 import torch.nn.functional as F
 
-from ultralytics.nn.modules.roi_heads import encode_boxes
-
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
     AIFI,
@@ -79,6 +77,16 @@ from ultralytics.nn.modules import (
     # DinoV3Backbone
     MaxViTBlock,
     DeformableConv2d,
+    BaseNeck,
+    FPN,
+    PAFPN,
+    PANet,
+    AugFPN,
+    LibraFPN,
+    RecursiveFPN,
+    RepFPN,
+    ScaleEqualizingFPN,
+    BiFPN,
     # Mask2FormerHead,
     # CascadeRCNNHead,
 )
@@ -423,7 +431,7 @@ class DetectionModel(BaseModel):
         if nc and nc != self.yaml["nc"]:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml["nc"] = nc  # override YAML value
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
+        self.model, self.save, self.backbone_layers, self.head_layers = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
         self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
         self.inplace = self.yaml.get("inplace", True)
         self.end2end = getattr(self.model[-1], "end2end", False)
@@ -932,7 +940,7 @@ class ClassificationModel(BaseModel):
             self.yaml["nc"] = nc  # override YAML value
         elif not nc and not self.yaml.get("nc", None):
             raise ValueError("nc not specified. Must specify nc in model.yaml or function arguments.")
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
+        self.model, self.save, self.backbone_layers, self.head_layers = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
         self.stride = torch.Tensor([1])  # no stride constraints
         self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
         self.info()
@@ -1884,6 +1892,11 @@ def parse_model(d, ch, verbose=True):
             A2C2f,
         }
     )
+    necks = frozenset({
+        FPN, PAFPN, PANet, AugFPN, BiFPN, LibraFPN, RepFPN, ScaleEqualizingFPN, RecursiveFPN,
+    })
+    layers = []
+    save = []
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
         m = (
             getattr(torch.nn, m[3:])
@@ -1947,6 +1960,16 @@ def parse_model(d, ch, verbose=True):
             args.insert(1, [ch[x] for x in f])
         # elif m in frozenset({CascadeRCNNHead}):
         #     args = [[ch[x] for x in f], *args]
+        elif m in necks:
+            # print("f:", f)
+            # print("ch:", ch)
+            c1 = [ch[x] for x in f]
+            c2 = [args[0] for _ in f]
+            args = [c1, *args[0:]]
+            # print("c1:", c1)
+            # print("c2:", c2)
+            # print("args:", args)
+            # print("len args:", len(args))
         elif m in frozenset({CBLinear, DeformableConv2d}):
             c2 = args[0]
             c1 = ch[f]
@@ -2036,11 +2059,15 @@ def parse_model(d, ch, verbose=True):
         if i == 0:
             ch = []
         ch.append(c2)
+
+        backbone_idxs = len(d["backbone"])
+        backbone_layers = layers[:backbone_idxs]
+        head_layers = layers[backbone_idxs:]
         # print("-"*30, flush=True)
         # print(f"[L{i:02d}] f={f} → c1={ch[f] if isinstance(f, int) and f >= 0 else 'list/concat'} " f"→ c2={c2} type={t}", flush=True)
         # print(ch, flush=True)
         # print("-"*30)
-    return torch.nn.Sequential(*layers), sorted(save)
+    return torch.nn.Sequential(*layers), sorted(save), backbone_layers, head_layers
 
 
 def yaml_model_load(path):

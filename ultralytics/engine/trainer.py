@@ -271,12 +271,23 @@ class BaseTrainer:
             if isinstance(self.args.freeze, int)
             else []
         )
+
+        # Unfreeze layers
+        unfreeze_list = (
+            self.args.unfreeze
+            if isinstance(self.args.unfreeze, list)
+            else range(self.args.unfreeze)
+            if isinstance(self.args.unfreeze, int)
+            else []
+        )
         always_freeze_names = [".dfl"]  # always freeze these layers
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
+        unfreeze_layer_names = [f"model.{x}." for x in unfreeze_list]
         self.freeze_layer_names = freeze_layer_names
+        self.unfreeze_layer_names = unfreeze_layer_names
         for k, v in self.model.named_parameters():
             # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
-            if any(x in k for x in freeze_layer_names):
+            if any(x in k for x in freeze_layer_names) and not any(x for x in k for x in unfreeze_layer_names):
                 LOGGER.info(f"Freezing layer '{k}'")
                 v.requires_grad = False
             elif not v.requires_grad and v.dtype.is_floating_point:  # only floating point Tensor can require gradients

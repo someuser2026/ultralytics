@@ -1,203 +1,272 @@
-# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+"""
+Region Proposal Network for Cascade R-CNN
+Path: ultralytics/nn/modules/rpn.py
+"""
 
 from __future__ import annotations
-
-import math
-from dataclasses import dataclass
 from typing import List, Tuple
-
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import Tensor, nn
 from torchvision.ops import nms
 
 
-@dataclass
-class RPNConfig:
-    """Configuration for Region Proposal Network."""
-    anchor_sizes: Tuple[int, ...] = (32, 64, 128, 256, 512)
-    ratios: Tuple[float, ...] = (0.5, 1.0, 2.0)
-    pre_nms_topk: int = 1000
-    post_nms_topk: int = 1000
-    nms_thresh: float = 0.7
-    min_box_size: float = 4.0
-    fg_iou: float = 0.7
-    bg_iou: float = 0.3
-    samples_per_img: int = 256
-    fg_fraction: float = 0.5
-
-
 class AnchorGenerator(nn.Module):
-    """Generate anchors per FPN level."""
+    """Generate anchors on multiple FPN levels."""
+    
+    def __init__(
+        self,
+        strides: Tuple[int, ...] = (4, 8, 16, 32),
+        scales: Tuple[int, ...] = (32, 64, 128, 256),
+        ratios: Tuple[float, ...] = (0.5, 1.0, 2.0)
+    ):
+        super().__init__()
+        self.strides = strides
+        self.scales = scales
+        self.ratios = ratios
+        self.num_anchors = len(ratios)
+        
+        # Cache for anchors
+        self._anchor_cache = {}
 
-    def __init__(self, sizes: Tuple[int, ...], ratios: Tuple[float, ...], strides: List[int]):
+    def _generate_base_anchors(self, scale: float, ratios: List[float], device) -> Tensor:
+        """Generate base anchors for a single scale and multiple ratios."""
+        ratios = torch.tensor(ratios, device=device)
+        
+        # Compute anchor dimensions
+        ws = scale * torch.sqrt(1.0 / ratios)
+        hs = scale * torch.sqrt(ratios)
+        
+        # Create anchors centered at (0, 0)
+        anchors = torch.stack([
+            -0.5 * ws,
+            -0.5 * hs,
+            0.5 * ws,
+            0.5 * hs
+        ], dim=1)
+        
+        return anchors
+
+    @torch.no_grad()
+    def grid_anchors(
+        self,
+        feat_shapes: List[Tuple[int, int]],
+        device: torch.device
+    ) -> List[Tensor]:
         """
-        Initialize anchor generator.
+        Generate anchors on grid for all FPN levels.
         
         Args:
-            sizes: Anchor sizes (one per FPN level)
-            ratios: Aspect ratios for anchors
-            strides: Feature map strides [8, 16, 32, 64, 128]
+            feat_shapes: List of (H, W) for each feature level
+            device: device to create anchors on
+        
+        Returns:
+            anchors_per_level: List of anchor tensors, each (num_anchors, 4)
         """
-        super().__init__()
-        self.sizes = sizes
-        self.ratios = ratios
-        self.strides = strides
-
-    @torch.no_grad()
-    def grid_anchors(self, feat: torch.Tensor, size: int, stride: int, device) -> torch.Tensor:
-        """Generate anchors for one feature level."""
-        h, w = feat.shape[-2:]
-        shifts_x = (torch.arange(w, device=device) + 0.5) * stride
-        shifts_y = (torch.arange(h, device=device) + 0.5) * stride
-        shift_y, shift_x = torch.meshgrid(shifts_y, shifts_x, indexing="ij")
+        anchors_per_level = []
         
-        # Base anchors for all ratios
-        base = []
-        for r in self.ratios:
-            ar = math.sqrt(r)
-            ws = size * ar
-            hs = size / ar
-            base.append(torch.tensor([[-ws / 2, -hs / 2, ws / 2, hs / 2]], device=device))
-        base = torch.cat(base, dim=0)  # [R, 4]
+        for (H, W), stride, scale in zip(feat_shapes, self.strides, self.scales):
+            # Use cache if available
+            cache_key = (H, W, stride, scale, device)
+            if cache_key in self._anchor_cache:
+                anchors_per_level.append(self._anchor_cache[cache_key])
+                continue
+            
+            # Generate base anchors
+            base_anchors = self._generate_base_anchors(scale, self.ratios, device)
+            num_base = base_anchors.shape[0]
+            
+            # Create grid
+            shifts_x = torch.arange(0, W, device=device, dtype=torch.float32) * stride
+            shifts_y = torch.arange(0, H, device=device, dtype=torch.float32) * stride
+            shift_y, shift_x = torch.meshgrid(shifts_y, shifts_x, indexing='ij')
+            
+            shifts = torch.stack([
+                shift_x.reshape(-1),
+                shift_y.reshape(-1),
+                shift_x.reshape(-1),
+                shift_y.reshape(-1)
+            ], dim=1)
+            
+            # Broadcast anchors to all grid locations
+            anchors = base_anchors.view(1, num_base, 4) + shifts.view(-1, 1, 4)
+            anchors = anchors.reshape(-1, 4)
+            
+            # Cache and append
+            self._anchor_cache[cache_key] = anchors
+            anchors_per_level.append(anchors)
         
-        # Tile to grid
-        shifts = torch.stack((shift_x, shift_y, shift_x, shift_y), dim=-1)  # [H, W, 4]
-        anchors = base[None, None, :, :] + shifts[:, :, None, :]  # [H, W, R, 4]
-        return anchors.reshape(-1, 4)
-
-    @torch.no_grad()
-    def forward(self, feats: List[torch.Tensor]) -> List[torch.Tensor]:
-        """Generate anchors for all FPN levels."""
-        anchors = []
-        device = feats[0].device
-        for lvl, feat in enumerate(feats):
-            size = self.sizes[min(lvl, len(self.sizes) - 1)]
-            stride = self.strides[min(lvl, len(self.strides) - 1)]
-            a = self.grid_anchors(feat, size=size, stride=stride, device=device)
-            anchors.append(a)  # [Hi*Wi*R, 4] absolute xyxy
-        return anchors
+        return anchors_per_level
 
 
 class RPNHead(nn.Module):
-    """RPN head with 3x3 conv producing objectness and bbox deltas."""
-
-    def __init__(self, in_channels: int, num_anchors: int):
-        """
-        Initialize RPN head.
-        
-        Args:
-            in_channels: Input feature channels
-            num_anchors: Number of anchors per location
-        """
+    """RPN head with objectness and bbox regression."""
+    
+    def __init__(self, in_channels: int, num_anchors: int = 3):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, in_channels, 3, padding=1)
-        self.obj = nn.Conv2d(in_channels, num_anchors, 1)
-        self.reg = nn.Conv2d(in_channels, num_anchors * 4, 1)
+        self.obj_logits = nn.Conv2d(in_channels, num_anchors, 1)
+        self.bbox_deltas = nn.Conv2d(in_channels, num_anchors * 4, 1)
         
         # Initialize weights
-        for m in [self.conv, self.obj, self.reg]:
-            nn.init.normal_(m.weight, std=0.01)
-            nn.init.constant_(m.bias, 0)
+        for layer in [self.conv, self.obj_logits, self.bbox_deltas]:
+            nn.init.normal_(layer.weight, std=0.01)
+            if layer.bias is not None:
+                nn.init.constant_(layer.bias, 0)
 
-    def forward(self, feats: List[torch.Tensor]) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """Forward pass returning objectness logits and bbox deltas."""
-        logits, bbox_deltas = [], []
-        for x in feats:
-            t = F.relu(self.conv(x))
-            logits.append(self.obj(t))
-            bbox_deltas.append(self.reg(t))
-        return logits, bbox_deltas
+    def forward(self, feats: List[Tensor]) -> Tuple[List[Tensor], List[Tensor]]:
+        """
+        Forward pass through RPN head.
+        
+        Args:
+            feats: List of feature maps [P2, P3, P4, P5]
+        
+        Returns:
+            obj_logits: List of objectness logits per level
+            bbox_deltas: List of bbox regression deltas per level
+        """
+        obj_logits_list = []
+        bbox_deltas_list = []
+        
+        for feat in feats:
+            t = torch.relu(self.conv(feat))
+            obj_logits_list.append(self.obj_logits(t))
+            bbox_deltas_list.append(self.bbox_deltas(t))
+        
+        return obj_logits_list, bbox_deltas_list
 
 
-def _apply_deltas_to_anchors(deltas: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
+@torch.no_grad()
+def generate_proposals(
+    anchors_per_level: List[Tensor],
+    obj_logits_per_level: List[Tensor],
+    bbox_deltas_per_level: List[Tensor],
+    image_shape: Tuple[int, int],
+    pre_nms_topk: int = 2000,
+    post_nms_topk: int = 1000,
+    nms_iou: float = 0.7,
+    min_box_size: float = 0.0
+) -> List[Tensor]:
     """
-    Decode bbox deltas relative to anchors.
+    Generate proposals from RPN outputs.
     
     Args:
-        deltas: [N, 4] (tx, ty, tw, th)
-        anchors: [N, 4] xyxy format
+        anchors_per_level: List of anchor tensors per FPN level
+        obj_logits_per_level: List of objectness logits per level
+        bbox_deltas_per_level: List of bbox deltas per level
+        image_shape: (H, W) of input image
+        pre_nms_topk: number of top proposals before NMS
+        post_nms_topk: number of top proposals after NMS
+        nms_iou: IoU threshold for NMS
+        min_box_size: minimum box size to keep
     
     Returns:
-        Decoded boxes [N, 4] in xyxy format
+        proposals_per_image: List of proposal tensors, one per image in batch
     """
-    wa = anchors[:, 2] - anchors[:, 0]
-    ha = anchors[:, 3] - anchors[:, 1]
+    batch_size = obj_logits_per_level[0].shape[0]
+    H_img, W_img = image_shape
+    device = obj_logits_per_level[0].device
+    
+    proposals_per_image = []
+    
+    for batch_idx in range(batch_size):
+        all_boxes = []
+        all_scores = []
+        
+        for anchors, obj_logits, bbox_deltas in zip(
+            anchors_per_level,
+            obj_logits_per_level,
+            bbox_deltas_per_level
+        ):
+            # Get batch element
+            obj = obj_logits[batch_idx]  # (A, H, W)
+            deltas = bbox_deltas[batch_idx]  # (4*A, H, W)
+            
+            A = obj.shape[0]
+            H, W = obj.shape[1], obj.shape[2]
+            
+            # Reshape to (H*W*A,)
+            obj_flat = obj.permute(1, 2, 0).reshape(-1).sigmoid()
+            
+            # Reshape to (H*W*A, 4)
+            deltas_flat = deltas.permute(1, 2, 0).reshape(-1, 4)
+            
+            # Select top-k before NMS
+            num_topk = min(pre_nms_topk, obj_flat.numel())
+            topk_idx = torch.topk(obj_flat, k=num_topk).indices
+            
+            scores = obj_flat[topk_idx]
+            deltas_topk = deltas_flat[topk_idx]
+            anchors_topk = anchors[topk_idx]
+            
+            # Decode boxes
+            boxes = decode_boxes(anchors_topk, deltas_topk)
+            
+            # Clip to image
+            boxes[:, 0::2].clamp_(0, W_img)
+            boxes[:, 1::2].clamp_(0, H_img)
+            
+            # Filter small boxes
+            if min_box_size > 0:
+                ws = boxes[:, 2] - boxes[:, 0]
+                hs = boxes[:, 3] - boxes[:, 1]
+                keep = (ws >= min_box_size) & (hs >= min_box_size)
+                boxes = boxes[keep]
+                scores = scores[keep]
+            
+            all_boxes.append(boxes)
+            all_scores.append(scores)
+        
+        if not all_boxes:
+            proposals_per_image.append(torch.zeros((0, 4), device=device))
+            continue
+        
+        # Concatenate all levels
+        all_boxes = torch.cat(all_boxes, dim=0)
+        all_scores = torch.cat(all_scores, dim=0)
+        
+        if all_boxes.numel() == 0:
+            proposals_per_image.append(torch.zeros((0, 4), device=device))
+            continue
+        
+        # Apply NMS
+        keep = nms(all_boxes, all_scores, nms_iou)
+        keep = keep[:post_nms_topk]
+        
+        proposals_per_image.append(all_boxes[keep])
+    
+    return proposals_per_image
+
+
+def decode_boxes(anchors: Tensor, deltas: Tensor) -> Tensor:
+    """
+    Decode bbox deltas to boxes.
+    
+    Args:
+        anchors: (N, 4) anchor boxes in xyxy format
+        deltas: (N, 4) regression deltas
+    
+    Returns:
+        boxes: (N, 4) predicted boxes in xyxy format
+    """
+    wa = (anchors[:, 2] - anchors[:, 0]).clamp(min=1e-6)
+    ha = (anchors[:, 3] - anchors[:, 1]).clamp(min=1e-6)
     xa = anchors[:, 0] + 0.5 * wa
     ya = anchors[:, 1] + 0.5 * ha
-
-    dx, dy, dw, dh = deltas.unbind(dim=1)
-    # Prevent blow-ups
-    dw = torch.clamp(dw, max=4.135)  # exp(4.135) ≈ 62
-    dh = torch.clamp(dh, max=4.135)
+    
+    # Clamp deltas for stability
+    dx = deltas[:, 0].clamp(min=-1000, max=1000)
+    dy = deltas[:, 1].clamp(min=-1000, max=1000)
+    dw = deltas[:, 2].clamp(min=-1000, max=1000)
+    dh = deltas[:, 3].clamp(min=-1000, max=1000)
     
     x = dx * wa + xa
     y = dy * ha + ya
     w = wa * torch.exp(dw)
     h = ha * torch.exp(dh)
     
-    return torch.stack((x - 0.5 * w, y - 0.5 * h, x + 0.5 * w, y + 0.5 * h), dim=1)
-
-
-@torch.no_grad()
-def rpn_inference_single_image(
-    logits_per_level: List[torch.Tensor],
-    deltas_per_level: List[torch.Tensor],
-    anchors_per_level: List[torch.Tensor],
-    image_size: Tuple[int, int],
-    cfg: RPNConfig,
-) -> torch.Tensor:
-    """
-    Generate proposals for one image.
+    x1 = x - 0.5 * w
+    y1 = y - 0.5 * h
+    x2 = x + 0.5 * w
+    y2 = y + 0.5 * h
     
-    Args:
-        logits_per_level: List of objectness logits per level
-        deltas_per_level: List of bbox deltas per level
-        anchors_per_level: List of anchors per level
-        image_size: (H, W) of image
-        cfg: RPN configuration
-    
-    Returns:
-        Proposals [N, 5] with [x1, y1, x2, y2, score]
-    """
-    device = logits_per_level[0].device
-    H, W = image_size
-    props = []
-    
-    for cls, reg, anchors in zip(logits_per_level, deltas_per_level, anchors_per_level):
-        scores = cls.sigmoid().flatten()
-        deltas = reg.permute(1, 2, 0).reshape(-1, 4)
-
-        # Top-k before NMS
-        num_pre = min(cfg.pre_nms_topk, scores.numel())
-        topk = scores.topk(num_pre).indices
-        scores = scores[topk]
-        anchors = anchors[topk]
-        deltas = deltas[topk]
-
-        # Decode boxes
-        boxes = _apply_deltas_to_anchors(deltas, anchors)
-        
-        # Clip to image
-        boxes[:, 0::2] = boxes[:, 0::2].clamp(min=0, max=W - 1)
-        boxes[:, 1::2] = boxes[:, 1::2].clamp(min=0, max=H - 1)
-        
-        # Filter by size
-        ws = boxes[:, 2] - boxes[:, 0]
-        hs = boxes[:, 3] - boxes[:, 1]
-        keep = (ws >= cfg.min_box_size) & (hs >= cfg.min_box_size)
-        boxes, scores = boxes[keep], scores[keep]
-        
-        # Per-level NMS
-        keep_idx = nms(boxes, scores, cfg.nms_thresh)
-        keep_idx = keep_idx[: cfg.post_nms_topk]
-        props.append(torch.cat([boxes[keep_idx], scores[keep_idx, None]], dim=1))
-    
-    if len(props) == 0:
-        return torch.zeros((0, 5), device=device)
-    
-    props = torch.cat(props, dim=0)
-    
-    # Cross-level NMS
-    keep = nms(props[:, :4], props[:, 4], cfg.nms_thresh)
-    return props[keep]
+    return torch.stack([x1, y1, x2, y2], dim=1)

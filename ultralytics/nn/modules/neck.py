@@ -1,0 +1,1374 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+"""
+neck.py — Modular FPN family for Ultralytics
+
+Scope covered with minimal duplication and clean extension points:
+
+E1: FPN Variants
+    - FPN (standard top-down with lateral)
+    - PANet (bottom-up augmentation)
+    - PAFPN (YOLOv4-style: concat-heavy, top-down + bottom-up)
+    - BiFPN (weighted fusion, fast normalized fusion; iterations configurable)
+    - AugFPN (ratio-invariant adaptive pooling + residual augmentation)  [approximation]
+    - LibraFPN (balanced feature pyramid via global balanced fusion)
+    - RepFPN (reparam convs in lateral & smoothing)
+    - RecursiveFPN (stacked FPN refinement passes)
+    - ScaleEqualizingFPN [approximation — scale alignment via cross-level pooling average]
+
+E2: Attention Modules in Neck (optional plugin blocks)
+    - SE, ECA, CBAM (full / channel-only / spatial-only), CoordinateAttention, SimAM (param-free)
+      Use via `attn_cfg` with keys: {'per_level': <name or None>, 'after_fuse': <name or None>}.
+
+E3: Convolutional Enhancements (pluggable per-conv policy)
+    - Depthwise/grouped/dilated/atrous selections (ConvPolicy)
+    - DeformableConv2d (toggle via conv_cfg.dcn=True)
+    - Simple multi-rate dilation via conv_cfg.dilation
+
+E5: Feature Normalization / Aggregation
+    - Optional per-level channel normalization to `out_channels` via 1×1 conv:
+        `normalize_channels=True`
+    - Fusion modes: 'add' | 'concat' | 'weighted' (BiFPN-style)
+      Concat path ends with 1×1 to out_channels.
+    - Separate dropout for top-down and bottom-up paths: `drop_td`, `drop_bu`
+
+IMPORTANT:
+- No P1/P6 (or extra levels) are created internally. Necks operate **only** on the input list.
+- Inputs/outputs are lists of feature maps; lengths and resolutions are respected as-is.
+"""
+
+from __future__ import annotations
+from typing import List, Optional, Sequence, Union, Dict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Import Ultralytics blocks already present in your repo
+from .conv import Conv, DWConv, DeformableConv2d, CBAM, RepConv, SE
+# from .common import RepConv, SE
+
+
+# -----------------------------
+# Utilities
+# -----------------------------
+
+def _make_dropout(p: float | None) -> nn.Module:
+    return nn.Dropout2d(p) if p and p > 0.0 else nn.Identity()
+
+
+# ================================ CONVOLUTIONAL POLICY ================================
+
+class ConvPolicy(nn.Module):
+    """
+    Composable convolution policy for lateral/smoothing/fusion operations.
+    Supports standard Conv, grouped/depthwise Conv, dilated Conv, and Deformable Conv (E19b).
+    
+    This abstraction allows swapping convolution types via conv_cfg dict:
+        - conv_cfg={'groups': 4} -> Grouped convolution (E21a)
+        - conv_cfg={'dilation': 2} -> Dilated/atrous convolution (E20a)
+        - conv_cfg={'dcn': True} -> Deformable convolution v2 (E19b)
+    
+    Args:
+        c1, c2: Input/output channels
+        k, s: Kernel size and stride
+        groups: Number of groups for grouped convolution (c2 for depthwise when c1==c2)
+        dilation: Dilation rate for atrous convolution
+        dcn: If True, use DeformableConv2d instead of standard Conv
+        act: Activation function (True -> SiLU, False -> None, or pass nn.Module)
+    
+    Example:
+        >>> # Standard 3x3 conv
+        >>> conv = ConvPolicy(256, 256, k=3, s=1)
+        >>> # Deformable conv with dilation
+        >>> conv_dcn = ConvPolicy(256, 256, k=3, s=1, dcn=True, dilation=2)
+    """
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        k: int = 3,
+        s: int = 1,
+        groups: int = 1,
+        dilation: int = 1,
+        dcn: bool = False,
+        act: Union[bool, nn.Module] = True,
+    ):
+        super().__init__()
+        if dcn:
+            # Deformable convolution path: DCN + BN + activation
+            act_mod = nn.SiLU(inplace=True) if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+            self.m = nn.Sequential(
+                DeformableConv2d(c1, c2, k, s, p=dilation, d=dilation, bias=False),
+                nn.BatchNorm2d(c2),
+                act_mod,
+            )
+        else:
+            # Standard convolution path (supports groups and dilation)
+            self.m = Conv(c1, c2, k=k, s=s, p=dilation, g=groups, d=dilation, act=act)
+
+    def forward(self, x):
+        return self.m(x)
+
+
+def lateral_1x1(c1: int, c2: int) -> nn.Module:
+    """
+    Create 1x1 convolution for lateral connections in FPN.
+    Used to project backbone features to neck's out_channels.
+    
+    Args:
+        c1: Input channels (from backbone)
+        c2: Output channels (neck out_channels)
+    
+    Returns:
+        Conv module with 1x1 kernel
+    """
+    return Conv(c1, c2, k=1, s=1)
+
+
+def smooth_3x3(c: int, conv_cfg: dict, dcn: bool) -> nn.Module:
+    """
+    Create 3x3 smoothing convolution applied after feature fusion.
+    Respects conv_cfg for grouped/dilated/deformable variants.
+    
+    Args:
+        c: Number of channels (in == out)
+        conv_cfg: Dict with optional keys: 'groups', 'dilation', 'dcn'
+    
+    Returns:
+        ConvPolicy module configured with conv_cfg settings
+    """
+    return ConvPolicy(c, c, k=3, s=1,
+                      groups=conv_cfg.get('groups', 1),
+                      dilation=conv_cfg.get('dilation', 1),
+                      dcn=dcn,
+                      act=True)
+
+
+def make_align_layers(in_channels: Sequence[int], out_channels: int, normalize: bool) -> nn.ModuleList:
+    """
+    Build channel alignment layers for input features.
+    
+    If normalize=True: Creates 1x1 convs to project mismatched channels to out_channels
+    If normalize=False: Uses nn.Identity (no projection, assumes channels already match)
+    
+    Args:
+        in_channels: List of input channel counts [C_P2, C_P3, C_P4, ...]
+        out_channels: Target channel count for neck
+        normalize: Whether to normalize/align channels
+    
+    Returns:
+        ModuleList of Conv or nn.Identity layers, one per input level
+    
+    Example:
+        >>> # Align [256, 512, 1024] -> 256
+        >>> align = make_align_layers([256, 512, 1024], 256, normalize=True)
+        >>> # Results in [nn.Identity(), Conv(512->256), Conv(1024->256)]
+    """
+    layers = []
+    for c in in_channels:
+        layers.append(lateral_1x1(c, out_channels) if normalize and c != out_channels else nn.Identity())
+    return nn.ModuleList(layers)
+
+
+# ================================ ATTENTION MODULES (E2) ================================
+
+class ECABlock(nn.Module):
+    """
+    Efficient Channel Attention (E13b).
+    
+    Lightweight channel attention via 1D convolution over channel descriptors.
+    More efficient than SE by avoiding dimensionality reduction.
+    
+    Reference: ECA-Net (CVPR 2020)
+    
+    Args:
+        channels: Number of input channels
+        k_size: Kernel size for 1D conv (adaptive kernel based on channel dimension)
+    
+    Example:
+        >>> eca = ECABlock(256)
+        >>> out = eca(features)  # (B, 256, H, W) -> (B, 256, H, W) with channel attention
+    """
+    def __init__(self, channels: int, k_size: int = 3):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # Global average pooling: (B, C, H, W) -> (B, C, 1, 1)
+        y = self.avg_pool(x)
+        # 1D conv over channels: (B, C, 1, 1) -> (B, 1, C) -> (B, 1, C)
+        y = self.conv(y.squeeze(-1).transpose(-1, -2))
+        # Reshape and apply sigmoid: (B, 1, C) -> (B, C, 1, 1)
+        y = self.sigmoid(y.transpose(-1, -2).unsqueeze(-1))
+        # Channel-wise attention
+        return x * y
+
+
+class CoordAttention(nn.Module):
+    """
+    Coordinate Attention (E15d).
+    
+    Encodes spatial information along height and width dimensions separately,
+    enabling long-range dependencies with precise positional information.
+    More effective than standard channel attention for localization tasks.
+    
+    Reference: Coordinate Attention for Efficient Mobile Network Design (CVPR 2021)
+    
+    Args:
+        c: Number of input channels
+        rd: Reduction ratio for bottleneck (default: 32)
+    
+    Example:
+        >>> coord_attn = CoordAttention(256, rd=32)
+        >>> out = coord_attn(features)  # Preserves spatial structure better than SE
+    """
+    def __init__(self, c: int, rd: int = 32):
+        super().__init__()
+        m = max(8, c // rd)  # Bottleneck channels (minimum 8)
+        
+        # 1x1 conv to reduce channels
+        self.conv1 = nn.Conv2d(c, m, kernel_size=1, stride=1, bias=True)
+        self.bn1 = nn.BatchNorm2d(m)
+        self.act = nn.SiLU()
+        
+        # Separate 1x1 convs for height and width attention
+        self.conv_h = nn.Conv2d(m, c, kernel_size=1, stride=1, bias=True)
+        self.conv_w = nn.Conv2d(m, c, kernel_size=1, stride=1, bias=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        
+        # Aggregate along width: (B, C, H, W) -> (B, C, H, 1)
+        x_h = x.mean(dim=3, keepdim=True)
+        # Aggregate along height: (B, C, H, W) -> (B, C, 1, W) -> (B, C, W, 1)
+        x_w = x.mean(dim=2, keepdim=True).permute(0, 1, 3, 2)
+        
+        # Concatenate: (B, C, H+W, 1)
+        y = torch.cat([x_h, x_w], dim=2)
+        
+        # Shared transform
+        y = self.act(self.bn1(self.conv1(y)))
+        
+        # Split back into height and width components
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)  # (B, C, W, 1) -> (B, C, 1, W)
+        
+        # Generate attention maps
+        a_h = self.sigmoid(self.conv_h(x_h))  # (B, C, H, 1)
+        a_w = self.sigmoid(self.conv_w(x_w))  # (B, C, 1, W)
+        
+        # Apply coordinate-wise attention
+        return x * a_h * a_w
+
+
+class SimAM(nn.Module):
+    """
+    SimAM: Parameter-free attention (E15f).
+    
+    Computes attention weights based on neuron importance without any learnable parameters.
+    Uses simple energy function to measure neuron importance relative to surrounding neurons.
+    
+    Reference: SimAM: A Simple, Parameter-Free Attention Module (ICML 2021)
+    
+    Args:
+        e_lambda: Regularization parameter for stability
+    
+    Example:
+        >>> simam = SimAM()  # Zero parameters!
+        >>> out = simam(features)  # Attention applied with no learned weights
+    """
+    def __init__(self, e_lambda: float = 1e-4):
+        super().__init__()
+        self.e_lambda = e_lambda
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        n = h * w - 1
+        
+        # Compute squared difference from mean
+        x_minus_mu_square = (x - x.mean(dim=[2, 3], keepdim=True)) ** 2
+        
+        # Compute variance with regularization
+        v = x_minus_mu_square.sum(dim=[2, 3], keepdim=True) / n + self.e_lambda
+        
+        # Energy function (lower energy = more important)
+        attn = x_minus_mu_square / (4 * (v + 1e-12)) + 0.5
+        
+        # Apply sigmoid to get attention weights
+        return x * torch.sigmoid(attn)
+
+
+def build_attn(name: Optional[str], c: int) -> nn.Module:
+    """
+    Factory function to build attention modules by name.
+    
+    Supported attention types (E2 experiments):
+        - 'se': Squeeze-and-Excitation (E13a)
+        - 'eca': Efficient Channel Attention (E13b)
+        - 'cbam': Full CBAM (channel + spatial) (E15a)
+        - 'cbam_c': CBAM channel-only (E13c)
+        - 'cbam_s': CBAM spatial-only (E14a)
+        - 'coord': Coordinate Attention (E15d)
+        - 'simam': SimAM parameter-free (E15f)
+    
+    Args:
+        name: Attention type string (case-insensitive) or None for no attention
+        c: Number of channels for the attention module
+    
+    Returns:
+        Attention module instance or nn.Identity if name is None
+    
+    Raises:
+        ValueError: If attention name is not recognized
+    
+    Example:
+        >>> attn = build_attn('coord', 256)
+        >>> # Use in attn_cfg: {'per_level': 'se', 'after_fuse': 'cbam'}
+    """
+    if not name:
+        return nn.Identity()
+    
+    name = name.lower()
+    
+    if name == 'se':
+        return SE(c)
+    if name == 'eca':
+        return ECABlock(c)
+    if name == 'cbam':
+        return CBAM(c, spatial=True, channel=True)
+    if name == 'cbam_c':
+        return CBAM(c, spatial=False, channel=True)
+    if name == 'cbam_s':
+        return CBAM(c, spatial=True, channel=False)
+    if name == 'coord':
+        return CoordAttention(c)
+    if name == 'simam':
+        return SimAM()
+    
+    raise ValueError(f"Unknown attention type: {name}. "
+                     f"Supported: se, eca, cbam, cbam_c, cbam_s, coord, simam")
+
+
+# ================================ FUSION MODULES ================================
+
+class WeightedAdd(nn.Module):
+    """
+    BiFPN-style fast normalized weighted fusion (E2b variant).
+    
+    Learns non-negative scalar weights for each input and computes normalized weighted sum.
+    Faster than softmax-based weighting used in earlier BiFPN variants.
+    
+    Formula: output = sum_i (w_i / (sum_j w_j + eps)) * x_i
+    where w_i = ReLU(learned_weight_i)
+    
+    Reference: EfficientDet (CVPR 2020)
+    
+    Args:
+        n_inputs: Number of input tensors to fuse (typically 2 for FPN nodes)
+        eps: Small constant for numerical stability in normalization
+    
+    Example:
+        >>> fuser = WeightedAdd(n_inputs=2)
+        >>> out = fuser([feature1, feature2])  # Learned weighted combination
+    """
+    def __init__(self, n_inputs: int, eps: float = 1e-4):
+        super().__init__()
+        self.eps = eps
+        # Initialize weights to 1.0 (equal weighting initially)
+        self.w = nn.Parameter(torch.ones(n_inputs))
+
+    def forward(self, xs: List[torch.Tensor]) -> torch.Tensor:
+        # Ensure non-negative weights and match input dtype
+        w = torch.relu(self.w).to(xs[0].dtype)
+        # Normalize to sum to 1
+        w = w / (w.sum() + self.eps)
+        
+        # Compute weighted sum
+        out = w[0] * xs[0]
+        for i in range(1, len(xs)):
+            out = out + w[i] * xs[i]
+        return out
+
+
+class Fusion(nn.Module):
+    """
+    Flexible fusion module supporting multiple fusion strategies (E32 variants).
+    
+    Fusion modes:
+        - 'add': Element-wise addition (E32b)
+          Requires aligned channels, efficient but assumes equal importance
+        
+        - 'weighted': BiFPN-style learned weighted sum (E32d for BiFPN)
+          Learns optimal weights for each input, best for iterative refinement
+        
+        - 'concat': Concatenation + 1x1 projection (E32a)
+          Most flexible, preserves all information but adds parameters
+    
+    Args:
+        mode: Fusion strategy ('add' | 'weighted' | 'concat')
+        c_in: List of input channel counts
+        c_out: Output channel count after fusion
+    
+    Example:
+        >>> # Concat fusion: [256, 256] -> concat -> 512 -> project -> 256
+        >>> fuse = Fusion('concat', [256, 256], 256)
+        >>> # Weighted fusion: learns weights for [feat1, feat2]
+        >>> fuse_w = Fusion('weighted', [256, 256], 256)
+    """
+    def __init__(self, mode: str, c_in: List[int], c_out: int):
+        super().__init__()
+        mode = mode.lower()
+        self.mode = mode
+        
+        if mode == 'weighted':
+            self.fuser = WeightedAdd(len(c_in))
+            self.project = nn.Identity()
+        elif mode == 'concat':
+            self.fuser = nn.Identity()
+            # Concatenate all inputs, then project to c_out
+            self.project = Conv(sum(c_in), c_out, k=1, s=1)
+        elif mode == 'add':
+            self.fuser = nn.Identity()
+            self.project = nn.Identity()
+            # Note: Assumes all c_in are equal to c_out (enforced by caller)
+        else:
+            raise ValueError(f"Unsupported fusion mode: {mode}. Use 'add', 'weighted', or 'concat'")
+
+    def forward(self, xs: List[torch.Tensor]) -> torch.Tensor:
+        if self.mode == 'concat':
+            # Concatenate along channel dimension
+            y = torch.cat(xs, dim=1)
+            return self.project(y)
+        elif self.mode == 'weighted':
+            # Learned weighted sum
+            y = self.fuser(xs)
+            return self.project(y)
+        else:  # add
+            # Simple element-wise addition
+            y = xs[0]
+            for t in xs[1:]:
+                y = y + t
+            return self.project(y)
+
+
+# ================================ BASE NECK ================================
+
+class BaseNeck(nn.Module):
+    """
+    Base class for all FPN-style necks with shared functionality.
+    
+    SIMPLIFIED API: Takes only 3 arguments:
+        1. in_channels: List[int] - Input channels from backbone
+        2. out_channels: int - Target output channels
+        3. cfg: dict - Configuration with all optional parameters
+    
+    Configuration keys in cfg:
+        - normalize_channels (bool): Align inputs to out_channels via 1x1 convs (default: True)
+        - attn_cfg (dict): Attention configuration
+            - 'per_level': Attention applied after alignment (default: None)
+            - 'after_fuse': Attention applied after fusion (default: None)
+        - conv_cfg (dict): Convolution configuration
+            - 'groups': Number of groups for grouped conv (default: 1)
+            - 'dilation': Dilation rate for atrous conv (default: 1)
+            - 'dcn': Use deformable convolution (default: False)
+        - fusion (str): Fusion mode - 'add'|'concat'|'weighted' (default: 'add')
+        - drop_td (float): Dropout for top-down path (default: 0.0)
+        - drop_bu (float): Dropout for bottom-up path (default: 0.0)
+    
+    Example:
+        >>> cfg = {
+        ...     'normalize_channels': True,
+        ...     'attn_cfg': {'per_level': 'se', 'after_fuse': 'cbam'},
+        ...     'conv_cfg': {'dcn': True, 'dilation': 2},
+        ...     'fusion': 'add',
+        ...     'drop_td': 0.1,
+        ...     'drop_bu': 0.1
+        ... }
+        >>> neck = FPN([256, 512, 1024, 2048], 256, cfg)
+    """
+    def __init__(
+        self,
+        in_channels: Sequence[int],
+        out_channels: int,
+        cfg: Optional[Dict] = None,
+    ):
+        super().__init__()
+        # Parse configuration with defaults
+        cfg = cfg or {}
+        self.in_channels = list(in_channels)
+        self.out_channels = out_channels
+        self.normalize_channels = cfg.get('normalize_channels', True)
+        
+        # Build channel alignment layers (1x1 convs or Identity)
+        self.align = make_align_layers(self.in_channels, self.out_channels, self.normalize_channels)
+
+        # Store configuration dicts
+        self.conv_cfg = cfg.get('conv_cfg', {})
+        self.attn_cfg = cfg.get('attn_cfg', {})
+        
+        # Build attention modules
+        # Per-level attention: applied after channel alignment
+        self.attn_per_level = nn.ModuleList([
+            build_attn(self.attn_cfg.get('per_level'), self.out_channels)
+            for _ in self.in_channels
+        ])
+        # After-fusion attention: applied after feature fusion in FPN paths
+        self.attn_after_fuse = build_attn(self.attn_cfg.get('after_fuse'), self.out_channels)
+
+        self.fusion_mode = cfg.get('fusion', 'add')
+
+        # Path-specific dropout layers
+        self.drop_td = _make_dropout(cfg.get('drop_td', 0.0))
+        self.drop_bu = _make_dropout(cfg.get('drop_bu', 0.0))
+
+    def _resize_to(self, src: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        """
+        Resize source tensor to match reference tensor's spatial dimensions.
+        Uses nearest neighbor interpolation (standard for FPN).
+        
+        Args:
+            src: Source tensor to resize (B, C, H_src, W_src)
+            ref: Reference tensor with target size (B, C, H_ref, W_ref)
+        
+        Returns:
+            Resized source tensor (B, C, H_ref, W_ref)
+        """
+        if src.shape[-2:] == ref.shape[-2:]:
+            return src
+        return F.interpolate(src, size=ref.shape[-2:], mode='nearest')
+
+    def _apply_align_and_attn(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Apply channel alignment and per-level attention to input features.
+        
+        Pipeline: backbone_features -> 1x1 alignment -> per-level attention
+        
+        Args:
+            xs: Input feature list from backbone
+        
+        Returns:
+            Aligned and attention-enhanced features
+        """
+        ys = []
+        for x, al, attn in zip(xs, self.align, self.attn_per_level):
+            y = al(x)       # Channel alignment (1x1 conv or identity)
+            y = attn(y)     # Per-level attention (SE/ECA/CBAM/etc or identity)
+            ys.append(y)
+        return ys
+    
+    def _select_flag(self, key: str, role: str, i: int, default: bool = False):
+        """
+        Reads conv_cfg[key] as:
+            - bool -> bool
+            - dict - {role: bool | list[int | bool], default}
+        """
+
+        val = self.conv_cfg.get(key, default)
+
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, dict):
+            role_val = val.get(role, val.get("default", default))
+            if isinstance(role_val, bool):
+                return role_val
+            if isinstance(role_val, (list, tuple)):
+                return bool(role_val[i]) if i < len(role_val) else val.get("default", default)
+        
+        return bool(val)
+    
+    def _dcn(self, role: str, i: int, default: bool = False):
+        return self._select_flag("dcn", role, i, default)
+
+
+# ================================ FPN VARIANTS ================================
+
+class FPN(BaseNeck):
+    """
+    Standard Feature Pyramid Network (E1 baseline).
+    
+    Architecture:
+        1. Top-down pathway starting from coarsest level
+        2. Lateral connections from backbone at each level
+        3. Element-wise fusion (add/concat/weighted)
+        4. 3x3 smoothing convolution after fusion
+    
+    Key properties:
+        - Builds high-level semantic features from coarse to fine
+        - Each level receives information from coarser level above
+        - Lateral connections inject fine-grained spatial details
+    
+    Args:
+        in_channels: Backbone output channels [C_P2, C_P3, C_P4, C_P5]
+        out_channels: Output channels for all FPN levels (typically 256)
+        cfg: Additional args passed to BaseNeck (attn_cfg, conv_cfg, etc.)
+    
+    Example:
+        >>> # Standard FPN with 256 output channels
+        >>> fpn = FPN([256, 512, 1024, 2048], 256)
+        >>> outs = fpn([p2, p3, p4, p5])  # All outputs have 256 channels
+        
+        >>> # FPN with coordinate attention and deformable convs
+        >>> fpn_advanced = FPN(
+        ...     [256, 512, 1024, 2048], 256,
+        ...     attn_cfg={'after_fuse': 'coord'},
+        ...     conv_cfg={'dcn': True}
+        ... )
+    """
+    def __init__(self, in_channels: Sequence[int], out_channels: int, cfg: dict):
+        super().__init__(in_channels, out_channels, cfg)
+        L = len(self.in_channels)
+
+        # Lateral 1x1 convs (only needed if not using normalize_channels)
+        # When normalize_channels=True, alignment is done in BaseNeck.align
+        self.laterals = nn.ModuleList([
+            lateral_1x1(self.in_channels[i], self.out_channels) if not self.normalize_channels else nn.Identity()
+            for i in range(L)
+        ])
+        
+        # 3x3 smoothing convolutions (applied after fusion to reduce aliasing)
+        self.smooth = nn.ModuleList([smooth_3x3(self.out_channels, self.conv_cfg, dcn=self._dcn("smooth_td", i)) for i in range(L)])
+        
+        # Fusion modules for combining lateral and top-down features
+        # (Not needed for topmost level)
+        self._fusions = nn.ModuleList([
+            Fusion(self.fusion_mode, [self.out_channels, self.out_channels], self.out_channels)
+            for _ in range(L - 1)
+        ])
+
+    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Forward pass through FPN.
+        
+        Args:
+            xs: Input features from backbone [P2, P3, P4, P5, ...]
+                where P2 is finest (largest spatial size) and P5 is coarsest
+        
+        Returns:
+            FPN output features [P2_out, P3_out, P4_out, P5_out, ...]
+            All outputs have out_channels and enhanced multi-scale information
+        """
+        # Step 1: Channel alignment and per-level attention
+        xs = self._apply_align_and_attn(xs)
+        L = len(xs)
+
+        outs = [None] * L
+        
+        # Step 2: Initialize top-down path from coarsest level
+        top = self.laterals[-1](xs[-1])
+        outs[-1] = self.smooth[-1](top)
+
+        # Step 3: Top-down fusion from coarse to fine
+        for i in range(L - 2, -1, -1):
+            # Lateral connection from backbone
+            li = self.laterals[i](xs[i])
+            
+            # Upsample coarser FPN feature to current resolution
+            up = self._resize_to(outs[i + 1], li)
+            
+            # Fuse lateral and upsampled features
+            fused = self._fusions[i]([li, up])
+            
+            # Apply after-fusion attention (if configured)
+            fused = self.attn_after_fuse(fused)
+            
+            # Apply dropout for regularization
+            fused = self.drop_td(fused)
+            
+            # 3x3 smoothing to reduce aliasing from upsampling
+            outs[i] = self.smooth[i](fused)
+
+        return outs
+
+
+class PANet(BaseNeck):
+    """
+    Path Aggregation Network (E3a: Bottom-up path augmentation).
+    
+    Architecture:
+        1. Standard FPN top-down path (coarse to fine)
+        2. Additional bottom-up path (fine to coarse)
+        3. Bottom-up path allows low-level features to be propagated upward
+    
+    Advantages over FPN:
+        - Low-level localization features can directly reach high levels
+        - Shorter path for information flow from fine to coarse levels
+        - Improves detection of small objects
+    
+    Reference: Path Aggregation Network for Instance Segmentation (CVPR 2018)
+    
+    Args:
+        in_channels: Backbone output channels
+        out_channels: Output channels for all levels
+        cfg: Additional args (attn_cfg, conv_cfg, fusion, dropout, etc.)
+    
+    Example:
+        >>> panet = PANet([256, 512, 1024, 2048], 256)
+        >>> outs = panet([p2, p3, p4, p5])  # Enhanced with bottom-up path
+    """
+    def __init__(self, in_channels: Sequence[int], out_channels: int, cfg: dict):
+        super().__init__(in_channels, out_channels, cfg)
+        L = len(self.in_channels)
+
+        # Top-down FPN stage (standard FPN)
+        self.td_fpn = FPN(in_channels, out_channels, cfg)
+
+        # Bottom-up path: stride-2 convolutions for downsampling
+        self.down = nn.ModuleList([
+            ConvPolicy(self.out_channels, self.out_channels, k=3, s=2, dcn=self._dcn("down_bu", i))
+            for i in range(L - 1)
+        ])
+        
+        # Bottom-up fusion modules
+        self.bu_fuse = nn.ModuleList([
+            Fusion(self.fusion_mode, [self.out_channels, self.out_channels], self.out_channels)
+            for _ in range(L - 1)
+        ])
+        
+        # Bottom-up smoothing convolutions
+        self.bu_smooth = nn.ModuleList([smooth_3x3(self.out_channels, self.conv_cfg, dcn=self._dcn("smooth_bu", i)) for i in range(L - 1)])
+
+    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Forward pass: FPN top-down + bottom-up path augmentation.
+        
+        Args:
+            xs: Input features from backbone
+        
+        Returns:
+            PANet features with bidirectional information flow
+        """
+        # Step 1: Standard FPN top-down path
+        # (alignment and per-level attention handled inside FPN)
+        ys = self.td_fpn(xs)
+        L = len(ys)
+
+        # Step 2: Bottom-up path augmentation (fine to coarse)
+        bu = [None] * L
+        bu[0] = ys[0]  # Finest level unchanged from FPN
+        
+        for i in range(L - 1):
+            # Downsample finer level
+            d = self.down[i](bu[i])
+            
+            # Fuse downsampled with corresponding FPN level
+            fused = self.bu_fuse[i]([d, ys[i + 1]])
+            
+            # Apply after-fusion attention
+            fused = self.attn_after_fuse(fused)
+            
+            # Apply bottom-up dropout
+            fused = self.drop_bu(fused)
+            
+            # Smooth with 3x3 conv
+            bu[i + 1] = self.bu_smooth[i](fused)
+
+        return bu
+
+
+class PAFPN(BaseNeck):
+    """
+    YOLOv4-style PAFPN (E10: Concat-heavy bidirectional pyramid).
+    
+    Architecture:
+        1. Top-down path with concatenation fusion
+        2. Bottom-up path with concatenation fusion
+        3. More parameters than PANet but preserves more information
+    
+    Key difference from PANet:
+        - Uses concatenation instead of addition for all fusion operations
+        - Concatenation followed by 1x1 projection + 3x3 smoothing
+        - Preserves full feature information at cost of more parameters
+    
+    Reference: YOLOv4 (arXiv 2020)
+    
+    Args:
+        in_channels: Backbone output channels
+        out_channels: Output channels for all levels
+        cfg: Additional args (attn_cfg, conv_cfg, dropout, etc.)
+    
+    Note:
+        This implementation manages its own alignment to avoid double-laterals
+        since it has a different fusion strategy than standard FPN.
+    
+    Example:
+        >>> pafpn = PAFPN([256, 512, 1024, 2048], 256)
+        >>> outs = pafpn([p2, p3, p4, p5])  # YOLOv4-style features
+    """
+    def __init__(self, in_channels: Sequence[int], out_channels: int, cfg):
+        super().__init__(in_channels, out_channels, cfg)
+        L = len(self.in_channels)
+
+        # Top-down path components
+        self.td_upsample = nn.ModuleList([nn.Upsample(scale_factor=2, mode='nearest') for _ in range(L - 1)])
+        self.td_fuse = nn.ModuleList([
+            Fusion('concat', [self.out_channels, self.out_channels], self.out_channels) for _ in range(L - 1)
+        ])
+        self.td_smooth = nn.ModuleList([smooth_3x3(self.out_channels, self.conv_cfg, dcn=self._dcn("smooth_td", i)) for i in range(L - 1)])
+
+        # Bottom-up path components
+        self.bu_down = nn.ModuleList([
+            ConvPolicy(self.out_channels, self.out_channels, k=3, s=2, dcn=self._dcn("down_bu", i))
+            for i in range(L - 1)
+        ])
+        self.bu_fuse = nn.ModuleList([
+            Fusion('concat', [self.out_channels, self.out_channels], self.out_channels) for _ in range(L - 1)
+        ])
+        self.bu_smooth = nn.ModuleList([smooth_3x3(self.out_channels, self.conv_cfg, dcn=self._dcn("smooth_bu", i)) for i in range(L - 1)])
+
+        # PAFPN manages its own alignment to avoid redundancy with BaseNeck
+        self.pre_align = make_align_layers(self.in_channels, self.out_channels, self.normalize_channels)
+        self.pre_attn = nn.ModuleList([build_attn(self.attn_cfg.get('per_level'), self.out_channels)
+                                       for _ in self.in_channels])
+
+    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Forward pass: Concat-heavy bidirectional pyramid.
+        
+        Args:
+            xs: Input features from backbone
+        
+        Returns:
+            PAFPN features with full information preservation via concatenation
+        """
+        # Step 1: Align channels and apply per-level attention
+        xs = [attn(al(x)) for x, al, attn in zip(xs, self.pre_align, self.pre_attn)]
+        L = len(xs)
+
+        # Step 2: Top-down path with concatenation
+        td = [None] * L
+        curr = xs[-1]
+        td[-1] = curr
+        
+        for i in range(L - 2, -1, -1):
+            # Upsample coarser level
+            up = self.td_upsample[i](curr)
+            up = self._resize_to(up, xs[i])
+            
+            # Concatenate finer level with upsampled coarser level
+            fused = self.td_fuse[i]([xs[i], up])
+            
+            # Apply after-fusion attention
+            fused = self.attn_after_fuse(fused)
+            
+            # Apply top-down dropout
+            fused = self.drop_td(fused)
+            
+            # Smooth with 3x3 conv
+            curr = self.td_smooth[i](fused)
+            td[i] = curr
+
+        # Step 3: Bottom-up path with concatenation
+        bu = [None] * L
+        bu[0] = td[0]
+        
+        for i in range(L - 1):
+            # Downsample finer level
+            d = self.bu_down[i](bu[i])
+            
+            # Concatenate downsampled with TD feature
+            fused = self.bu_fuse[i]([d, td[i + 1]])
+            
+            # Apply after-fusion attention
+            fused = self.attn_after_fuse(fused)
+            
+            # Apply bottom-up dropout
+            fused = self.drop_bu(fused)
+            
+            # Smooth with 3x3 conv
+            bu[i + 1] = self.bu_smooth[i](fused)
+
+        return bu
+
+
+class BiFPN(BaseNeck):
+    """
+    Bidirectional Feature Pyramid Network (E2a-d: BiFPN with iterations).
+    
+    Architecture:
+        1. Weighted feature fusion using fast normalized fusion
+        2. Bidirectional cross-scale connections
+        3. Stacked iterations for iterative refinement
+    
+    Key innovations:
+        - Learned fusion weights (more efficient than equal weighting)
+        - Multiple iterations (E2c: 3, E2d: 5) for feature refinement
+        - Cross-scale connections for better information flow
+    
+    Reference: EfficientDet (CVPR 2020)
+    
+    Args:
+        in_channels: Backbone output channels
+        out_channels: Output channels for all levels
+        iterations: Number of BiFPN stacks (1=single pass, 3=E2c, 5=E2d)
+        cfg: Additional args (attn_cfg, conv_cfg, dropout, etc.)
+    
+    Example:
+        >>> # Single iteration BiFPN (E2a)
+        >>> bifpn = BiFPN([256, 512, 1024, 2048], 256, iterations=1)
+        
+        >>> # 3-iteration BiFPN (E2c)
+        >>> bifpn_3 = BiFPN([256, 512, 1024, 2048], 256, iterations=3)
+        
+        >>> # 5-iteration BiFPN (E2d)
+        >>> bifpn_5 = BiFPN([256, 512, 1024, 2048], 256, iterations=5)
+    """
+    def __init__(self, in_channels: Sequence[int], out_channels: int, cfg):
+        cfg["fusion"] = "weighted"
+        super().__init__(in_channels, out_channels, cfg)
+        self.iterations = max(1, cfg.get("iterations", 1))
+        
+        # First BiFPN layer processes backbone features
+        self.fpn = FPN(in_channels, out_channels, cfg)
+
+        # Additional iterations process uniform-channel features
+        L = len(in_channels)
+        self.extra_stacks = nn.ModuleList([
+            FPN([out_channels] * L, out_channels, cfg)
+            for _ in range(self.iterations - 1)
+        ])
+
+    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Forward pass: Iterative bidirectional feature refinement.
+        
+        Args:
+            xs: Input features from backbone
+        
+        Returns:
+            Refined features after multiple BiFPN iterations
+        """
+        # First iteration: process backbone features
+        y = self.fpn(xs)
+        
+        # Additional iterations: iterative refinement
+        for fpn in self.extra_stacks:
+            y = fpn(y)
+        
+        return y
+
+
+class AugFPN(BaseNeck):
+    """
+    Augmented FPN (E5 approximation: Ratio-invariant adaptive pooling).
+    
+    Architecture:
+        1. Standard FPN as base
+        2. Ratio-invariant adaptive pooling (RAP) to fixed bins
+        3. Residual feature augmentation (RFA) added back to each level
+    
+    Key features:
+        - Handles scale variations better through adaptive pooling
+        - Adds global context via pooled features
+        - Lightweight approximation of full AugFPN
+    
+    Reference: AugFPN (arXiv 2020)
+    
+    Args:
+        in_channels: Backbone output channels
+        out_channels: Output channels for all levels
+        pool_bins: Number of bins for adaptive pooling (typically 3)
+        cfg: Additional args (attn_cfg, conv_cfg, dropout, etc.)
+    
+    Note:
+        This is a simplified implementation focusing on RAP+RFA core concepts.
+        Full AugFPN includes additional components like semantic enhancement.
+    
+    Example:
+        >>> augfpn = AugFPN([256, 512, 1024, 2048], 256, pool_bins=3)
+        >>> outs = augfpn([p2, p3, p4, p5])  # Enhanced with global context
+    """
+    def __init__(self, in_channels: Sequence[int], out_channels: int, cfg):
+        super().__init__(in_channels, out_channels, cfg)
+        self.pool_bins = cfg.get("pool_bins", 3)
+        
+        # Base FPN
+        self.fpn = FPN(in_channels, out_channels, cfg)
+
+        # RAP projection layers
+        self.proj = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = nn.SiLU()
+
+    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Forward pass: FPN + ratio-invariant adaptive pooling + residual augmentation.
+        
+        Args:
+            xs: Input features from backbone
+        
+        Returns:
+            Augmented features with global context
+        """
+        # Step 1: Standard FPN
+        feats = self.fpn(xs)
+        
+        # Step 2: Apply RAP + RFA to each level
+        outs = []
+        for f in feats:
+            H, W = f.shape[-2:]
+            
+            # Adaptive pooling to fixed bins (ratio-invariant)
+            pooled = F.adaptive_avg_pool2d(f, (self.pool_bins, self.pool_bins))
+            
+            # Project pooled features
+            pooled = self.proj(pooled)
+            pooled = self.bn(pooled)
+            pooled = self.act(pooled)
+            
+            # Upsample back to original size
+            pooled = F.interpolate(pooled, size=(H, W), mode='nearest')
+            
+            # Residual feature augmentation
+            outs.append(f + pooled)
+        
+        return outs
+
+
+class LibraFPN(BaseNeck):
+    """
+    Libra FPN (E9 approximation: Balanced feature pyramid).
+    
+    Architecture:
+        1. Standard FPN as base
+        2. Global feature balancing across all levels
+        3. Balanced features added back to each level
+    
+    Key features:
+        - Addresses feature imbalance across pyramid levels
+        - Global context pooling at reference scale
+        - Improves consistency across scales
+    
+    Reference: Libra R-CNN (CVPR 2019)
+    
+    Args:
+        in_channels: Backbone output channels
+        out_channels: Output channels for all levels
+        cfg: Additional args (attn_cfg, conv_cfg, dropout, etc.)
+    
+    Note:
+        Full Libra R-CNN includes IoU-balanced sampling and balanced L1 loss,
+        which are training components (not architecture). This implements
+        the balanced feature pyramid component only.
+    
+    Example:
+        >>> librafpn = LibraFPN([256, 512, 1024, 2048], 256)
+        >>> outs = librafpn([p2, p3, p4, p5])  # Balanced features
+    """
+    def __init__(self, in_channels: Sequence[int], out_channels: int, cfg):
+        super().__init__(in_channels, out_channels, cfg)
+        
+        # Base FPN
+        self.fpn = FPN(in_channels, out_channels, cfg)
+        
+        # Reprojection layers after adding balanced features
+        self.reproj = nn.ModuleList([Conv(out_channels, out_channels, k=3, s=1) for _ in in_channels])
+
+    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Forward pass: FPN + global balanced feature injection.
+        
+        Args:
+            xs: Input features from backbone
+        
+        Returns:
+            Balanced features with global context
+        """
+        # Step 1: Standard FPN
+        feats = self.fpn(xs)
+        
+        # Step 2: Compute balanced feature at reference scale (median level)
+        ref = feats[len(feats) // 2]
+        
+        # Resize all features to reference scale
+        resized = [self._resize_to(f, ref) for f in feats]
+        
+        # Average across all levels (balanced feature)
+        balanced = torch.stack(resized, dim=0).mean(dim=0)
+        
+        # Step 3: Add balanced feature back to each level
+        outs = []
+        for i, f in enumerate(feats):
+            # Resize balanced feature to match current level
+            b = self._resize_to(balanced, f)
+            
+            # Add and reproject
+            outs.append(self.reproj[i](f + b))
+        
+        return outs
+
+
+class RepFPN(BaseNeck):
+    """
+    Reparameterizable FPN (E11: RepConv for lateral and smoothing).
+    
+    Architecture:
+        1. Standard FPN structure
+        2. RepConv (reparameterizable convolution) for lateral connections
+        3. RepConv for smoothing operations
+    
+    Key features:
+        - Multi-branch training, single-branch inference
+        - Improves representation power during training
+        - No additional inference cost after reparameterization
+    
+    Reference: RepVGG (CVPR 2021)
+    
+    Args:
+        in_channels: Backbone output channels
+        out_channels: Output channels for all levels
+        cfg: Additional args (attn_cfg, conv_cfg, dropout, etc.)
+    
+    Note:
+        Call model.fuse() before inference to merge branches for speed.
+    
+    Example:
+        >>> repfpn = RepFPN([256, 512, 1024, 2048], 256)
+        >>> # Training
+        >>> outs = repfpn([p2, p3, p4, p5])
+        >>> # Before inference
+        >>> repfpn.eval()
+        >>> # Branches are automatically merged in eval mode
+    """
+    def __init__(self, in_channels: Sequence[int], out_channels: int, cfg):
+        super().__init__(in_channels, out_channels, cfg)
+        L = len(in_channels)
+
+        # Channel alignment layers
+        self.align = make_align_layers(in_channels, out_channels, self.normalize_channels)
+
+        # RepConv lateral connections (1x1 + RepConv 3x3)
+        self.lat = nn.ModuleList([
+            nn.Sequential(
+                Conv(in_channels[i] if not self.normalize_channels else out_channels, out_channels, k=1, s=1),
+                RepConv(out_channels, out_channels, k=3, s=1),
+            )
+            for i in range(L)
+        ])
+        
+        # RepConv smoothing layers
+        self.smooth = nn.ModuleList([RepConv(out_channels, out_channels, k=3, s=1) for _ in range(L)])
+
+    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Forward pass: FPN with reparameterizable convolutions.
+        
+        Args:
+            xs: Input features from backbone
+        
+        Returns:
+            FPN features with enhanced representation from RepConv
+        """
+        # Step 1: Channel alignment
+        xs = [al(x) for x, al in zip(xs, self.align)]
+        L = len(xs)
+        
+        # Step 2: Top-down FPN with RepConv
+        outs = [None] * L
+        
+        # Topmost level
+        outs[-1] = self.smooth[-1](self.lat[-1](xs[-1]))
+        
+        # Top-down fusion
+        for i in range(L - 2, -1, -1):
+            # Upsample coarser level
+            up = self._resize_to(outs[i + 1], xs[i])
+            
+            # Lateral connection + addition fusion
+            fused = self.lat[i](xs[i]) + up
+            
+            # Apply dropout
+            fused = self.drop_td(fused)
+            
+            # RepConv smoothing
+            outs[i] = self.smooth[i](fused)
+        
+        return outs
+
+
+class RecursiveFPN(BaseNeck):
+    """
+    Recursive FPN (E7: Multi-pass refinement).
+    
+    Architecture:
+        1. Standard FPN applied multiple times
+        2. Each pass refines features from previous pass
+        3. Iterative refinement improves feature quality
+    
+    Key features:
+        - Simple but effective iterative refinement
+        - Each pass has same architecture (weight sharing)
+        - More passes = more refinement but slower inference
+    
+    Args:
+        in_channels: Backbone output channels
+        out_channels: Output channels for all levels
+        passes: Number of FPN passes (default: 2)
+        cfg: Additional args (attn_cfg, conv_cfg, dropout, etc.)
+    
+    Example:
+        >>> # 2-pass recursive FPN
+        >>> recfpn = RecursiveFPN([256, 512, 1024, 2048], 256, passes=2)
+        
+        >>> # 3-pass for more refinement
+        >>> recfpn_3 = RecursiveFPN([256, 512, 1024, 2048], 256, passes=3)
+    """
+    def __init__(self, in_channels: Sequence[int], out_channels: int, cfg):
+        super().__init__(in_channels, out_channels, cfg)
+        self.passes = max(1, cfg.get("passes", 2))
+        L = len(in_channels)
+        
+        # Single FPN applied multiple times
+        self.fpn_first = FPN(in_channels, out_channels, cfg)
+        self.fpn_shared = FPN([out_channels] * L, out_channels, cfg)
+
+    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Forward pass: Apply FPN multiple times for iterative refinement.
+        
+        Args:
+            xs: Input features from backbone
+        
+        Returns:
+            Refined features after multiple FPN passes
+        """
+        # First pass on backbone features
+        y = self.fpn_first(xs)
+        
+        # Additional passes on refined features
+        for _ in range(self.passes - 1):
+            y = self.fpn_shared(y)
+        
+        return y
+
+
+class ScaleEqualizingFPN(BaseNeck):
+    """
+    Scale-Equalizing FPN (E8 approximation: Cross-level mean feature injection).
+    
+    Architecture:
+        1. Standard FPN as base
+        2. Compute mean feature across all levels at reference scale
+        3. Inject mean as residual bias to equalize scales
+    
+    Key features:
+        - Addresses scale imbalance in feature pyramid
+        - Cross-level information sharing via mean pooling
+        - Helps with scale-sensitive tasks
+    
+    Args:
+        in_channels: Backbone output channels
+        out_channels: Output channels for all levels
+        cfg: Additional args (attn_cfg, conv_cfg, dropout, etc.)
+    
+    Note:
+        This is a lightweight approximation. Full scale-equalizing pyramid
+        uses integral loss for scale balance during training.
+    
+    Example:
+        >>> sefpn = ScaleEqualizingFPN([256, 512, 1024, 2048], 256)
+        >>> outs = sefpn([p2, p3, p4, p5])  # Scale-equalized features
+    """
+    def __init__(self, in_channels: Sequence[int], out_channels: int, cfg):
+        super().__init__(in_channels, out_channels, cfg)
+        
+        # Base FPN
+        self.fpn = FPN(in_channels, out_channels, cfg)
+        
+        # Post-processing layers after adding mean feature
+        self.post = nn.ModuleList([Conv(out_channels, out_channels, k=3, s=1) for _ in in_channels])
+
+    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Forward pass: FPN + cross-level mean feature injection.
+        
+        Args:
+            xs: Input features from backbone
+        
+        Returns:
+            Scale-equalized features with cross-level mean
+        """
+        # Step 1: Standard FPN
+        feats = self.fpn(xs)
+        
+        # Step 2: Compute cross-level mean at reference scale
+        ref = feats[len(feats) // 2]  # Median level as reference
+        
+        # Resize all features to reference scale
+        pooled = [self._resize_to(f, ref) for f in feats]
+        
+        # Mean across all levels
+        mean = torch.stack(pooled, dim=0).mean(0)
+        
+        # Step 3: Add mean to each level as scale-equalizing bias
+        outs = []
+        for i, f in enumerate(feats):
+            # Resize mean to match current level
+            m = self._resize_to(mean, f)
+            
+            # Add and post-process
+            outs.append(self.post[i](f + m))
+        
+        return outs
+
+
+# ================================ FACTORY ================================
+
+NECKS = {
+    'fpn': FPN,
+    'panet': PANet,
+    'pafpn': PAFPN,
+    'bifpn': BiFPN,
+    'augfpn': AugFPN,
+    'librafpn': LibraFPN,
+    'recfpn': RecursiveFPN,
+    'repfpn': RepFPN,
+    'sefpn': ScaleEqualizingFPN,
+}
+
+
+def build_neck(name: str, in_channels: Sequence[int], out_channels: int, cfg) -> nn.Module:
+    """
+    Factory function to build neck by name.
+    
+    Args:
+        name: Neck architecture name (case-insensitive)
+        in_channels: Backbone output channels
+        out_channels: Neck output channels
+        cfg: Additional configuration (attn_cfg, conv_cfg, etc.)
+    
+    Returns:
+        Instantiated neck module
+    
+    Raises:
+        KeyError: If neck name is not recognized
+    
+    Available necks:
+        - 'fpn': Standard FPN (E1)
+        - 'panet': Path Aggregation Network (E3a)
+        - 'pafpn': YOLOv4-style PAFPN (E10)
+        - 'bifpn': BiFPN with iterations (E2a-d)
+        - 'augfpn': Augmented FPN (E5)
+        - 'librafpn': Libra FPN (E9)
+        - 'recfpn': Recursive FPN (E7)
+        - 'repfpn': Reparameterizable FPN (E11)
+        - 'sefpn': Scale-Equalizing FPN (E8)
+    
+    Example:
+        >>> # Build BiFPN with 3 iterations and coordinate attention
+        >>> neck = build_neck(
+        ...     'bifpn',
+        ...     in_channels=[256, 512, 1024, 2048],
+        ...     out_channels=256,
+        ...     iterations=3,
+        ...     attn_cfg={'after_fuse': 'coord'},
+        ...     conv_cfg={'dcn': True}
+        ... )
+    """
+    name = name.lower()
+    if name not in NECKS:
+        raise KeyError(f"Unknown neck: {name}. Available: {list(NECKS.keys())}")
+    return NECKS[name](in_channels, out_channels, cfg)
+

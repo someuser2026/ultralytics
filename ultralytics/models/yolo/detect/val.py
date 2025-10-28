@@ -517,3 +517,5 @@ class DetectionValidator(BaseValidator):
             except Exception as e:
                 LOGGER.warning(f"faster-coco-eval unable to run: {e}")
         return stats
+
+

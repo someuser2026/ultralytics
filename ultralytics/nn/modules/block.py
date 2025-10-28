@@ -2228,7 +2228,7 @@ class Timm(nn.Module):
         freeze_stem (bool, optional): Whether to freeze stem weights. Default is False.
         freeze (bool, optional): Whether to freeze entire backbone. Default is False.
         pure_transformers (bool, optional): Whether model is a pure transformer. Default is True.
-        dynamic_img_size (bool, optional): Allow dynamic input sizes (disables strict size checks). Default is True.
+        drop_path_rate (bool, optional): Stochastic drop path rate in the backbone. Default is 0.15
 
     Example:
         YAML usage with Index to select specific feature scales:
@@ -2256,7 +2256,8 @@ class Timm(nn.Module):
         freeze_stem: bool = False,
         freeze: bool = False,
         pure_transformers: bool = True,
-        dynamic_img_size: bool = False
+        dynamic_img_size: bool = False,
+        drop_path_rate: float = 0.15
     ):
         """
         Load the model from timm with specified configuration.
@@ -2283,6 +2284,7 @@ class Timm(nn.Module):
         self.features_only = features_only
         self.out_indices = out_indices
         self.model_name = model
+        self.drop_path_rate = drop_path_rate
         self.dynamic_img_size = dynamic_img_size
         
         # Try to create model with features_only first to validate out_indices
