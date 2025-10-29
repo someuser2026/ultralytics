@@ -570,7 +570,7 @@ class Exporter:
     def get_int8_calibration_dataloader(self, prefix=""):
         """Build and return a dataloader for calibration of INT8 models."""
         LOGGER.info(f"{prefix} collecting INT8 calibration images from 'data={self.args.data}'")
-        data = (check_cls_dataset if self.model.task == "classify" else check_det_dataset)(self.args.data)
+        data = (check_cls_dataset if self.model.task == "classify" else check_det_dataset)(self.args.data, True, self.args)
         dataset = YOLODataset(
             data[self.args.split or "val"],
             data=data,

@@ -156,7 +156,12 @@ class BaseTrainer:
         # Model and Dataset
         self.model = check_model_file_from_stem(self.args.model)  # add suffix, i.e. yolo11n -> yolo11n.pt
         with torch_distributed_zero_first(LOCAL_RANK):  # avoid auto-downloading dataset multiple times
+            print("-*"*50)
+            print("inside base/trainer.py 160")
+            print("args:", self.args)
             self.data = self.get_dataset()
+            print("data:", self.data)
+            print("-*"*50)
 
         self.ema = None
 
@@ -642,14 +647,22 @@ class BaseTrainer:
 
                 yaml_path = asyncio.run(convert_ndjson_to_yolo(self.args.data))
                 self.args.data = str(yaml_path)
-                data = check_det_dataset(self.args.data)
+                data = check_det_dataset(self.args.data, True, self.args)
+                # print("-"*50)
+                # print("Inside base/trainer.py 651")
+                # print(data)
+                # print("-"*50)
             elif self.args.data.rsplit(".", 1)[-1] in {"yaml", "yml"} or self.args.task in {
                 "detect",
                 "segment",
                 "pose",
                 "obb",
             }:
-                data = check_det_dataset(self.args.data)
+                data = check_det_dataset(self.args.data, True, self.args)
+                # print("-"*50)
+                # print("Inside base/trainer.py 651")
+                # print(data)
+                # print("-"*50)
                 if "yaml_file" in data:
                     self.args.data = data["yaml_file"]  # for validating 'yolo train data=url.zip' usage
         except Exception as e:

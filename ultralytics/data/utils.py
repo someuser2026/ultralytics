@@ -386,8 +386,36 @@ def find_dataset_yaml(path: Path) -> Path:
     assert len(files) == 1, f"Expected 1 YAML file in '{path.resolve()}', but found {len(files)}.\n{files}"
     return files[0]
 
+def compute_channels(channels, hyp):
+    if not hyp:
+        return channels
+    orig_channels = channels
+    if getattr(hyp, "sobel_p", False):
+        orig_channels += 2
+    if getattr(hyp, "canny_p", False):
+        orig_channels += 1
+    if getattr(hyp, "log_p", False):
+        orig_channels += 1
+    if getattr(hyp, "stt_p", False):
+        orig_channels += 3
+    if getattr(hyp, "lbp_p", False):
+        orig_channels += 1
+    if getattr(hyp, "gaussian_pyramid_p", False):
+        orig_channels += 2
+    if getattr(hyp, "laplacian_pyramid_p", False):
+        orig_channels += 2
+    if getattr(hyp, "stl_p", False):
+        orig_channels += 6
+    if getattr(hyp, "dog_p", False):
+        orig_channels += 1
+    if getattr(hyp, "ridge_p", False):
+        orig_channels += 1
+    if getattr(hyp, "gabor_p", False):
+        orig_channels += 1
+    return orig_channels
 
-def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]:
+
+def check_det_dataset(dataset: str, autodownload: bool = True, hyp: dict = None) -> dict[str, Any]:
     """
     Download, verify, and/or unzip a dataset if not found locally.
 
@@ -433,7 +461,8 @@ def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]
         data["nc"] = len(data["names"])
 
     data["names"] = check_class_names(data["names"])
-    data["channels"] = data.get("channels", 3)  # get image channels, default to 3
+    orig_channels = data.get("channels", 3)  # get image channels, default to 3
+    data["channels"] = compute_channels(orig_channels, hyp)
 
     # Resolve paths
     path = Path(extract_dir or data.get("path") or Path(data.get("yaml_file", "")).parent)  # dataset root
@@ -482,7 +511,7 @@ def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]
     return data  # dictionary
 
 
-def check_cls_dataset(dataset: str | Path, split: str = "") -> dict[str, Any]:
+def check_cls_dataset(dataset: str | Path, split: str = "", hyp: dict = None) -> dict[str, Any]:
     """
     Check a classification dataset such as Imagenet.
 

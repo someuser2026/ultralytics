@@ -112,7 +112,7 @@ class BaseDataset(Dataset):
         self.single_cls = single_cls
         self.prefix = prefix
         self.fraction = fraction
-        self.channels = channels
+        self.channels = self.compute_channels(channels, hyp)
         self.cv2_flag = cv2.IMREAD_GRAYSCALE if channels == 1 else cv2.IMREAD_COLOR
         self.im_files = self.get_img_files(self.img_path)
         self.labels = self.get_labels()
@@ -146,6 +146,43 @@ class BaseDataset(Dataset):
 
         # Transforms
         self.transforms = self.build_transforms(hyp=hyp)
+    
+    def compute_channels(self, channels, hyp):
+        orig_channels = channels
+        if getattr(hyp, "sobel_p", False):
+            orig_channels += 2
+        if getattr(hyp, "canny_p", False):
+            orig_channels += 1
+        if getattr(hyp, "log_p", False):
+            orig_channels += 1
+        if getattr(hyp, "stt_p", False):
+            orig_channels += 3
+        if getattr(hyp, "lbp_p", False):
+            orig_channels += 1
+        if getattr(hyp, "gaussian_pyramid_p", False):
+            orig_channels += 2
+        if getattr(hyp, "laplacian_pyramid_p", False):
+            orig_channels += 2
+        if getattr(hyp, "stl_p", False):
+            orig_channels += 6
+        if getattr(hyp, "dog_p", False):
+            orig_channels += 1
+        if getattr(hyp, "ridge_p", False):
+            orig_channels += 1
+        if getattr(hyp, "gabor_p", False):
+            orig_channels += 1
+        return orig_channels
+        # if getattr(hyp, "sobel_p", False):
+        #     orig_channels += 2
+        # if getattr(hyp, "sobel_p", False):
+        #     orig_channels += 2
+        # if getattr(hyp, "sobel_p", False):
+        #     orig_channels += 2
+        # if getattr(hyp, "sobel_p", False):
+        #     orig_channels += 2
+        # if getattr(hyp, "sobel_p", False):
+        #     orig_channels += 2
+
 
     def get_img_files(self, img_path: str | list[str]) -> list[str]:
         """

@@ -28,6 +28,17 @@ from .augment import (
     classify_augmentations,
     classify_transforms,
     v8_transforms,
+    SobelEdges,
+    CannyEdges,
+    LoGEdge,
+    StructureTensor,
+    LBP,
+    GaussianPyramid,
+    LaplacianPyramid,
+    SteerableFilters,
+    Gabor,
+    DoG,
+    RidgeFilters
 )
 from .base import BaseDataset
 from .converter import merge_multi_segment
@@ -227,7 +238,20 @@ class YOLODataset(BaseDataset):
             # print("Inside dataset.py 224")
             # print("self.imgsz:", self.imgsz)
             # print("-"*50)
-            transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
+            transforms = Compose([
+                LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False),
+                SobelEdges(getattr(hyp, "sobel_p", False)),
+                CannyEdges(getattr(hyp, "canny_p", False)),
+                LoGEdge(getattr(hyp, "log_p", False)),
+                StructureTensor(getattr(hyp, "stt_p", False)),
+                LBP(getattr(hyp, "lbp_p", False)),
+                GaussianPyramid(getattr(hyp, "gaussian_pyramid_p", False)),
+                LaplacianPyramid(getattr(hyp, "laplacian_pyramid_p", False)),
+                SteerableFilters(getattr(hyp, "stl_p", False)),
+                Gabor(getattr(hyp, "gabor_p", False)),
+                DoG(getattr(hyp, "dog_p", False)),
+                RidgeFilters(getattr(hyp, "ridge_p", False)),
+            ])
         transforms.append(
             Format(
                 bbox_format="xywh",

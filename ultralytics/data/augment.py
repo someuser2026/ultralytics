@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import random
 from copy import deepcopy
-from typing import Any
+from typing import Any, Literal
 
 import cv2
 import numpy as np
@@ -2319,8 +2319,12 @@ class RandomCLAHE:
         else:
             # Multi-channel image (RGB or multispectral)
             channels = cv2.split(img)
-            channels = [clahe.apply(ch) for ch in channels]
-            img = cv2.merge(channels)
+            # Apply to only first three channels assuming RGB
+            rgb_channels = deepcopy(channels)[:3]
+            non_rgb_channels = deepcopy(channels)[3:]
+            rgb_channels = [clahe.apply(ch) for ch in rgb_channels]
+            new_channels = rgb_channels + non_rgb_channels
+            img = cv2.merge(new_channels)
 
         labels["img"] = img.astype(dtype)
         return labels
@@ -2534,6 +2538,898 @@ class RandomUnsharpMask:
         sharpened = np.clip(sharpened, 0, 255).astype(dtype)
 
         labels["img"] = sharpened
+        return labels
+
+# ============================== helpers ======================================
+def _ensure_uint8(img: np.ndarray) -> np.ndarray:
+    """Convert image to uint8 format, scaling if necessary."""
+    if img.dtype == np.uint8:
+        return img
+    elif img.dtype == np.uint16:
+        return (img / 257).astype(np.uint8)
+    x = img.astype(np.float32)
+    if np.issubdtype(img.dtype, np.floating) and x.max() <= 1.0:
+        x *= 255.0
+    return np.clip(x, 0, 255).astype(np.uint8)
+
+def _to_gray(img: np.ndarray, strategy: Literal["luma", "mean"] = "luma") -> np.ndarray:
+    """
+    Convert image to grayscale using specified strategy.
+    
+    Args:
+        img: Input image array
+        strategy: Conversion method - "luma" for weighted RGB or "mean" for simple averaging
+        
+    Returns:
+        Grayscale image as uint8
+    """
+    img_u8 = _ensure_uint8(img)
+    if img_u8.ndim == 3 and img_u8.shape[2] >= 3 and strategy == "luma":
+        return cv2.cvtColor(img_u8[:, :, :3], cv2.COLOR_BGR2GRAY)
+    g = np.mean(img_u8, axis=2) if img_u8.ndim == 3 else img_u8
+    return np.clip(g, 0, 255).astype(np.uint8)
+
+def _match_dtype(img: np.ndarray, ch_u8: np.ndarray) -> np.ndarray:
+    """Match the dtype of a channel to the original image."""
+    if np.issubdtype(img.dtype, np.floating):
+        out = ch_u8.astype(np.float32) / 255.0
+        return out.astype(img.dtype, copy=False)
+    return ch_u8.astype(img.dtype, copy=False)
+
+def _append_channels(img: np.ndarray, chans: list[np.ndarray]) -> np.ndarray:
+    """Append additional channels to an image."""
+    out = img
+    if out.ndim == 2:
+        out = out[..., None]
+    stack = [out]
+    for ch in chans:
+        if ch.ndim == 3 and ch.shape[2] == 1:
+            ch = ch[:, :, 0]
+        ch_u8 = _ensure_uint8(ch)
+        ch_cast = _match_dtype(out, ch_u8)
+        stack.append(ch_cast[..., None] if ch_cast.ndim == 2 else ch_cast)
+    return np.concatenate(stack, axis = 2)
+
+# ============================ core edges =====================================
+class SobelEdges:
+    """
+    Apply Sobel edge detection and append edge channels to the image.
+    
+    This augmentation computes Sobel gradients in x and y directions and can append
+    magnitude, directional gradients, or both magnitude and direction as additional channels.
+    
+    Attributes:
+        p (float): Probability of applying the augmentation. Default is 1.0 (always apply).
+        ksize (int): Size of the Sobel kernel. Must be 1, 3, 5, or 7. Default is 3.
+        out_mode (str): Output mode determining which channels to append:
+            - "mag": Append gradient magnitude (1 channel)
+            - "dxdy": Append x and y gradients (2 channels)
+            - "magdir": Append magnitude and direction (2 channels)
+        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
+    
+    Examples:
+        >>> from ultralytics.data.augment import AddSobelEdges
+        >>> import numpy as np
+        >>> augmenter = AddSobelEdges(p=0.5, ksize=3, out_mode="mag")
+        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        >>> labels = {"img": image}
+        >>> augmented = augmenter(labels)
+        >>> print(augmented["img"].shape)  # Shape will be (100, 100, 4) - original 3 + 1 edge channel
+    """
+    
+    def __init__(
+        self,
+        p: bool = False,
+        ksize: int = 3,
+        out_mode: Literal["mag", "dxdy", "magdir"] = "dxdy",
+        gray_strategy: Literal["luma", "mean"] = "luma"
+    ) -> None:
+        """
+        Initialize AddSobelEdges augmentation.
+        
+        Args:
+            p: Probability of applying the augmentation (0.0 to 1.0).
+            ksize: Sobel kernel size. Must be 1, 3, 5, or 7.
+            out_mode: Output mode - "mag", "dxdy", or "magdir".
+            gray_strategy: Grayscale conversion method - "luma" or "mean".
+        """
+        self.p = p
+        self.ksize = ksize if ksize in (1, 3, 5, 7) else 3
+        self.out_mode = out_mode
+        self.gray_strategy = gray_strategy
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Apply Sobel edge detection to the image.
+        
+        Args:
+            labels: Dictionary containing 'img' key with image array.
+            
+        Returns:
+            Dictionary with image having additional edge channels appended.
+        """
+        if not self.p:
+            return labels
+            
+        img = labels["img"]
+        gray = _to_gray(img, self.gray_strategy)
+        
+        dx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=self.ksize)
+        dy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=self.ksize)
+        mag = cv2.magnitude(dx, dy)
+        mag_u8 = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        
+        if self.out_mode == "mag":
+            out_chans = [mag_u8]
+        elif self.out_mode == "dxdy":
+            dx_u8 = cv2.normalize(np.abs(dx), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            dy_u8 = cv2.normalize(np.abs(dy), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            out_chans = [dx_u8, dy_u8]
+        else:  # magdir
+            ang = cv2.phase(dx, dy, angleInDegrees=True)
+            ang_u8 = (ang / 360.0 * 255.0).astype(np.uint8)
+            out_chans = [mag_u8, ang_u8]
+            
+        labels["img"] = _append_channels(img, out_chans)
+        return labels
+
+
+class CannyEdges:
+    """
+    Apply Canny edge detection and append edge map as an additional channel.
+    
+    This augmentation uses the Canny edge detector with optional automatic threshold
+    calculation based on image median intensity.
+    
+    Attributes:
+        p (float): Probability of applying the augmentation. Default is 1.0.
+        auto (bool): If True, automatically calculate thresholds from image median. Default is True.
+        t1 (int): Lower threshold for Canny (used when auto=False). Default is 50.
+        t2 (int): Upper threshold for Canny (used when auto=False). Default is 150.
+        aperture_size (int): Aperture size for Sobel operator. Must be 3, 5, or 7. Default is 3.
+        L2gradient (bool): If True, uses L2 norm for gradient magnitude. Default is True.
+        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
+    
+    Examples:
+        >>> from ultralytics.data.augment import AddCannyEdges
+        >>> import numpy as np
+        >>> augmenter = AddCannyEdges(p=0.8, auto=True)
+        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        >>> labels = {"img": image}
+        >>> augmented = augmenter(labels)
+        >>> print(augmented["img"].shape)  # Shape will be (100, 100, 4)
+    """
+    
+    def __init__(
+        self,
+        p: bool = False,
+        auto: bool = True,
+        t1: int = 50,
+        t2: int = 150,
+        aperture_size: int = 3,
+        L2gradient: bool = True,
+        gray_strategy: Literal["luma", "mean"] = "luma"
+    ) -> None:
+        """
+        Initialize AddCannyEdges augmentation.
+        
+        Args:
+            p: Probability of applying the augmentation (0.0 to 1.0).
+            auto: Enable automatic threshold calculation.
+            t1: Lower Canny threshold (when auto=False).
+            t2: Upper Canny threshold (when auto=False).
+            aperture_size: Sobel aperture size. Must be 3, 5, or 7.
+            L2gradient: Use L2 norm for gradient calculation.
+            gray_strategy: Grayscale conversion method - "luma" or "mean".
+        """
+        self.p = p
+        self.auto = auto
+        self.t1 = int(t1)
+        self.t2 = int(t2)
+        self.aperture_size = aperture_size if aperture_size in (3, 5, 7) else 3
+        self.L2gradient = L2gradient
+        self.gray_strategy = gray_strategy
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Apply Canny edge detection to the image.
+        
+        Args:
+            labels: Dictionary containing 'img' key with image array.
+            
+        Returns:
+            Dictionary with image having edge channel appended.
+        """
+        if not self.p:
+            return labels
+            
+        img = labels["img"]
+        gray = _to_gray(img, self.gray_strategy)
+        gb = cv2.GaussianBlur(gray, (3, 3), 0)
+        
+        if self.auto:
+            v = float(np.median(gb))
+            lo = int(max(0, (1 - 0.33) * v))
+            hi = int(min(255, (1 + 0.33) * v))
+        else:
+            lo, hi = self.t1, self.t2
+            
+        edges = cv2.Canny(gb, lo, hi, apertureSize=self.aperture_size, L2gradient=self.L2gradient)
+        labels["img"] = _append_channels(img, [edges])
+        return labels
+
+
+class LoGEdge:
+    """
+    Apply Laplacian of Gaussian (LoG) edge detection and append as a channel.
+    
+    This augmentation combines Gaussian smoothing with Laplacian edge detection,
+    effective for detecting edges at multiple scales.
+    
+    Attributes:
+        p (float): Probability of applying the augmentation. Default is 1.0.
+        sigma (float): Sigma for Gaussian blur before Laplacian. Default is 1.2.
+        scale_abs (bool): If True, take absolute value of Laplacian. Default is True.
+        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
+    
+    Examples:
+        >>> from ultralytics.data.augment import AddLoGEdge
+        >>> import numpy as np
+        >>> augmenter = AddLoGEdge(p=0.7, sigma=1.5)
+        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        >>> labels = {"img": image}
+        >>> augmented = augmenter(labels)
+    """
+    
+    def __init__(
+        self,
+        p: bool = False,
+        sigma: float = 1.2,
+        scale_abs: bool = True,
+        gray_strategy: Literal["luma", "mean"] = "luma"
+    ) -> None:
+        """
+        Initialize AddLoGEdge augmentation.
+        
+        Args:
+            p: Probability of applying the augmentation (0.0 to 1.0).
+            sigma: Gaussian blur sigma value. Higher values detect coarser edges.
+            scale_abs: Take absolute value of Laplacian output.
+            gray_strategy: Grayscale conversion method - "luma" or "mean".
+        """
+        self.p = p
+        self.sigma = float(max(0.1, sigma))
+        self.scale_abs = scale_abs
+        self.gray_strategy = gray_strategy
+        
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Apply LoG edge detection to the image.
+        
+        Args:
+            labels: Dictionary containing 'img' key with image array.
+            
+        Returns:
+            Dictionary with image having LoG edge channel appended.
+        """
+        if not self.p:
+            return labels
+            
+        img = labels["img"]
+        gray = _to_gray(img, self.gray_strategy)
+        k = int(2 * np.ceil(3 * self.sigma) + 1)
+        blur = cv2.GaussianBlur(gray, (k, k), self.sigma)
+        lap = cv2.Laplacian(blur, cv2.CV_32F, ksize=3)
+        
+        if self.scale_abs:
+            lap = np.abs(lap)
+            
+        out = cv2.normalize(lap, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        labels["img"] = _append_channels(img, [out])
+        return labels
+
+
+class StructureTensor:
+    """
+    Compute and append structure tensor components (Jxx, Jyy, Jxy) as channels.
+    
+    The structure tensor captures local gradient information and is useful for
+    detecting corners, edges, and texture orientation.
+    
+    Attributes:
+        p (float): Probability of applying the augmentation. Default is 1.0.
+        sobel_ksize (int): Sobel kernel size. Must be 1, 3, 5, or 7. Default is 3.
+        smooth_sigma (float): Gaussian smoothing sigma for tensor components. Default is 1.0.
+        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
+    
+    Examples:
+        >>> from ultralytics.data.augment import AddStructureTensor
+        >>> import numpy as np
+        >>> augmenter = AddStructureTensor(p=0.6, smooth_sigma=1.5)
+        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        >>> labels = {"img": image}
+        >>> augmented = augmenter(labels)
+        >>> print(augmented["img"].shape)  # Shape will be (100, 100, 6) - original 3 + 3 tensor channels
+    """
+    
+    def __init__(
+        self,
+        p: bool = False,
+        sobel_ksize: int = 3,
+        smooth_sigma: float = 1.0,
+        gray_strategy: Literal["luma", "mean"] = "luma"
+    ) -> None:
+        """
+        Initialize AddStructureTensor augmentation.
+        
+        Args:
+            p: Probability of applying the augmentation (0.0 to 1.0).
+            sobel_ksize: Sobel kernel size. Must be 1, 3, 5, or 7.
+            smooth_sigma: Sigma for Gaussian smoothing of tensor components.
+            gray_strategy: Grayscale conversion method - "luma" or "mean".
+        """
+        self.p = p
+        self.sobel_ksize = sobel_ksize if sobel_ksize in (1, 3, 5, 7) else 3
+        self.sigma = float(max(0, smooth_sigma))
+        self.gray_strategy = gray_strategy
+        
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Compute and append structure tensor channels to the image.
+        
+        Args:
+            labels: Dictionary containing 'img' key with image array.
+            
+        Returns:
+            Dictionary with image having 3 structure tensor channels appended.
+        """
+        if not self.p:
+            return labels
+            
+        img = labels["img"]
+        g = _to_gray(img, self.gray_strategy)
+        dx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=self.sobel_ksize)
+        dy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=self.sobel_ksize)
+        
+        Jxx, Jyy, Jxy = dx * dx, dy * dy, dx * dy
+        
+        if self.sigma > 0:
+            k = int(2 * np.ceil(3 * self.sigma) + 1)
+            Jxx = cv2.GaussianBlur(Jxx, (k, k), self.sigma)
+            Jyy = cv2.GaussianBlur(Jyy, (k, k), self.sigma)
+            Jxy = cv2.GaussianBlur(Jxy, (k, k), self.sigma)
+            
+        chans = [cv2.normalize(x, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8) 
+                 for x in (Jxx, Jyy, Jxy)]
+        labels["img"] = _append_channels(img, chans)
+        return labels
+
+
+class LBP:
+    """
+    Compute and append Local Binary Pattern (LBP) as a texture channel.
+    
+    LBP is a texture descriptor that compares each pixel with its 8 neighbors,
+    creating a binary pattern. Useful for texture classification and analysis.
+    
+    Attributes:
+        p (float): Probability of applying the augmentation. Default is 1.0.
+        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
+    
+    Examples:
+        >>> from ultralytics.data.augment import AddLBP
+        >>> import numpy as np
+        >>> augmenter = AddLBP(p=0.5)
+        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        >>> labels = {"img": image}
+        >>> augmented = augmenter(labels)
+    """
+    
+    def __init__(
+        self,
+        p: bool = False,
+        gray_strategy: Literal["luma", "mean"] = "luma"
+    ) -> None:
+        """
+        Initialize AddLBP augmentation.
+        
+        Args:
+            p: Probability of applying the augmentation (0.0 to 1.0).
+            gray_strategy: Grayscale conversion method - "luma" or "mean".
+        """
+        self.p = p
+        self.gray_strategy = gray_strategy
+        
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Compute and append LBP texture channel to the image.
+        
+        Args:
+            labels: Dictionary containing 'img' key with image array.
+            
+        Returns:
+            Dictionary with image having LBP channel appended.
+        """
+        if not self.p:
+            return labels
+            
+        img = labels["img"]
+        g = _to_gray(img, self.gray_strategy).astype(np.int16)
+        
+        # Compute neighbors via roll
+        def rol(x, dy, dx):
+            return np.roll(np.roll(x, dy, axis=0), dx, axis=1)
+        
+        c = g
+        n = [
+            rol(g, -1, -1), rol(g, -1, 0), rol(g, -1, 1),
+            rol(g, 0, -1),                 rol(g, 0, 1),
+            rol(g, 1, -1),  rol(g, 1, 0),  rol(g, 1, 1)
+        ]
+        
+        lbp = np.zeros_like(g, dtype=np.uint8)
+        for i, ni in enumerate(n):
+            lbp |= ((ni >= c).astype(np.uint8) << i)
+            
+        labels["img"] = _append_channels(img, [lbp])
+        return labels
+
+
+class GaussianPyramid:
+    """
+    Create and append Gaussian pyramid levels as additional channels.
+    
+    Downsamples the image multiple times and upsamples back to original size,
+    creating scale-space representations useful for multi-scale feature detection.
+    
+    Attributes:
+        p (float): Probability of applying the augmentation. Default is 1.0.
+        levels (int): Number of pyramid levels to create. Default is 2.
+        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
+    
+    Examples:
+        >>> from ultralytics.data.augment import AddGaussianPyramid
+        >>> import numpy as np
+        >>> augmenter = AddGaussianPyramid(p=0.5, levels=3)
+        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        >>> labels = {"img": image}
+        >>> augmented = augmenter(labels)
+        >>> print(augmented["img"].shape)  # Shape will be (100, 100, 6) - original 3 + 3 pyramid levels
+    """
+    
+    def __init__(
+        self,
+        p: bool = False,
+        levels: int = 2,
+        gray_strategy: Literal["luma", "mean"] = "luma"
+    ) -> None:
+        """
+        Initialize AddGaussianPyramid augmentation.
+        
+        Args:
+            p: Probability of applying the augmentation (0.0 to 1.0).
+            levels: Number of pyramid levels to create.
+            gray_strategy: Grayscale conversion method - "luma" or "mean".
+        """
+        self.p = p
+        self.levels = max(1, int(levels))
+        self.gray_strategy = gray_strategy
+        
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Create and append Gaussian pyramid channels to the image.
+        
+        Args:
+            labels: Dictionary containing 'img' key with image array.
+            
+        Returns:
+            Dictionary with image having pyramid level channels appended.
+        """
+        if not self.p:
+            return labels
+            
+        img = labels["img"]
+        g0 = _to_gray(img, self.gray_strategy)
+        chans = []
+        g = g0.copy()
+        
+        for i in range(self.levels):
+            g = cv2.pyrDown(g)
+            up = g
+            for _ in range(i + 1):
+                up = cv2.pyrUp(up)
+            up = cv2.resize(up, (g0.shape[1], g0.shape[0]), interpolation=cv2.INTER_LINEAR)
+            chans.append(_ensure_uint8(up))
+            
+        labels["img"] = _append_channels(img, chans)
+        return labels
+
+
+class LaplacianPyramid:
+    """
+    Create and append Laplacian pyramid levels as additional channels.
+    
+    Computes differences between Gaussian pyramid levels, capturing details
+    at different scales. Useful for multi-scale edge and detail detection.
+    
+    Attributes:
+        p (float): Probability of applying the augmentation. Default is 1.0.
+        levels (int): Number of pyramid levels to create. Default is 2.
+        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
+    
+    Examples:
+        >>> from ultralytics.data.augment import AddLaplacianPyramid
+        >>> import numpy as np
+        >>> augmenter = AddLaplacianPyramid(p=0.6, levels=2)
+        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        >>> labels = {"img": image}
+        >>> augmented = augmenter(labels)
+    """
+    
+    def __init__(
+        self,
+        p: bool = False,
+        levels: int = 2,
+        gray_strategy: Literal["luma", "mean"] = "luma"
+    ) -> None:
+        """
+        Initialize AddLaplacianPyramid augmentation.
+        
+        Args:
+            p: Probability of applying the augmentation (0.0 to 1.0).
+            levels: Number of pyramid levels to create.
+            gray_strategy: Grayscale conversion method - "luma" or "mean".
+        """
+        self.p = p
+        self.levels = max(1, int(levels))
+        self.gray_strategy = gray_strategy
+        
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Create and append Laplacian pyramid channels to the image.
+        
+        Args:
+            labels: Dictionary containing 'img' key with image array.
+            
+        Returns:
+            Dictionary with image having Laplacian pyramid channels appended.
+        """
+        if not self.p:
+            return labels
+            
+        img = labels["img"]
+        g0 = _to_gray(img, self.gray_strategy)
+        gp = [g0]
+        
+        for _ in range(self.levels):
+            gp.append(cv2.pyrDown(gp[-1]))
+            
+        chans = []
+        for lvl in range(self.levels):
+            up = cv2.pyrUp(gp[lvl + 1])
+            up = cv2.resize(up, (gp[lvl].shape[1], gp[lvl].shape[0]), interpolation=cv2.INTER_LINEAR)
+            lap = cv2.subtract(gp[lvl], up)
+            lap_u8 = cv2.normalize(lap.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            lap_u8 = cv2.resize(lap_u8, (g0.shape[1], g0.shape[0]), interpolation=cv2.INTER_LINEAR)
+            chans.append(lap_u8)
+            
+        labels["img"] = _append_channels(img, chans)
+        return labels
+
+
+class SteerableFilters:
+    """
+    Apply steerable filters at multiple orientations and append as channels.
+    
+    Computes directional derivatives at K evenly-spaced orientations using
+    steerability: R(θ) = cos(θ)*dx + sin(θ)*dy. Useful for orientation-specific
+    edge and texture detection.
+    
+    Attributes:
+        p (float): Probability of applying the augmentation. Default is 1.0.
+        n_orientations (int): Number of orientations to compute. Default is 6.
+        sobel_ksize (int): Sobel kernel size. Must be 1, 3, 5, or 7. Default is 3.
+        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
+    
+    Examples:
+        >>> from ultralytics.data.augment import AddSteerableFilters
+        >>> import numpy as np
+        >>> augmenter = AddSteerableFilters(p=0.5, n_orientations=8)
+        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        >>> labels = {"img": image}
+        >>> augmented = augmenter(labels)
+        >>> print(augmented["img"].shape)  # Shape will be (100, 100, 11) - original 3 + 8 orientations
+    """
+    
+    def __init__(
+        self,
+        p: bool = False,
+        n_orientations: int = 6,
+        sobel_ksize: int = 3,
+        gray_strategy: Literal["luma", "mean"] = "luma"
+    ) -> None:
+        """
+        Initialize AddSteerableFilters augmentation.
+        
+        Args:
+            p: Probability of applying the augmentation (0.0 to 1.0).
+            n_orientations: Number of orientations to compute.
+            sobel_ksize: Sobel kernel size. Must be 1, 3, 5, or 7.
+            gray_strategy: Grayscale conversion method - "luma" or "mean".
+        """
+        self.p = p
+        self.K = max(1, int(n_orientations))
+        self.ksize = sobel_ksize if sobel_ksize in (1, 3, 5, 7) else 3
+        self.gray_strategy = gray_strategy
+        
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Compute and append steerable filter responses at multiple orientations.
+        
+        Args:
+            labels: Dictionary containing 'img' key with image array.
+            
+        Returns:
+            Dictionary with image having orientation-specific channels appended.
+        """
+        if not self.p:
+            return labels
+            
+        img = labels["img"]
+        g = _to_gray(img, self.gray_strategy)
+        dx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=self.ksize)
+        dy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=self.ksize)
+        
+        chans = []
+        for i in range(self.K):
+            theta = np.pi * i / self.K
+            resp = np.abs(np.cos(theta) * dx + np.sin(theta) * dy)
+            resp_u8 = cv2.normalize(resp, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            chans.append(resp_u8)
+            
+        labels["img"] = _append_channels(img, chans)
+        return labels
+
+
+class Gabor:
+    """
+    Apply Gabor filter and append magnitude response as a channel.
+    
+    Gabor filters are useful for texture analysis and feature extraction,
+    combining frequency and orientation selectivity.
+    
+    Attributes:
+        p (float): Probability of applying the augmentation. Default is 1.0.
+        ksize (int): Gabor kernel size. Default is 21.
+        sigma (float): Standard deviation of Gaussian envelope. Default is 4.0.
+        theta_deg (float): Orientation in degrees. Default is 0.0.
+        lambd (float): Wavelength of sinusoidal factor. Default is 10.0.
+        gamma (float): Spatial aspect ratio. Default is 0.5.
+        psi (float): Phase offset. Default is 0.0.
+        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
+    
+    Examples:
+        >>> from ultralytics.data.augment import AddGabor
+        >>> import numpy as np
+        >>> augmenter = AddGabor(p=0.5, theta_deg=45, lambd=8.0)
+        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        >>> labels = {"img": image}
+        >>> augmented = augmenter(labels)
+    """
+    
+    def __init__(
+        self,
+        p: bool = False,
+        ksize: int = 21,
+        sigma: float = 4.0,
+        theta_deg: float = 0.0,
+        lambd: float = 10.0,
+        gamma: float = 0.5,
+        psi: float = 0.0,
+        gray_strategy: Literal["luma", "mean"] = "luma"
+    ) -> None:
+        """
+        Initialize AddGabor augmentation.
+        
+        Args:
+            p: Probability of applying the augmentation (0.0 to 1.0).
+            ksize: Gabor kernel size. Should be odd.
+            sigma: Standard deviation of Gaussian envelope.
+            theta_deg: Filter orientation in degrees.
+            lambd: Wavelength of the sinusoidal factor.
+            gamma: Spatial aspect ratio (ellipticity).
+            psi: Phase offset in radians.
+            gray_strategy: Grayscale conversion method - "luma" or "mean".
+        """
+        self.p = p
+        self.ksize = int(max(3, ksize) | 1)  # Ensure odd
+        self.sigma = float(sigma)
+        self.theta = np.deg2rad(theta_deg)
+        self.lambd = float(lambd)
+        self.gamma = float(gamma)
+        self.psi = float(psi)
+        self.gray_strategy = gray_strategy
+        
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Apply Gabor filter to the image.
+        
+        Args:
+            labels: Dictionary containing 'img' key with image array.
+            
+        Returns:
+            Dictionary with image having Gabor response channel appended.
+        """
+        if not self.p:
+            return labels
+            
+        img = labels["img"]
+        g = _to_gray(img, self.gray_strategy)
+        k = cv2.getGaborKernel(
+            (self.ksize, self.ksize),
+            self.sigma,
+            self.theta,
+            self.lambd,
+            self.gamma,
+            self.psi,
+            ktype=cv2.CV_32F
+        )
+        resp = cv2.filter2D(g.astype(np.float32), cv2.CV_32F, k)
+        resp = np.abs(resp)
+        out = cv2.normalize(resp, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        labels["img"] = _append_channels(img, [out])
+        return labels
+
+
+class DoG:
+    """
+    Apply Difference of Gaussians (DoG) and append as a channel.
+    
+    DoG approximates the Laplacian of Gaussian and is useful for blob detection
+    and edge enhancement at specific scales.
+    
+    Attributes:
+        p (float): Probability of applying the augmentation. Default is 1.0.
+        sigma1 (float): Sigma for first Gaussian. Default is 1.0.
+        sigma2 (float): Sigma for second Gaussian. Default is 2.0.
+        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
+    
+    Examples:
+        >>> from ultralytics.data.augment import AddDoG
+        >>> import numpy as np
+        >>> augmenter = AddDoG(p=0.6, sigma1=1.0, sigma2=2.5)
+        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        >>> labels = {"img": image}
+        >>> augmented = augmenter(labels)
+    """
+    
+    def __init__(
+        self,
+        p: bool = False,
+        sigma1: float = 1.0,
+        sigma2: float = 2.0,
+        gray_strategy: Literal["luma", "mean"] = "luma"
+    ) -> None:
+        """
+        Initialize AddDoG augmentation.
+        
+        Args:
+            p: Probability of applying the augmentation (0.0 to 1.0).
+            sigma1: Sigma for first (narrower) Gaussian.
+            sigma2: Sigma for second (wider) Gaussian. Should be > sigma1.
+            gray_strategy: Grayscale conversion method - "luma" or "mean".
+        """
+        self.p = p
+        self.s1 = float(sigma1)
+        self.s2 = float(sigma2)
+        if self.s1 >= self.s2:
+            self.s1, self.s2 = self.s2 / 2.0, self.s2
+        self.gray_strategy = gray_strategy
+        
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Apply Difference of Gaussians to the image.
+        
+        Args:
+            labels: Dictionary containing 'img' key with image array.
+            
+        Returns:
+            Dictionary with image having DoG channel appended.
+        """
+        if not self.p:
+            return labels
+            
+        img = labels["img"]
+        g = _to_gray(img, self.gray_strategy)
+        k1 = int(2 * np.ceil(3 * self.s1) + 1)
+        k2 = int(2 * np.ceil(3 * self.s2) + 1)
+        b1 = cv2.GaussianBlur(g, (k1, k1), self.s1)
+        b2 = cv2.GaussianBlur(g, (k2, k2), self.s2)
+        dog = np.abs(b1.astype(np.int16) - b2.astype(np.int16)).astype(np.float32)
+        out = cv2.normalize(dog, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        labels["img"] = _append_channels(img, [out])
+        return labels
+
+
+class RidgeFilters:
+    """
+    Apply Hessian-based ridge detection and append as a channel.
+    
+    Computes ridge strength using eigenvalues of the Hessian matrix,
+    useful for detecting vessel-like structures and ridges in images.
+    
+    Attributes:
+        p (float): Probability of applying the augmentation. Default is 1.0.
+        sigma (float): Sigma for Gaussian pre-smoothing. Default is 1.5.
+        mode (str): Ridge type - "bright" for bright ridges on dark background,
+                    "dark" for dark ridges on bright background.
+        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
+    
+    Examples:
+        >>> from ultralytics.data.augment import AddRidgeFilters
+        >>> import numpy as np
+        >>> augmenter = AddRidgeFilters(p=0.5, sigma=2.0, mode="bright")
+        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        >>> labels = {"img": image}
+        >>> augmented = augmenter(labels)
+    """
+    
+    def __init__(
+        self,
+        p: bool = False,
+        sigma: float = 1.5,
+        mode: Literal["bright", "dark"] = "bright",
+        gray_strategy: Literal["luma", "mean"] = "luma"
+    ) -> None:
+        """
+        Initialize AddRidgeFilters augmentation.
+        
+        Args:
+            p: Probability of applying the augmentation (0.0 to 1.0).
+            sigma: Sigma for Gaussian smoothing before Hessian computation.
+            mode: Ridge polarity - "bright" or "dark".
+            gray_strategy: Grayscale conversion method - "luma" or "mean".
+        """
+        self.p = p
+        self.sigma = float(max(0.1, sigma))
+        self.mode = mode
+        self.gray_strategy = gray_strategy
+        
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Apply ridge detection to the image.
+        
+        Args:
+            labels: Dictionary containing 'img' key with image array.
+            
+        Returns:
+            Dictionary with image having ridge strength channel appended.
+        """
+        if not self.p:
+            return labels
+            
+        img = labels["img"]
+        g = _to_gray(img, self.gray_strategy).astype(np.float32)
+        k = int(2 * np.ceil(3 * self.sigma) + 1)
+        g = cv2.GaussianBlur(g, (k, k), self.sigma)
+        
+        Ixx = cv2.Sobel(g, cv2.CV_32F, 2, 0, ksize=3)
+        Iyy = cv2.Sobel(g, cv2.CV_32F, 0, 2, ksize=3)
+        Ixy = cv2.Sobel(g, cv2.CV_32F, 1, 1, ksize=3)
+        
+        tr = Ixx + Iyy
+        det = Ixx * Iyy - Ixy * Ixy
+        disc = np.sqrt(np.maximum(tr * tr - 4.0 * det, 0.0))
+        lam1 = 0.5 * (tr + disc)
+        lam2 = 0.5 * (tr - disc)
+        
+        if self.mode == "bright":
+            ridge = np.maximum(0.0, -lam2)
+        else:
+            ridge = np.maximum(0.0, lam2)
+            
+        out = cv2.normalize(ridge, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        labels["img"] = _append_channels(img, [out])
         return labels
 
 class Format:
@@ -3073,6 +3969,17 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             RandomFlip(direction="vertical", p=hyp.flipud, flip_idx=flip_idx),
             RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
+            SobelEdges(getattr(hyp, "sobel_p", False)),
+            CannyEdges(getattr(hyp, "canny_p", False)),
+            LoGEdge(getattr(hyp, "log_p", False)),
+            StructureTensor(getattr(hyp, "stt_p", False)),
+            LBP(getattr(hyp, "lbp_p", False)),
+            GaussianPyramid(getattr(hyp, "gaussian_pyramid_p", False)),
+            LaplacianPyramid(getattr(hyp, "laplacian_pyramid_p", False)),
+            SteerableFilters(getattr(hyp, "stl_p", False)),
+            Gabor(getattr(hyp, "gabor_p", False)),
+            DoG(getattr(hyp, "dog_p", False)),
+            RidgeFilters(getattr(hyp, "ridge_p", False)),
         ]
     )  # transforms
 
