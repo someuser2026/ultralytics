@@ -395,63 +395,355 @@ class WeightedAdd(nn.Module):
 
 class Fusion(nn.Module):
     """
-    Flexible fusion module supporting multiple fusion strategies (E32 variants).
+    Enhanced flexible fusion module supporting multiple fusion strategies (E32 variants).
     
-    Fusion modes:
-        - 'add': Element-wise addition (E32b)
-          Requires aligned channels, efficient but assumes equal importance
-        
-        - 'weighted': BiFPN-style learned weighted sum (E32d for BiFPN)
-          Learns optimal weights for each input, best for iterative refinement
-        
-        - 'concat': Concatenation + 1x1 projection (E32a)
-          Most flexible, preserves all information but adds parameters
+    Fusion Modes:
+        1. 'add': Element-wise addition (E32b)
+           - Requires aligned channels (all c_in must equal c_out)
+           - Most efficient, no extra parameters
+           - Assumes equal importance of all inputs
+           
+        2. 'weighted': BiFPN-style learned static weights (E32d)
+           - Fast normalized fusion with learnable scalar weights
+           - Each input gets a learned weight, normalized to sum to 1
+           - More flexible than 'add', minimal parameter overhead
+           
+        3. 'concat': Concatenation + 1x1 projection (E32a)
+           - Concatenates all inputs along channel dimension
+           - Projects concatenated features to c_out via 1x1 conv
+           - Preserves all information, highest parameter count
+           
+        4. 'adapool': Adaptive pooling fusion (similar to AugFPN E5)
+           - Concatenates inputs
+           - Applies adaptive average pooling to (bins × bins) resolution
+           - Upsamples pooled features back to original size
+           - Adds as residual to concatenated features
+           - Projects to c_out via 1x1 conv
+           - Captures multi-scale context information
+           
+        5. 'fc': Data-dependent MLP gating (NEW - dynamic fusion)
+           - Uses global average pooling + MLP to compute input weights
+           - Weights are data-dependent (change per sample)
+           - Two variants:
+             * Scalar gating (fc_channel=False): One weight per input
+             * Per-channel gating (fc_channel=True): C weights per input
     
     Args:
-        mode: Fusion strategy ('add' | 'weighted' | 'concat')
-        c_in: List of input channel counts
-        c_out: Output channel count after fusion
+        mode (str): Fusion strategy - 'add' | 'weighted' | 'concat' | 'adapool' | 'fc'
+        c_in (List[int]): Input channel counts for each input feature
+        c_out (int): Output channel count after fusion
+        bins (int): Pooling resolution for 'adapool' mode (default: 3)
+                    E.g., bins=3 pools to 3×3 grid
+        fc_hidden (int | None): Hidden size for MLP in 'fc' mode
+                                If None, auto-computed as max(128, total_channels // 2)
+        fc_channel (bool): If True, use per-channel gating in 'fc' mode
+                           If False, use scalar gating (one weight per input)
     
-    Example:
-        >>> # Concat fusion: [256, 256] -> concat -> 512 -> project -> 256
-        >>> fuse = Fusion('concat', [256, 256], 256)
-        >>> # Weighted fusion: learns weights for [feat1, feat2]
-        >>> fuse_w = Fusion('weighted', [256, 256], 256)
+    Examples:
+        >>> # Simple addition (requires aligned channels)
+        >>> fuse_add = Fusion('add', [256, 256], 256)
+        
+        >>> # BiFPN weighted fusion
+        >>> fuse_weighted = Fusion('weighted', [256, 256], 256)
+        
+        >>> # Concatenation fusion
+        >>> fuse_concat = Fusion('concat', [128, 256, 512], 256)
+        
+        >>> # Adaptive pooling fusion (AugFPN-style)
+        >>> fuse_adapool = Fusion('adapool', [256, 256], 256, bins=3)
+        
+        >>> # Data-dependent scalar gating
+        >>> fuse_fc_scalar = Fusion('fc', [256, 256, 256], 256, fc_hidden=256, fc_channel=False)
+        
+        >>> # Data-dependent per-channel gating
+        >>> fuse_fc_channel = Fusion('fc', [256, 256, 256], 256, fc_hidden=512, fc_channel=True)
+    
+    References:
+        - 'weighted': EfficientDet (CVPR 2020)
+        - 'adapool': AugFPN (arXiv 2020)
+        - 'fc': Inspired by attention mechanisms and adaptive fusion
     """
-    def __init__(self, mode: str, c_in: List[int], c_out: int):
+    def __init__(
+        self,
+        mode: str,
+        c_in: List[int],
+        c_out: int,
+        bins: int = 3,
+        fc_hidden: Optional[int] = None,
+        fc_channel: bool = False,
+    ):
         super().__init__()
         mode = mode.lower()
         self.mode = mode
+        self.c_in = list(c_in)
+        self.c_out = int(c_out)
+        self.bins = int(bins)
+        self.fc_channel = bool(fc_channel)
         
+        # Number of inputs to fuse
+        self.num_inputs = len(c_in)
+
+        # =====================================================================
+        # MODE: WEIGHTED (BiFPN-style learned static weights)
+        # =====================================================================
         if mode == 'weighted':
-            self.fuser = WeightedAdd(len(c_in))
+            # Learnable weights for each input (normalized during forward)
+            self.fuser = WeightedAdd(self.num_inputs)
             self.project = nn.Identity()
+
+        # =====================================================================
+        # MODE: CONCAT (concatenation + 1x1 projection)
+        # =====================================================================
         elif mode == 'concat':
             self.fuser = nn.Identity()
-            # Concatenate all inputs, then project to c_out
+            # Project concatenated features (sum of all c_in) to c_out
             self.project = Conv(sum(c_in), c_out, k=1, s=1)
+
+        # =====================================================================
+        # MODE: ADD (element-wise addition)
+        # =====================================================================
         elif mode == 'add':
             self.fuser = nn.Identity()
             self.project = nn.Identity()
-            # Note: Assumes all c_in are equal to c_out (enforced by caller)
+            # Note: Assumes all c_in are equal to c_out (enforced by caller via normalize_channels)
+
+        # =====================================================================
+        # MODE: ADAPOOL (adaptive pooling fusion with residual)
+        # =====================================================================
+        elif mode == 'adapool':
+            # Validate bins parameter
+            assert self.bins >= 1, f"bins must be >= 1 for 'adapool', got {self.bins}"
+            
+            self.fuser = nn.Identity()
+            # Project concatenated + pooled features to c_out
+            self.project = Conv(sum(c_in), c_out, k=1, s=1)
+            
+            # No additional learnable parameters needed
+            # Pooling and upsampling are done in forward()
+
+        # =====================================================================
+        # MODE: FC (data-dependent MLP gating)
+        # =====================================================================
+        elif mode == 'fc':
+            # Validate that all inputs have same channels (required for FC gating)
+            T = self.num_inputs  # Number of inputs to fuse
+            C = c_in[0]          # Channels per input
+            
+            if not all(ci == C for ci in c_in):
+                raise ValueError(
+                    f"'fc' fusion requires all inputs to have the same channels. "
+                    f"Got {c_in}. Enable normalize_channels=True in neck config."
+                )
+            
+            # Total feature dimension after GAP and concatenation
+            in_dim = T * C
+            
+            # Auto-compute hidden size if not provided
+            if fc_hidden is None:
+                fc_hidden = max(128, in_dim // 2)
+            
+            # ===== Build MLP for gating =====
+            if self.fc_channel:
+                # Per-channel gating: output is (T * C) logits
+                # Reshaped to (T, C) and softmax over T dimension
+                # Each channel gets independent weights across inputs
+                self.mlp = nn.Sequential(
+                    nn.Linear(in_dim, fc_hidden, bias=True),
+                    nn.SiLU(inplace=True),
+                    nn.Linear(fc_hidden, T * C, bias=True),
+                )
+            else:
+                # Scalar gating: output is T logits
+                # Softmax over T gives one weight per input
+                # All channels of an input share the same weight
+                self.mlp = nn.Sequential(
+                    nn.Linear(in_dim, fc_hidden, bias=True),
+                    nn.SiLU(inplace=True),
+                    nn.Linear(fc_hidden, T, bias=True),
+                )
+            
+            # Global average pooling to get per-input descriptors
+            self.gap = nn.AdaptiveAvgPool2d(1)  # (B, C, H, W) -> (B, C, 1, 1)
+            self.project = nn.Identity()
+
         else:
-            raise ValueError(f"Unsupported fusion mode: {mode}. Use 'add', 'weighted', or 'concat'")
+            raise ValueError(
+                f"Unsupported fusion mode: '{mode}'. "
+                f"Supported modes: 'add', 'weighted', 'concat', 'adapool', 'fc'"
+            )
 
     def forward(self, xs: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Forward pass through fusion module.
+        
+        Args:
+            xs: List of input tensors to fuse
+                Each tensor has shape (B, C_i, H, W) where C_i = self.c_in[i]
+                For 'add' and 'fc' modes, all C_i must be equal
+        
+        Returns:
+            Fused tensor of shape (B, c_out, H, W)
+        
+        Raises:
+            RuntimeError: If invalid fusion mode state (should never happen)
+            AssertionError: If input shapes are incompatible
+        """
+        # Validate input count
+        assert len(xs) == self.num_inputs, \
+            f"Expected {self.num_inputs} inputs, got {len(xs)}"
+        
+        # Validate spatial dimensions (all inputs must have same H, W)
+        H, W = xs[0].shape[-2:]
+        for i, x in enumerate(xs[1:], 1):
+            assert x.shape[-2:] == (H, W), \
+                f"Input {i} spatial size {x.shape[-2:]} != reference {(H, W)}. " \
+                f"All inputs must have same spatial dimensions."
+        
+        # =====================================================================
+        # CONCAT MODE: Concatenate along channel dim + 1x1 projection
+        # =====================================================================
         if self.mode == 'concat':
-            # Concatenate along channel dimension
+            # Concatenate: [B,C1,H,W], [B,C2,H,W], ... -> [B, sum(Ci), H, W]
             y = torch.cat(xs, dim=1)
+            # Project to output channels
             return self.project(y)
-        elif self.mode == 'weighted':
-            # Learned weighted sum
+
+        # =====================================================================
+        # WEIGHTED MODE: BiFPN-style learned weighted sum
+        # =====================================================================
+        if self.mode == 'weighted':
+            # WeightedAdd computes: sum_i (w_i / sum_j(w_j)) * x_i
             y = self.fuser(xs)
             return self.project(y)
-        else:  # add
-            # Simple element-wise addition
+
+        # =====================================================================
+        # ADD MODE: Simple element-wise addition
+        # =====================================================================
+        if self.mode == 'add':
+            # Initialize with first input
             y = xs[0]
+            # Add remaining inputs
             for t in xs[1:]:
                 y = y + t
             return self.project(y)
+
+        # =====================================================================
+        # ADAPOOL MODE: Adaptive pooling with residual connection
+        # =====================================================================
+        if self.mode == 'adapool':
+            # Step 1: Concatenate all inputs
+            y = torch.cat(xs, dim=1)  # (B, sum(C_i), H, W)
+            
+            # Step 2: Adaptive average pooling to (bins × bins) resolution
+            # This captures multi-scale context at a fixed resolution
+            pooled = F.adaptive_avg_pool2d(y, (self.bins, self.bins))  # (B, sum(C_i), bins, bins)
+            
+            # Step 3: Upsample pooled features back to original spatial size
+            # Uses nearest neighbor to match FPN's upsampling strategy
+            pooled_up = F.interpolate(pooled, size=y.shape[-2:], mode='nearest')  # (B, sum(C_i), H, W)
+            
+            # Step 4: Residual connection with numerical stability
+            # Add small epsilon to prevent gradient issues in case of near-zero features
+            y = y + pooled_up + 1e-6
+            
+            # Step 5: Project to output channels
+            return self.project(y)
+
+        # =====================================================================
+        # FC MODE: Data-dependent MLP gating
+        # =====================================================================
+        if self.mode == 'fc':
+            B, C, H, W = xs[0].shape
+            T = len(xs)  # Number of inputs
+            
+            # Step 1: Global average pooling for each input
+            # Reduces spatial dimensions to get per-input descriptors
+            gs = [self.gap(t).flatten(1) for t in xs]  # Each: (B, C)
+            
+            # Step 2: Concatenate descriptors
+            g = torch.cat(gs, dim=1)  # (B, T*C)
+            
+            # Step 3: Check if gradient checkpointing is needed for memory efficiency
+            in_dim = T * C
+            use_checkpoint = in_dim > 10000  # Threshold for large models
+            
+            # ===== Per-channel gating variant =====
+            if self.fc_channel:
+                # Step 3a: MLP produces logits for each input-channel pair
+                # Use gradient checkpointing for very large feature dimensions
+                if use_checkpoint and self.training:
+                    from torch.utils.checkpoint import checkpoint
+                    logits = checkpoint(self.mlp, g, use_reentrant=False)
+                else:
+                    logits = self.mlp(g)  # (B, T*C)
+                
+                # Step 4a: Reshape to separate inputs and channels
+                logits = logits.view(B, T, C)  # (B, T, C)
+                
+                # Step 5a: Softmax over inputs (dim=1) for each channel independently
+                # This gives T weights per channel that sum to 1
+                w = torch.softmax(logits, dim=1)  # (B, T, C)
+                
+                # Step 6a: Weighted sum with per-channel weights
+                # Using Kahan summation for numerical stability with many inputs
+                if T > 10:  # Use stable summation for many inputs
+                    out = torch.zeros_like(xs[0])
+                    compensation = torch.zeros_like(xs[0])  # Kahan summation compensation
+                    
+                    for i, xi in enumerate(xs):
+                        # Extract weights for input i: (B, C, 1, 1)
+                        wi = w[:, i, :].unsqueeze(-1).unsqueeze(-1).to(xi.dtype)
+                        
+                        # Kahan summation algorithm for numerical stability
+                        y_term = xi * wi - compensation
+                        t = out + y_term
+                        compensation = (t - out) - y_term
+                        out = t
+                else:
+                    # Standard summation for few inputs
+                    out = sum(xi * w[:, i, :].unsqueeze(-1).unsqueeze(-1).to(xi.dtype) 
+                             for i, xi in enumerate(xs))
+                
+                return self.project(out)
+            
+            # ===== Scalar gating variant =====
+            else:
+                # Step 3b: MLP produces scalar logit per input
+                # Use gradient checkpointing for very large feature dimensions
+                if use_checkpoint and self.training:
+                    from torch.utils.checkpoint import checkpoint
+                    logits = checkpoint(self.mlp, g, use_reentrant=False)
+                else:
+                    logits = self.mlp(g)  # (B, T)
+                
+                # Step 4b: Softmax over inputs (dim=1)
+                # This gives T weights that sum to 1 (one per input)
+                w = torch.softmax(logits, dim=1)  # (B, T)
+                
+                # Step 5b: Weighted sum with scalar weights
+                # Using Kahan summation for numerical stability with many inputs
+                if T > 10:  # Use stable summation for many inputs
+                    out = torch.zeros_like(xs[0])
+                    compensation = torch.zeros_like(xs[0])  # Kahan summation compensation
+                    
+                    for i, xi in enumerate(xs):
+                        # Broadcast scalar weight: (B, 1, 1, 1)
+                        wi = w[:, i].view(B, 1, 1, 1).to(xi.dtype)
+                        
+                        # Kahan summation algorithm
+                        y_term = xi * wi - compensation
+                        t = out + y_term
+                        compensation = (t - out) - y_term
+                        out = t
+                else:
+                    # Standard summation for few inputs
+                    out = sum(xi * w[:, i].view(B, 1, 1, 1).to(xi.dtype) 
+                             for i, xi in enumerate(xs))
+                
+                return self.project(out)
+
+        # Should never reach here if mode is valid
+        raise RuntimeError(f"Invalid fusion mode state: {self.mode}")
 
 
 # ================================ BASE NECK ================================
@@ -501,6 +793,10 @@ class BaseNeck(nn.Module):
         self.in_channels = list(in_channels)
         self.out_channels = out_channels
         self.normalize_channels = cfg.get('normalize_channels', True)
+
+        self.fusion_bins = cfg.get("fusion_bins", 3)
+        self.fusion_fc_hidden = cfg.get("fusion_fc_hidden", None)
+        self.fusion_fc_channel = cfg.get("fusion_fc_channel", False)
         
         # Build channel alignment layers (1x1 convs or Identity)
         self.align = make_align_layers(self.in_channels, self.out_channels, self.normalize_channels)
@@ -634,7 +930,12 @@ class FPN(BaseNeck):
         # Fusion modules for combining lateral and top-down features
         # (Not needed for topmost level)
         self._fusions = nn.ModuleList([
-            Fusion(self.fusion_mode, [self.out_channels, self.out_channels], self.out_channels)
+            Fusion(
+                self.fusion_mode, [self.out_channels, self.out_channels], self.out_channels,
+                bins = self.fusion_bins,
+                fc_hidden = self.fusion_fc_hidden,
+                fc_channel = self.fusion_fc_channel
+            )
             for _ in range(L - 1)
         ])
 
@@ -723,7 +1024,7 @@ class PANet(BaseNeck):
         
         # Bottom-up fusion modules
         self.bu_fuse = nn.ModuleList([
-            Fusion(self.fusion_mode, [self.out_channels, self.out_channels], self.out_channels)
+            Fusion(self.fusion_mode, [self.out_channels, self.out_channels], self.out_channels, self.fusion_bins, self.fusion_fc_hidden, self.fusion_fc_channel)
             for _ in range(L - 1)
         ])
         
@@ -804,7 +1105,7 @@ class PAFPN(BaseNeck):
         # Top-down path components
         self.td_upsample = nn.ModuleList([nn.Upsample(scale_factor=2, mode='nearest') for _ in range(L - 1)])
         self.td_fuse = nn.ModuleList([
-            Fusion('concat', [self.out_channels, self.out_channels], self.out_channels) for _ in range(L - 1)
+            Fusion('concat', [self.out_channels, self.out_channels], self.out_channels, self.fusion_bins, self.fusion_fc_hidden, self.fusion_fc_channel) for _ in range(L - 1)
         ])
         self.td_smooth = nn.ModuleList([smooth_3x3(self.out_channels, self.conv_cfg, dcn=self._dcn("smooth_td", i)) for i in range(L - 1)])
 
@@ -814,7 +1115,7 @@ class PAFPN(BaseNeck):
             for i in range(L - 1)
         ])
         self.bu_fuse = nn.ModuleList([
-            Fusion('concat', [self.out_channels, self.out_channels], self.out_channels) for _ in range(L - 1)
+            Fusion('concat', [self.out_channels, self.out_channels], self.out_channels, self.fusion_bins, self.fusion_fc_hidden, self.fusion_fc_channel) for _ in range(L - 1)
         ])
         self.bu_smooth = nn.ModuleList([smooth_3x3(self.out_channels, self.conv_cfg, dcn=self._dcn("smooth_bu", i)) for i in range(L - 1)])
 

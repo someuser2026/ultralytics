@@ -192,9 +192,12 @@ class DetectionValidator(BaseValidator):
             cls = pbatch["cls"].cpu().numpy()
             areas = pbatch["areas"].cpu().numpy()
             no_pred = predn["cls"].shape[0] == 0
+
+            processed = self._process_batch(pred, pbatch)
+
             self.metrics.update_stats(
                 {
-                    **self._process_batch(predn, pbatch),
+                    **processed,
                     "target_cls": cls,
                     "target_img": np.unique(cls),
                     "target_areas": areas,

@@ -411,6 +411,11 @@ def boundary_iou(
 
     gt_b = _extract_boundary(mask_gt).bool()
     pr_b = _extract_boundary(mask_pred).bool()
+    
+    # ADD: Check if boundaries exist
+    gt_b_count = gt_b.sum(dim=(1, 2)).float()
+    pr_b_count = pr_b.sum(dim=(1, 2)).float()
+    has_boundary = (gt_b_count > 0) | (pr_b_count > 0)
 
     if tolerance > 0:
         k = 2 * tolerance + 1
@@ -429,7 +434,12 @@ def boundary_iou(
 
     inter = (gt_b & pr_b).sum(dim=(1, 2)).float()
     union = (gt_b | pr_b).sum(dim=(1, 2)).float()
-    return inter / (union + eps)
+    biou = inter / (union + eps)
+    
+    # CHANGE: Set to 0 where no boundaries exist
+    biou = torch.where(has_boundary, biou, torch.zeros_like(biou))
+    
+    return biou
 
 
 
@@ -1062,9 +1072,9 @@ def ap_per_class(
     Compute AP per class with size-based breakdown.
     
     Size categories (COCO standard):
-    - Small: area < 32²  (1024 pixels²)
-    - Medium: 32² ≤ area < 96² (1024-9216 pixels²)
-    - Large: area ≥ 96² (≥9216 pixels²)
+    - Small: area < 15^2  (225 pixels²)
+    - Medium: 15^2 ≤ area < 32^2 (225-1024 pixels²)
+    - Large: area ≥ 32^2 (≥1024 pixels²)
     """
     # Sort by objectness
     i = np.argsort(-conf)
@@ -1083,8 +1093,8 @@ def ap_per_class(
     ap, p_curve, r_curve = np.zeros((nc, tp.shape[1])), np.zeros((nc, 1000)), np.zeros((nc, 1000))
     
     # Size-based AP
-    SMALL_THRESHOLD = 32 * 32
-    MEDIUM_THRESHOLD = 96 * 96
+    SMALL_THRESHOLD = 15 * 15
+    MEDIUM_THRESHOLD = 32 * 32
     ap_small = np.zeros(nc)
     ap_medium = np.zeros(nc)
     ap_large = np.zeros(nc)
