@@ -2323,7 +2323,7 @@ class RandomCLAHE:
             rgb_channels = deepcopy(channels)[:3]
             non_rgb_channels = deepcopy(channels)[3:]
             rgb_channels = [clahe.apply(ch) for ch in rgb_channels]
-            new_channels = list(rgb_channels) + non_rgb_channels
+            new_channels = list(rgb_channels) + list(non_rgb_channels)
             img = cv2.merge(new_channels)
 
         labels["img"] = img.astype(dtype)
