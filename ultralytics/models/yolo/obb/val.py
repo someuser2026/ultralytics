@@ -94,9 +94,19 @@ class OBBValidator(DetectionValidator):
             >>> correct_matrix = validator._process_batch(detections, gt_bboxes, gt_cls)
         """
         if batch["cls"].shape[0] == 0 or preds["cls"].shape[0] == 0:
-            return {"tp": np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)}
+            return {
+                "tp": np.zeros((preds["cls"].shape[0], self.niou), dtype=bool),
+                "matched_gt_idx": np.full(preds["cls"].shape[0], -1, dtype=np.int32),
+            }
         iou = batch_probiou(batch["bboxes"], preds["bboxes"])
-        return {"tp": self.match_predictions(preds["cls"], batch["cls"], iou).cpu().numpy()}
+        tp, matched_gt_idx = self.match_predictions(
+            preds["cls"], batch["cls"], iou, return_matched_indices=True
+        )
+        
+        return {
+            "tp": tp.cpu().numpy(),
+            "matched_gt_idx": matched_gt_idx,  # ADD: Which GT each prediction matched to
+        }
 
     def postprocess(self, preds: torch.Tensor) -> list[dict[str, torch.Tensor]]:
         """
@@ -136,9 +146,13 @@ class OBBValidator(DetectionValidator):
         ratio_pad = batch["ratio_pad"][si]
         if cls.shape[0]:
             bbox[..., :4].mul_(torch.tensor(imgsz, device=self.device)[[1, 0, 1, 0]])  # target boxes
+            areas = bbox[..., 2] * bbox[..., 3]
+        else:
+            areas = torch.zeros(0, device = self.device)
         return {
             "cls": cls,
             "bboxes": bbox,
+            "areas": areas,
             "ori_shape": ori_shape,
             "imgsz": imgsz,
             "ratio_pad": ratio_pad,

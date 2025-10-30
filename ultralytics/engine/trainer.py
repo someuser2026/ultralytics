@@ -156,12 +156,12 @@ class BaseTrainer:
         # Model and Dataset
         self.model = check_model_file_from_stem(self.args.model)  # add suffix, i.e. yolo11n -> yolo11n.pt
         with torch_distributed_zero_first(LOCAL_RANK):  # avoid auto-downloading dataset multiple times
-            print("-*"*50)
-            print("inside base/trainer.py 160")
-            print("args:", self.args)
+            # print("-*"*50)
+            # print("inside base/trainer.py 160")
+            # print("args:", self.args)
             self.data = self.get_dataset()
-            print("data:", self.data)
-            print("-*"*50)
+            # print("data:", self.data)
+            # print("-*"*50)
 
         self.ema = None
 

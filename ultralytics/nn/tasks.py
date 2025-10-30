@@ -367,6 +367,12 @@ class BaseModel(torch.nn.Module):
 
         if preds is None:
             preds = self.forward(batch["img"])
+            # print("-"*50)
+            # print("inside nn/tasks.py 370")
+            # print("OBB preds len:", len(preds), "types:", [type(p) for p in preds])
+            # if isinstance(preds[0], (list, tuple)):
+            #     print("preds[0] is list/tuple with len:", len(preds[0]))            
+            # print("-"*50)
         return self.criterion(preds, batch)
 
     def init_criterion(self):
