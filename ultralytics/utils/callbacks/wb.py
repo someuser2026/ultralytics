@@ -267,6 +267,7 @@ def on_train_end(trainer):
                 imgsz=getattr(trainer.args, "imgsz", None),
                 conf=getattr(trainer.args, "conf", 0.001),
                 iou=getattr(trainer.args, "iou", 0.7),
+                fitness_weights = getattr(trainer.args, "fitness_weights", None),
                 plots=False,  # Disable plot generation/saving
                 save_json=False,  # Optional: disable JSON saving
                 verbose=False,  # Optional: reduce console output
@@ -294,9 +295,10 @@ def on_train_end(trainer):
         error_info = {
             "test_eval_error": str(e),
             "test_eval_error_type": type(e).__name__,
-            # "test_eval_traceback": traceback.format_exc(),
+            "test_eval_traceback": e,
         }
-        LOGGER.info(error_info)
+        # LOGGER.info(error_info)
+        LOGGER.error(e)
         wb.run.summary.update({"test_eval_failed": True})
 
     # Finish the run (existing behavior)

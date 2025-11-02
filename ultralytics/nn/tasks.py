@@ -461,6 +461,7 @@ class DetectionModel(BaseModel):
             m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
             # print("-"*50)
             # print("Inside task.py 439")
+            # print("s:", s)
             # print("m.stride:", m.stride)
             # print("-"*50)
             self.stride = m.stride

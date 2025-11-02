@@ -58,7 +58,7 @@ class OBBValidator(DetectionValidator):
         """
         super().__init__(dataloader, save_dir, args, _callbacks)
         self.args.task = "obb"
-        self.metrics = OBBMetrics(fitness_weights = args.fitness_weights)
+        self.metrics = OBBMetrics(fitness_weights = self.args.fitness_weights)
 
     def init_metrics(self, model: torch.nn.Module) -> None:
         """

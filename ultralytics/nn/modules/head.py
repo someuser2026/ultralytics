@@ -282,7 +282,16 @@ class Segment(Detect):
         # DEBUG (remove after it passes)
         # assert x[0].shape[1] == self.nm, f"Proto nm={self.nm}, got x0 C={x[0].shape[1]}"
 
+        # if not hasattr(self, "_dbg_once"):
+        #     print("SEG inputs:", [tuple(t.shape) for t in x], flush=True)
+        #     self._dbg_once = True
+        
         p = self.proto(x[0])  # mask protos
+
+        # if not hasattr(self, "_dbg_proto"):
+        #     print(f"[PROTO] mean={p.mean().item():.4f} std={p.std().item():.4f} shape={tuple(p.shape)}", flush=True)
+        #     self._dbg_proto = True
+        
         bs = p.shape[0]  # batch size
 
         mc = torch.cat([self.cv4[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)  # mask coefficients
