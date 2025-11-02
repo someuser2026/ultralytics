@@ -27,120 +27,6 @@ try:
 except Exception:
     _HAS_SCI_CV = False
 
-def _safe_u8(x: torch.Tensor) -> torch.Tensor:
-    return (x > 0.5).to(torch.uint8) if x.dtype.is_floating_point else x.to(torch.uint8)
-
-@torch.no_grad()
-def _debug_mask_alignment(
-    i_img: int,
-    fg_mask_i: torch.Tensor,
-    target_gt_idx_i: torch.Tensor,
-    proto_i: torch.Tensor,                 # (P,Hp,Wp)
-    mxyxy_i: torch.Tensor,                 # (Npos,4) in proto space
-    marea_i: torch.Tensor,                 # (Npos,)
-    masks_i: torch.Tensor,                 # (Hfull,Wfull) if overlap=True (label map) else ignored here
-    masks_full_batch: torch.Tensor,        # (B, Hfull, Wfull) or (B, Ninst, Hfull, Wfull) if overlap=False
-    batch_idx: torch.Tensor,
-    overlap: bool,
-    debug_max: int = 4,
-):
-    # Proto dims
-    Hp, Wp = int(proto_i.shape[-2]), int(proto_i.shape[-1])
-
-    # Build the per-image downsampled GT mask tensor @ proto resolution
-    if overlap:
-        # integer-labeled map per image → one-hot slices for selected instances
-        # NOTE: target_gt_idx_i holds indices of GT objects for positives
-        pos_idx = target_gt_idx_i[fg_mask_i]                  # (Npos,)
-        if pos_idx.numel() == 0: 
-            return
-        # Validate labels exist in label map
-        max_label = int(masks_i.max().item()) if masks_i.numel() else -1
-        bad = (pos_idx + 1) > max_label
-        if bad.any():
-            raise AssertionError(f"[align] image {i_img}: some mask_idx (+1) not in label map. max_label={max_label}, bad_idx={pos_idx[bad][:8].tolist()}")
-
-        # Downsample once to (Hp,Wp)
-        mi = masks_i.unsqueeze(0).unsqueeze(0).float()           # (1,1,H,W)
-        mi_ds = F.interpolate(mi, size=(Hp, Wp), mode="nearest")[0,0]  # (Hp,Wp), ints preserved
-        # Gather per-instance planes
-        gt_stack = torch.stack([(mi_ds == (k.item()+1)).to(torch.float32) for k in pos_idx], dim=0)  # (Npos,Hp,Wp)
-    else:
-        # Non-overlap: masks_full_batch is (B, Ninst, H, W)
-        sel = (batch_idx.view(-1) == i_img)
-        insts = masks_full_batch[sel]  # (Ninst_i, H, W)
-        pos_idx = target_gt_idx_i[fg_mask_i]
-        if pos_idx.numel() == 0:
-            return
-        if pos_idx.max().item() >= insts.shape[0]:
-            raise AssertionError(f"[align] image {i_img}: target_gt_idx out of range (max={pos_idx.max().item()}, ninst={insts.shape[0]}).")
-        # Downsample to (Hp,Wp)
-        insts_ds = F.interpolate(insts.float(), size=(Hp, Wp), mode="nearest")  # (Ninst_i,Hp,Wp)
-        gt_stack = insts_ds[pos_idx.long()]  # (Npos,Hp,Wp)
-
-    # Binarize
-    gt_stack = (gt_stack > 0.5).to(proto_i.dtype)  # (Npos,Hp,Wp)
-
-    # Basic per-positive checks (limit prints)
-    mxyxy_pos = mxyxy_i[fg_mask_i]               # (Npos,4)
-    marea_pos = marea_i[fg_mask_i]               # (Npos,)
-    Npos = int(mxyxy_pos.shape[0])
-    K = min(debug_max, Npos)
-    for k in range(K):
-        x1,y1,x2,y2 = mxyxy_pos[k]
-        # bounds & size
-        if not (0 <= x1 <= Wp and 0 <= x2 <= Wp and 0 <= y1 <= Hp and 0 <= y2 <= Hp):
-            raise AssertionError(f"[align] img {i_img} pos {k}: mxyxy out of proto bounds {(Hp,Wp)} → {(x1.item(),y1.item(),x2.item(),y2.item())}")
-        if (x2 - x1) < 1 or (y2 - y1) < 1:
-            raise AssertionError(f"[align] img {i_img} pos {k}: degenerate crop size: {(x1.item(),y1.item(),x2.item(),y2.item())}")
-
-        # crop GT to its box in proto space
-        gt_k = gt_stack[k:k+1]                                # (1,Hp,Wp)
-        gt_crop = crop_mask(gt_k, mxyxy_pos[k:k+1])[0]        # (h,w)
-        if gt_crop.numel() == 0:
-            raise AssertionError(f"[align] img {i_img} pos {k}: empty crop after crop_mask.")
-
-        # Simple stats
-        pix = int(gt_k.sum().item())
-        pix_crop = int(gt_crop.sum().item())
-        box_area = float((x2 - x1) * (y2 - y1))
-        # IoU between GT crop and a “box raster” (rough sanity only)
-        box_raster = torch.zeros_like(gt_k[0])
-        box_raster[int(y1):int(y2), int(x1):int(x2)] = 1.0
-        box_crop = crop_mask(box_raster.unsqueeze(0), mxyxy_pos[k:k+1])[0]
-        inter = (gt_crop * box_crop).sum().item()
-        union = (gt_crop + box_crop - gt_crop*box_crop).sum().clamp_min(1e-6).item()
-        iou_box = inter / union
-
-        print(f"[align] img {i_img} pos {k}: "
-              f"proto={Hp}x{Wp} gt_pix={pix} crop_pix={pix_crop} "
-              f"box_area≈{box_area:.1f} iou(gt,box)={iou_box:.3f} "
-              f"area_norm={float(marea_pos[k].item()):.4f}",
-              flush=True)
-
-    # Global checks
-    # Strict binarity after nearest downsample (overlap→ label map is allowed >1 before one-hots)
-    if not overlap:
-        u = torch.unique(gt_stack)
-        bad_vals = u[~((u == 0) | (u == 1))]
-        if bad_vals.numel():
-            raise AssertionError(f"[align] Non-binary GT at proto scale: unique={u.tolist()}")
-    
-    try:
-        import cv2, numpy as np, os
-        debug_dir = "runs/_debug_align"
-        os.makedirs(debug_dir, exist_ok=True)
-        K = min(2, gt_stack.shape[0])
-        for k in range(K):
-            canvas = (gt_stack[k].cpu().numpy()*255).astype(np.uint8)   # (Hp,Wp)
-            x1,y1,x2,y2 = [int(v.item()) for v in mxyxy_pos[k]]
-            cv2.rectangle(canvas, (x1,y1), (x2,y2), 128, 1)
-            cv2.imwrite(os.path.join(debug_dir, f"img{i_img}_pos{k}_proto.png"), canvas)
-    except Exception:
-        pass
-
-
-
 def _to_float_tensor(x: torch.Tensor) -> torch.Tensor:
     return x.to(dtype=torch.float32, non_blocking=True)
 
@@ -1075,7 +961,7 @@ class v8SegmentationLoss(v8DetectionLoss):
                     gt_mask = gt_mask.float()
                 else:
                     gt_mask = masks[batch_idx.view(-1) == i][mask_idx]
-                
+                    
                 loss += self.single_mask_loss(
                     gt_mask, pred_masks_i[fg_mask_i], proto_i, mxyxy_i[fg_mask_i], marea_i[fg_mask_i]
                 )
