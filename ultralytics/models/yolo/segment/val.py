@@ -188,8 +188,7 @@ class SegmentationValidator(DetectionValidator):
             gt_masks = F.interpolate(
                 gt_masks[None].float(), 
                 pred_masks.shape[1:], 
-                mode="nearest", 
-                align_corners=False
+                mode="nearest"
             )[0]
             gt_masks = gt_masks.gt_(0.5)
         
