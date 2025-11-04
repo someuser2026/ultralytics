@@ -75,6 +75,7 @@ class SegmentationValidator(DetectionValidator):
         """
         batch = super().preprocess(batch)
         batch["masks"] = batch["masks"].float()
+        self._last_imgsz = tuple(batch["img"].shape[2:])
         return batch
 
     def init_metrics(self, model: torch.nn.Module) -> None:
@@ -118,8 +119,14 @@ class SegmentationValidator(DetectionValidator):
         """
         proto = preds[1][-1] if len(preds[1]) == 3 else preds[1]  # second output is len 3 if pt, but only 1 if exported
         preds = super().postprocess(preds[0])
-        imgsz = [4 * x for x in proto.shape[2:]]  # get image size from proto
+        # imgsz = [4 * x for x in proto.shape[2:]]  # get image size from proto
+        imgsz = self._last_imgsz
         for i, pred in enumerate(preds):
+            # print("-"*50)
+            # print("Inside postprocess function in segment/val.py 126")
+            # print("imgsz", imgsz)
+            # print("pred:", pred)
+            # print("-"*50)
             coefficient = pred.pop("extra")
             pred["masks"] = (
                 self.process(proto[i], coefficient, pred["bboxes"], shape=imgsz)
@@ -181,10 +188,16 @@ class SegmentationValidator(DetectionValidator):
             gt_masks = F.interpolate(
                 gt_masks[None].float(), 
                 pred_masks.shape[1:], 
-                mode="bilinear", 
+                mode="nearest", 
                 align_corners=False
             )[0]
             gt_masks = gt_masks.gt_(0.5)
+        
+        # print("-"*50)
+        # print("Inside _process_batch function in segment/val.py 196")
+        # print("gt_masks.shape", gt_masks.shape)
+        # print("pred_masks.shape", pred_masks.shape)
+        # print("-"*50)
 
         # Compute mask IoU on flattened masks
         iou = mask_iou(

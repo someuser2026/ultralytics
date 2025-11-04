@@ -851,24 +851,25 @@ class v8SegmentationLoss(v8DetectionLoss):
 
         # 1) assemble logits from prototypes
         # Assemble logits from prototypes
-        pred_mask = torch.einsum("in,nhw->ihw", pred, proto)  # (Npos, H, W)
+        C = proto.shape[0]
+        pred_mask = torch.einsum("in,nhw->ihw", pred, proto) / torch.sqrt(C) # (Npos, H, W)
         Npos, H, W = pred_mask.shape
 
-        print("-"*50)
-        print("Inside single_mask_loss function in loss.py 857")
-        print("gt_mask.shape", gt_mask.shape)
-        print("pred.shape", pred.shape)
-        print("proto.shape", proto.shape)
-        print("xyxy.shape", xyxy.shape)
-        print("area.shape", area.shape)
-        print("gt sum", gt_mask.sum())
-        print("pred sum", pred.sum())
-        print("proto sum", proto.sum())
-        print("xyxy sum", xyxy.sum())
-        print("area sum", area.sum())
-        print("pred_mask.shape", pred_mask.shape)
-        print("pred_mask sum", pred_mask.sum())
-        print("-"*50)
+        # print("-"*50)
+        # print("Inside single_mask_loss function in loss.py 857")
+        # print("gt_mask.shape", gt_mask.shape)
+        # print("pred.shape", pred.shape)
+        # print("proto.shape", proto.shape)
+        # print("xyxy.shape", xyxy.shape)
+        # print("area.shape", area.shape)
+        # print("gt sum", gt_mask.sum())
+        # print("pred sum", pred.sum())
+        # print("proto sum", proto.sum())
+        # print("xyxy sum", xyxy.sum())
+        # print("area sum", area.sum())
+        # print("pred_mask.shape", pred_mask.shape)
+        # print("pred_mask sum", pred_mask.sum())
+        # print("-"*50)
 
         # Generate weight map on the same per-anchor gt_mask tensor
         weight_map = None
