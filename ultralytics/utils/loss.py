@@ -852,7 +852,7 @@ class v8SegmentationLoss(v8DetectionLoss):
         # 1) assemble logits from prototypes
         # Assemble logits from prototypes
         C = proto.shape[0]
-        pred_mask = torch.einsum("in,nhw->ihw", pred, proto) / torch.sqrt(C) # (Npos, H, W)
+        pred_mask = torch.einsum("in,nhw->ihw", pred, proto) / (C ** 0.5) # (Npos, H, W)
         Npos, H, W = pred_mask.shape
 
         # print("-"*50)
