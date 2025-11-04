@@ -99,6 +99,8 @@ from .head import (
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
+    RTDETROBBDecoder,
+    RTDETRSegmentDecoder,
     # CascadeRCNNHead
 )
 from .transformer import (
@@ -227,6 +229,8 @@ __all__ = (
     "RecursiveFPN",
     "RepFPN",
     "ScaleEqualizingFPN",
+    "RTDETROBBDecoder",
+    "RTDETRSegmentDecoder",
     # "Mask2FormerHead",
     # "CascadeRCNNHead"
 )

@@ -90,3 +90,105 @@ class RTDETRTrainer(DetectionTrainer):
         """Return a DetectionValidator suitable for RT-DETR model validation."""
         self.loss_names = "giou_loss", "cls_loss", "l1_loss"
         return RTDETRValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args))
+
+
+class RTDETRSegmentTrainer(RTDETRTrainer):
+    """
+    Trainer class for the RT-DETR segmentation model.
+
+    This class extends RTDETRTrainer to adapt to segmentation-specific features and architecture of RT-DETR.
+
+    Attributes:
+        loss_names (tuple): Names of the loss components used for training.
+        data (dict): Dataset configuration containing class count and other parameters.
+        args (dict): Training arguments and hyperparameters.
+
+    Methods:
+        get_model: Initialize and return an RT-DETR segmentation model.
+        get_validator: Return a RTDETRSegmentValidator suitable for RT-DETR segmentation model validation.
+
+    Examples:
+        >>> from ultralytics.models.rtdetr.train import RTDETRSegmentTrainer
+        >>> args = dict(model="rtdetr-l-seg.yaml", data="coco8-seg.yaml", imgsz=640, epochs=3)
+        >>> trainer = RTDETRSegmentTrainer(overrides=args)
+        >>> trainer.train()
+    """
+
+    def get_model(self, cfg: dict | None = None, weights: str | None = None, verbose: bool = True):
+        """
+        Initialize and return an RT-DETR segmentation model.
+
+        Args:
+            cfg (dict, optional): Model configuration.
+            weights (str, optional): Path to pre-trained model weights.
+            verbose (bool): Verbose logging if True.
+
+        Returns:
+            (RTDETRSegmentModel): Initialized model.
+        """
+        from ultralytics.nn.tasks import RTDETRSegmentModel
+
+        model = RTDETRSegmentModel(
+            cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1
+        )
+        if weights:
+            model.load(weights)
+        return model
+
+    def get_validator(self):
+        """Return a RTDETRSegmentValidator suitable for RT-DETR segmentation model validation."""
+        from .val import RTDETRSegmentValidator
+
+        self.loss_names = "giou_loss", "cls_loss", "l1_loss"
+        return RTDETRSegmentValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args))
+
+
+class RTDETROBBTrainer(RTDETRTrainer):
+    """
+    Trainer class for the RT-DETR OBB model.
+
+    This class extends RTDETRTrainer to adapt to OBB-specific features and architecture of RT-DETR.
+
+    Attributes:
+        loss_names (tuple): Names of the loss components used for training.
+        data (dict): Dataset configuration containing class count and other parameters.
+        args (dict): Training arguments and hyperparameters.
+
+    Methods:
+        get_model: Initialize and return an RT-DETR OBB model.
+        get_validator: Return a RTDETROBBValidator suitable for RT-DETR OBB model validation.
+
+    Examples:
+        >>> from ultralytics.models.rtdetr.train import RTDETROBBTrainer
+        >>> args = dict(model="rtdetr-l-obb.yaml", data="dota8.yaml", imgsz=640, epochs=3)
+        >>> trainer = RTDETROBBTrainer(overrides=args)
+        >>> trainer.train()
+    """
+
+    def get_model(self, cfg: dict | None = None, weights: str | None = None, verbose: bool = True):
+        """
+        Initialize and return an RT-DETR OBB model.
+
+        Args:
+            cfg (dict, optional): Model configuration.
+            weights (str, optional): Path to pre-trained model weights.
+            verbose (bool): Verbose logging if True.
+
+        Returns:
+            (RTDETROBBModel): Initialized model.
+        """
+        from ultralytics.nn.tasks import RTDETROBBModel
+
+        model = RTDETROBBModel(
+            cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1
+        )
+        if weights:
+            model.load(weights)
+        return model
+
+    def get_validator(self):
+        """Return a RTDETROBBValidator suitable for RT-DETR OBB model validation."""
+        from .val import RTDETROBBValidator
+
+        self.loss_names = "giou_loss", "cls_loss", "l1_loss"
+        return RTDETROBBValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args))

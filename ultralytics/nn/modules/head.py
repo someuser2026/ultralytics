@@ -21,12 +21,12 @@ from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_in
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Residual, SwiGLUFFN
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
-from .utils import bias_init_with_prob, linear_init
+from .utils import bias_init_with_prob, inverse_sigmoid, linear_init
 
 # from .roi_heads import MaskHead, TwoFCBBoxHead, decode_boxes, encode_boxes, roi_align_pyramid
 # from .rpn import AnchorGenerator, RPNConfig, RPNHead, rpn_inference_single_image
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"#, "CascadeRCNNHead"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "RTDETRSegmentDecoder", "RTDETROBBDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"#, "CascadeRCNNHead"
 
 
 class Detect(nn.Module):
@@ -1192,6 +1192,433 @@ class RTDETRDecoder(nn.Module):
         xavier_uniform_(self.query_pos_head.layers[1].weight)
         for layer in self.input_proj:
             xavier_uniform_(layer[0].weight)
+
+
+class RTDETRSegmentDecoder(RTDETRDecoder):
+    """
+    Real-Time Deformable Transformer Decoder for Segmentation tasks.
+
+    This decoder extends RTDETRDecoder to predict both bounding boxes and segmentation masks.
+
+    Attributes:
+        nm (int): Number of masks.
+        npr (int): Number of prototypes.
+        proto (Proto): Prototype generation module for masks.
+        enc_mask_head (nn.Linear): Encoder mask coefficient head.
+        dec_mask_head (nn.ModuleList): Decoder mask coefficient heads.
+
+    Examples:
+        Create an RTDETRSegmentDecoder
+        >>> decoder = RTDETRSegmentDecoder(nc=80, ch=(512, 1024, 2048), hd=256, nq=300, nm=32, npr=256)
+        >>> x = [torch.randn(1, 512, 64, 64), torch.randn(1, 1024, 32, 32), torch.randn(1, 2048, 16, 16)]
+        >>> outputs = decoder(x)
+    """
+
+    def __init__(
+        self,
+        nc: int = 80,
+        ch: tuple = (512, 1024, 2048),
+        hd: int = 256,
+        nq: int = 300,
+        ndp: int = 4,
+        nh: int = 8,
+        ndl: int = 6,
+        d_ffn: int = 1024,
+        dropout: float = 0.0,
+        act: nn.Module = nn.ReLU(),
+        eval_idx: int = -1,
+        nd: int = 100,
+        label_noise_ratio: float = 0.5,
+        box_noise_scale: float = 1.0,
+        learnt_init_query: bool = False,
+        nm: int = 32,  # number of masks
+        npr: int = 256,  # number of protos
+    ):
+        """
+        Initialize RTDETRSegmentDecoder with segmentation-specific parameters.
+
+        Args:
+            nc (int): Number of classes.
+            ch (tuple): Channels in the backbone feature maps.
+            hd (int): Hidden dimension.
+            nq (int): Number of queries.
+            ndp (int): Number of decoder points.
+            nh (int): Number of heads.
+            ndl (int): Number of decoder layers.
+            d_ffn (int): Feed-forward dimension.
+            dropout (float): Dropout rate.
+            act (nn.Module): Activation function.
+            eval_idx (int): Evaluation index.
+            nd (int): Number of denoising queries.
+            label_noise_ratio (float): Label noise ratio.
+            box_noise_scale (float): Box noise scale.
+            learnt_init_query (bool): Whether to learn initial query embeddings.
+            nm (int): Number of masks.
+            npr (int): Number of prototypes.
+        """
+        super().__init__(
+            nc=nc,
+            ch=ch,
+            hd=hd,
+            nq=nq,
+            ndp=ndp,
+            nh=nh,
+            ndl=ndl,
+            d_ffn=d_ffn,
+            dropout=dropout,
+            act=act,
+            eval_idx=eval_idx,
+            nd=nd,
+            label_noise_ratio=label_noise_ratio,
+            box_noise_scale=box_noise_scale,
+            learnt_init_query=learnt_init_query,
+        )
+        self.nm = nm
+        self.npr = npr
+        # Proto module for mask generation
+        self.proto = Proto(ch[0], self.npr, self.nm)
+
+        # Mask prediction heads
+        self.enc_mask_head = nn.Linear(hd, nm)
+        self.dec_mask_head = nn.ModuleList([nn.Linear(hd, nm) for _ in range(ndl)])
+
+    def forward(self, x: list[torch.Tensor], batch: dict | None = None) -> tuple | torch.Tensor:
+        """
+        Run forward pass returning bounding boxes, scores, mask coefficients, and prototypes.
+
+        Args:
+            x (list[torch.Tensor]): List of feature maps from the backbone.
+            batch (dict, optional): Batch information for training.
+
+        Returns:
+            During training: (dec_bboxes, dec_scores, enc_bboxes, enc_scores, dec_masks, enc_masks, protos, dn_meta)
+            During inference: (y, (dec_bboxes, dec_scores, enc_bboxes, enc_scores, dec_masks, enc_masks, protos, dn_meta))
+                where y is (bs, 300, 4+nc+nm) concatenated tensor
+        """
+        from ultralytics.models.utils.ops import get_cdn_group
+
+        # Generate prototypes from first feature map
+        protos = self.proto(x[0])  # (bs, nm, H, W)
+
+        # Input projection and embedding
+        feats, shapes = self._get_encoder_input(x)
+
+        # Prepare denoising training
+        dn_embed, dn_bbox, attn_mask, dn_meta = get_cdn_group(
+            batch,
+            self.nc,
+            self.num_queries,
+            self.denoising_class_embed.weight,
+            self.num_denoising,
+            self.label_noise_ratio,
+            self.box_noise_scale,
+            self.training,
+        )
+
+        embed, refer_bbox, enc_bboxes, enc_scores = self._get_decoder_input(feats, shapes, dn_embed, dn_bbox)
+
+        # Encoder mask predictions - use same top-k selection as encoder scores
+        enc_features = self.enc_output(feats)  # (bs, h*w, hd)
+        enc_mask_coeffs_full = self.enc_mask_head(enc_features)  # (bs, h*w, nm)
+        # Get top-k indices from encoder scores (from _get_decoder_input)
+        enc_outputs_scores_full = self.enc_score_head(enc_features)
+        bs = enc_features.shape[0]
+        topk_ind = torch.topk(enc_outputs_scores_full.max(-1).values, self.num_queries, dim=1).indices.view(-1)
+        batch_ind = torch.arange(end=bs, dtype=topk_ind.dtype).unsqueeze(-1).repeat(1, self.num_queries).view(-1)
+        enc_mask_coeffs = enc_mask_coeffs_full[batch_ind, topk_ind].view(bs, self.num_queries, -1)
+
+        # Decoder - manually run to track mask predictions at each layer
+        output = embed
+        dec_mask_coeffs = []
+        refer_bbox_detached = refer_bbox.sigmoid() if not self.training else refer_bbox.detach().sigmoid()
+        last_refined_bbox = None
+        dec_bboxes_list = []
+        dec_scores_list = []
+
+        for i, layer in enumerate(self.decoder.layers):
+            output = layer(
+                output,
+                refer_bbox_detached,
+                feats,
+                shapes,
+                None,  # padding_mask
+                attn_mask,
+                self.query_pos_head(refer_bbox_detached),
+            )
+            
+            # Predict bbox, score, and mask for this layer
+            bbox = self.dec_bbox_head[i](output)
+            refined_bbox = torch.sigmoid(bbox + inverse_sigmoid(refer_bbox_detached))
+            if i > 0:
+                refined_bbox = torch.sigmoid(bbox + inverse_sigmoid(last_refined_bbox))
+            
+            score = self.dec_score_head[i](output)
+            mask_coeff = self.dec_mask_head[i](output)
+            dec_mask_coeffs.append(mask_coeff)
+            
+            if self.training:
+                dec_scores_list.append(score)
+                if i == 0:
+                    dec_bboxes_list.append(refined_bbox)
+                else:
+                    dec_bboxes_list.append(torch.sigmoid(bbox + inverse_sigmoid(last_refined_bbox)))
+            elif i == self.decoder.eval_idx:
+                # For inference, stop at eval_idx - use current predictions
+                dec_bboxes = refined_bbox.unsqueeze(0)  # (1, bs, nq, 4)
+                dec_scores = score.unsqueeze(0)  # (1, bs, nq, nc)
+                dec_mask_coeffs = mask_coeff.unsqueeze(0)  # (1, bs, nq, nm)
+                break
+
+            last_refined_bbox = refined_bbox
+            refer_bbox_detached = refined_bbox.detach() if self.training else refined_bbox
+
+        # Stack decoder outputs for training
+        if self.training:
+            dec_bboxes = torch.stack(dec_bboxes_list)  # (ndl, bs, nq, 4)
+            dec_scores = torch.stack(dec_scores_list)  # (ndl, bs, nq, nc)
+            dec_mask_coeffs = torch.stack(dec_mask_coeffs)  # (ndl, bs, nq, nm)
+
+        x = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dec_mask_coeffs, enc_mask_coeffs, protos, dn_meta
+        if self.training:
+            return x
+        # Concatenate bboxes, scores, and mask coefficients for inference
+        # dec_bboxes, dec_scores, dec_mask_coeffs are already at eval_idx from the loop above
+        dec_bboxes_eval = dec_bboxes.squeeze(0)  # (bs, nq, 4)
+        dec_scores_eval = dec_scores.squeeze(0)  # (bs, nq, nc)
+        dec_masks_eval = dec_mask_coeffs.squeeze(0)  # (bs, nq, nm)
+
+        # (bs, 300, 4+nc+nm)
+        y = torch.cat((dec_bboxes_eval, dec_scores_eval.sigmoid(), dec_masks_eval), -1)
+        return y if self.export else (y, x)
+
+
+
+class RTDETROBBDecoder(RTDETRDecoder):
+    """
+    Real-Time Deformable Transformer Decoder for Oriented Bounding Box tasks.
+
+    This decoder extends RTDETRDecoder to predict rotated bounding boxes with angles.
+
+    Attributes:
+        enc_bbox_head (MLP): Encoder bbox head outputting 5D (x, y, w, h, angle).
+        dec_bbox_head (nn.ModuleList): Decoder bbox heads outputting 5D.
+
+    Examples:
+        Create an RTDETROBBDecoder
+        >>> decoder = RTDETROBBDecoder(nc=80, ch=(512, 1024, 2048), hd=256, nq=300)
+        >>> x = [torch.randn(1, 512, 64, 64), torch.randn(1, 1024, 32, 32), torch.randn(1, 2048, 16, 16)]
+        >>> outputs = decoder(x)
+    """
+
+    def __init__(
+        self,
+        nc: int = 80,
+        ch: tuple = (512, 1024, 2048),
+        hd: int = 256,
+        nq: int = 300,
+        ndp: int = 4,
+        nh: int = 8,
+        ndl: int = 6,
+        d_ffn: int = 1024,
+        dropout: float = 0.0,
+        act: nn.Module = nn.ReLU(),
+        eval_idx: int = -1,
+        nd: int = 100,
+        label_noise_ratio: float = 0.5,
+        box_noise_scale: float = 1.0,
+        learnt_init_query: bool = False,
+    ):
+        """
+        Initialize RTDETROBBDecoder for oriented bounding box detection.
+
+        Args:
+            nc (int): Number of classes.
+            ch (tuple): Channels in the backbone feature maps.
+            hd (int): Hidden dimension.
+            nq (int): Number of queries.
+            ndp (int): Number of decoder points.
+            nh (int): Number of heads.
+            ndl (int): Number of decoder layers.
+            d_ffn (int): Feed-forward dimension.
+            dropout (float): Dropout rate.
+            act (nn.Module): Activation function.
+            eval_idx (int): Evaluation index.
+            nd (int): Number of denoising queries.
+            label_noise_ratio (float): Label noise ratio.
+            box_noise_scale (float): Box noise scale.
+            learnt_init_query (bool): Whether to learn initial query embeddings.
+        """
+        super().__init__(
+            nc=nc,
+            ch=ch,
+            hd=hd,
+            nq=nq,
+            ndp=ndp,
+            nh=nh,
+            ndl=ndl,
+            d_ffn=d_ffn,
+            dropout=dropout,
+            act=act,
+            eval_idx=eval_idx,
+            nd=nd,
+            label_noise_ratio=label_noise_ratio,
+            box_noise_scale=box_noise_scale,
+            learnt_init_query=learnt_init_query,
+        )
+
+        # Override bbox heads to output 5D (x, y, w, h, angle) instead of 4D
+        self.enc_bbox_head = MLP(hd, hd, 5, num_layers=3)
+        self.dec_bbox_head = nn.ModuleList([MLP(hd, hd, 5, num_layers=3) for _ in range(ndl)])
+
+        self.query_pos_head = MLP(5, 2 * hd, hd, num_layers=2)
+        self.decoder_layer = DeformableTransformerDecoderLayer(hd, nh, d_ffn, dropout, act, self.nl, ndp, use_obb=True)
+        self.decoder = DeformableTransformerDecoder(hd, self.decoder_layer, ndl, eval_idx)
+
+        # Re-initialize bbox head parameters
+        constant_(self.enc_bbox_head.layers[-1].weight, 0.0)
+        constant_(self.enc_bbox_head.layers[-1].bias, 0.0)
+        for reg_ in self.dec_bbox_head:
+            constant_(reg_.layers[-1].weight, 0.0)
+            constant_(reg_.layers[-1].bias, 0.0)
+
+    def _get_decoder_input_obb(
+        self,
+        feats: torch.Tensor,
+        shapes: list[list[int]],
+        dn_embed: torch.Tensor | None = None,
+        dn_bbox: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Generate and prepare the input required for the OBB decoder from the provided features and shapes.
+        Handles 5D bboxes (x, y, w, h, angle) instead of 4D.
+
+        Args:
+            feats (torch.Tensor): Processed features from encoder.
+            shapes (list): List of feature map shapes.
+            dn_embed (torch.Tensor, optional): Denoising embeddings.
+            dn_bbox (torch.Tensor, optional): Denoising bounding boxes (may be 5D).
+
+        Returns:
+            embeddings (torch.Tensor): Query embeddings for decoder.
+            refer_bbox (torch.Tensor): Reference bounding boxes (5D).
+            enc_bboxes (torch.Tensor): Encoded bounding boxes (5D).
+            enc_scores (torch.Tensor): Encoded scores.
+        """
+        bs = feats.shape[0]
+        # Prepare input for decoder - generate 4D anchors first
+        anchors, valid_mask = self._generate_anchors(shapes, dtype=feats.dtype, device=feats.device)
+        features = self.enc_output(valid_mask * feats)
+
+        enc_outputs_scores = self.enc_score_head(features)
+
+        # Query selection
+        topk_ind = torch.topk(enc_outputs_scores.max(-1).values, self.num_queries, dim=1).indices.view(-1)
+        batch_ind = torch.arange(end=bs, dtype=topk_ind.dtype).unsqueeze(-1).repeat(1, self.num_queries).view(-1)
+
+        top_k_features = features[batch_ind, topk_ind].view(bs, self.num_queries, -1)
+        top_k_anchors = anchors[:, topk_ind].view(bs, self.num_queries, -1)  # (bs, nq, 4)
+
+        # Dynamic anchors + static content - encoder bbox head outputs 5D, so we pad anchors with 0 angle
+        enc_bbox_pred = self.enc_bbox_head(top_k_features)  # (bs, nq, 5)
+        top_k_anchors_5d = torch.cat([top_k_anchors, torch.zeros_like(top_k_anchors[:, :, :1])], dim=-1)  # (bs, nq, 5)
+        refer_bbox = enc_bbox_pred + top_k_anchors_5d
+
+        enc_bboxes = refer_bbox.sigmoid()
+        if dn_bbox is not None:
+            # dn_bbox may be 4D or 5D - pad if needed
+            if dn_bbox.shape[-1] == 4:
+                dn_bbox_5d = torch.cat([dn_bbox, torch.zeros_like(dn_bbox[:, :, :1])], dim=-1)
+                refer_bbox = torch.cat([dn_bbox_5d, refer_bbox], 1)
+            else:
+                refer_bbox = torch.cat([dn_bbox, refer_bbox], 1)
+        enc_scores = enc_outputs_scores[batch_ind, topk_ind].view(bs, self.num_queries, -1)
+
+        embeddings = self.tgt_embed.weight.unsqueeze(0).repeat(bs, 1, 1) if self.learnt_init_query else top_k_features
+        if self.training:
+            refer_bbox = refer_bbox.detach()
+            if not self.learnt_init_query:
+                embeddings = embeddings.detach()
+        if dn_embed is not None:
+            embeddings = torch.cat([dn_embed, embeddings], 1)
+
+        return embeddings, refer_bbox, enc_bboxes, enc_scores
+
+    def forward(self, x: list[torch.Tensor], batch: dict | None = None) -> tuple | torch.Tensor:
+        """
+        Run forward pass returning rotated bounding boxes (5D) and classification scores.
+
+        Args:
+            x (list[torch.Tensor]): List of feature maps from the backbone.
+            batch (dict, optional): Batch information for training.
+
+        Returns:
+            During training: (dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta)
+                where bboxes are 5D (x, y, w, h, angle) with angle in [-pi/4, 3pi/4]
+            During inference: (y, x) where y is (bs, 300, 5+nc) concatenated tensor
+        """
+        from ultralytics.models.utils.ops import get_cdn_group
+
+        # Input projection and embedding
+        feats, shapes = self._get_encoder_input(x)
+
+        # Prepare denoising training
+        dn_embed, dn_bbox, attn_mask, dn_meta = get_cdn_group(
+            batch,
+            self.nc,
+            self.num_queries,
+            self.denoising_class_embed.weight,
+            self.num_denoising,
+            self.label_noise_ratio,
+            self.box_noise_scale,
+            self.training,
+        )
+
+        embed, refer_bbox, enc_bboxes, enc_scores = self._get_decoder_input_obb(feats, shapes, dn_embed, dn_bbox)
+
+        # Decoder
+        dec_bboxes, dec_scores = self.decoder(
+            embed,
+            refer_bbox,
+            feats,
+            shapes,
+            self.dec_bbox_head,
+            self.dec_score_head,
+            self.query_pos_head,
+            attn_mask=attn_mask,
+        )
+
+        # Regularize angles: apply sigmoid and map to [-pi/4, 3pi/4]
+        def regularize_angle(angle_tensor):
+            """Regularize angle from sigmoid output [0, 1] to [-pi/4, 3pi/4]."""
+            return (angle_tensor.sigmoid() - 0.25) * math.pi
+
+        # Regularize encoder bboxes
+        if enc_bboxes.shape[-1] == 5:
+            enc_bboxes_xywh = enc_bboxes[..., :4].sigmoid()
+            enc_bboxes_angle = regularize_angle(enc_bboxes[..., 4:5])
+            enc_bboxes = torch.cat([enc_bboxes_xywh, enc_bboxes_angle], dim=-1)
+
+        # Regularize decoder bboxes
+        if dec_bboxes.shape[-1] == 5:
+            # Handle stacked decoder outputs
+            if dec_bboxes.ndim == 4:  # (ndl, bs, nq, 5)
+                dec_bboxes_xywh = dec_bboxes[..., :4].sigmoid()
+                dec_bboxes_angle = regularize_angle(dec_bboxes[..., 4:5])
+                dec_bboxes = torch.cat([dec_bboxes_xywh, dec_bboxes_angle], dim=-1)
+            else:
+                dec_bboxes_xywh = dec_bboxes[..., :4].sigmoid()
+                dec_bboxes_angle = regularize_angle(dec_bboxes[..., 4:5])
+                dec_bboxes = torch.cat([dec_bboxes_xywh, dec_bboxes_angle], dim=-1)
+
+        x = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta
+        if self.training:
+            return x
+        # (bs, 300, 5+nc)
+        eval_idx = self.decoder.eval_idx if self.decoder.eval_idx >= 0 else len(self.decoder.layers) + self.decoder.eval_idx
+        dec_bboxes_eval = dec_bboxes[eval_idx].squeeze(0) if dec_bboxes.ndim > 3 else dec_bboxes
+        dec_scores_eval = dec_scores[eval_idx].squeeze(0) if dec_scores.ndim > 3 else dec_scores
+        y = torch.cat((dec_bboxes_eval, dec_scores_eval.sigmoid()), -1)
+        return y if self.export else (y, x)
 
 
 class v10Detect(Detect):

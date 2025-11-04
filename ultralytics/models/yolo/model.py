@@ -84,7 +84,7 @@ class YOLO(Model):
             if hasattr(self.model, "model") and "RTDETR" in self.model.model[-1]._get_name():  # if RTDETR head
                 from ultralytics import RTDETR
 
-                new_instance = RTDETR(self)
+                new_instance = RTDETR(self, task=task)
                 self.__class__ = type(new_instance)
                 self.__dict__ = new_instance.__dict__
             # elif hasattr(self.model, "model") and "CascadeRCNNHead" in self.model.model[-1]._get_name():

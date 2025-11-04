@@ -583,6 +583,284 @@ class MSDeformAttn(nn.Module):
         return self.output_proj(output)
 
 
+def rotmat(theta):  # theta: (N,)
+    c, s = torch.cos(theta), torch.sin(theta)
+    return torch.stack([torch.stack([c, -s], -1),
+                        torch.stack([s,  c], -1)], -2)  # (N,2,2)
+
+def circular_bias(m, S, M, device):
+    # Eq.(10): o_ms = s * (cos(2π m/M), sin(2π m/M)) / max(|cos|,|sin|)
+    s_vals = torch.arange(1, S+1, device=device, dtype=torch.float32)
+    ang = 2 * math.pi * (m / M)
+    c, s = math.cos(ang), math.sin(ang)
+    denom = max(abs(c), abs(s))
+    vec = torch.stack([torch.full_like(s_vals, c), torch.full_like(s_vals, s)], -1)
+    return (s_vals[:, None] * vec) / max(denom, 1e-6)  # (S,2)
+
+def obb_to_gaussian_params(w, h, theta, eps=1e-6):
+    """
+    Map OBB size/orientation to Gaussian Σ according to Eq. 8:
+      Σ^{1/2} = F Λ F^T
+    where F(θ) is rotation matrix and Λ = diag(w/2, h/2)
+    """
+    k = 2.0  # Using factor of 2 as suggested by paper
+    sigx = torch.clamp(w / k, min=eps)
+    sigy = torch.clamp(h / k, min=eps)
+    varx, vary = sigx**2, sigy**2
+    
+    BQ = w.numel()
+    R = rotmat(theta.view(-1))  # (BQ,2,2)
+    D = torch.zeros(BQ, 2, 2, device=w.device, dtype=w.dtype)
+    D[:, 0, 0], D[:, 1, 1] = varx.view(-1), vary.view(-1)
+    Sigma = torch.matmul(torch.matmul(R, D), R.transpose(-2, -1))  # (BQ,2,2)
+    
+    # Compute inverse and log normalizer
+    det = torch.clamp(Sigma[:, 0, 0]*Sigma[:, 1, 1] - Sigma[:, 0, 1]*Sigma[:, 1, 0], min=eps)
+    Sigma_inv = torch.linalg.inv(Sigma)
+    log_norm = -math.log(2*math.pi) - 0.5 * torch.log(det)
+    return Sigma_inv, log_norm  # each (BQ,2,2), (BQ,)
+
+def gaussian_pdf_2d(points_xy, mu_xy, Sigma_inv, log_norm):
+    """Compute 2D Gaussian probability density."""
+    d = (points_xy - mu_xy)[..., None, :]  # (...,1,2)
+    mahal = torch.matmul(torch.matmul(d, Sigma_inv), d.transpose(-1, -2))  # (...,1,1)
+    log_pdf = -0.5 * mahal.squeeze(-1).squeeze(-1) + log_norm  # (...)
+    return torch.exp(log_pdf)
+
+def multi_scale_oriented_deformable_attn(
+    value: torch.Tensor,
+    value_shapes: list,
+    sampling_locations: torch.Tensor,
+    attention_weights: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Multi-scale oriented deformable attention sampling.
+    
+    Args:
+        value: (bs, len_v, n_heads, head_dim)
+        value_shapes: [(H_0, W_0), (H_1, W_1), ..., (H_L-1, W_L-1)]
+        sampling_locations: (bs, len_q, n_heads, n_levels, n_points, 2) in normalized [0,1]
+        attention_weights: (bs, len_q, n_heads, n_levels, n_points)
+    
+    Returns:
+        (bs, len_q, n_heads * head_dim)
+    """
+    bs, len_q, n_heads, n_levels, n_points = attention_weights.shape
+    _, len_v, _, head_dim = value.shape
+    
+    # Split value by levels
+    value_list = value.split([H * W for H, W in value_shapes], dim=1)
+    
+    # Sample from each level
+    sampled_values = []
+    for level, (H, W) in enumerate(value_shapes):
+        # Get value for this level: (bs, H*W, n_heads, head_dim)
+        value_l = value_list[level].reshape(bs, H, W, n_heads, head_dim)
+        value_l = value_l.permute(0, 3, 4, 1, 2).flatten(0, 1)  # (bs*n_heads, head_dim, H, W)
+        
+        # Get sampling locations for this level: (bs, len_q, n_heads, n_points, 2)
+        sampling_loc_l = sampling_locations[:, :, :, level, :, :]
+        sampling_loc_l = sampling_loc_l.flatten(0, 2)  # (bs*len_q*n_heads, n_points, 2)
+        
+        # Convert to grid_sample format [-1, 1]
+        grid = sampling_loc_l * 2.0 - 1.0  # (bs*len_q*n_heads, n_points, 2)
+        grid = grid.unsqueeze(2)  # (bs*len_q*n_heads, n_points, 1, 2)
+        
+        # Sample: (bs*n_heads, head_dim, len_q*n_points, 1)
+        sampled = F.grid_sample(
+            value_l.repeat(len_q, 1, 1, 1),
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False
+        )
+        sampled = sampled.squeeze(-1)  # (bs*n_heads*len_q, head_dim, n_points)
+        sampled = sampled.reshape(bs, n_heads, len_q, head_dim, n_points)
+        sampled = sampled.permute(0, 2, 1, 3, 4)  # (bs, len_q, n_heads, head_dim, n_points)
+        sampled_values.append(sampled)
+    
+    # Stack all levels: (bs, len_q, n_heads, head_dim, n_levels, n_points)
+    sampled_values = torch.stack(sampled_values, dim=-2)
+    
+    # Apply attention weights: (bs, len_q, n_heads, n_levels, n_points)
+    attention_weights = attention_weights.unsqueeze(3)  # (bs, len_q, n_heads, 1, n_levels, n_points)
+    output = (sampled_values * attention_weights).sum(dim=(-2, -1))  # (bs, len_q, n_heads, head_dim)
+    
+    return output.flatten(-2)  # (bs, len_q, n_heads * head_dim)
+
+
+class MultiScaleOrientedDeformableAttention(nn.Module):
+    """
+    Multi-scale RO2-DETR Oriented Deformable Attention implementing Eq. 6, 9, 10:
+      - Works across multiple feature pyramid levels
+      - Gaussian pdf modulates query features in offset calculation (Eq. 9)
+      - Offsets use sqrt((w,h)/S) scale factor
+      - Circular bias o_ms from Eq. 10
+    """
+    def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.d_model = d_model
+        self.n_levels = n_levels
+        self.n_heads = n_heads
+        self.n_points = n_points
+        self.head_dim = d_model // n_heads
+
+        # Value projection
+        self.value_proj = nn.Linear(d_model, d_model)
+        self.output_proj = nn.Linear(d_model, d_model)
+
+        # Attention weights over (n_levels * n_points)
+        self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
+        
+        # Query-dependent offset modulation for z_q * f(μ,Σ) term in Eq. 9
+        # One offset per (head, level, point)
+        self.offset_modulation = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        """Initialize parameters."""
+        # Initialize attention weights
+        nn.init.constant_(self.attention_weights.weight.data, 0.0)
+        nn.init.constant_(self.attention_weights.bias.data, 0.0)
+        
+        # Initialize offset modulation (similar to sampling_offsets in standard deformable DETR)
+        nn.init.constant_(self.offset_modulation.weight.data, 0.0)
+        # Initialize bias with circular pattern
+        thetas = torch.arange(self.n_heads, dtype=torch.float32) * (2.0 * math.pi / self.n_heads)
+        grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
+        grid_init = (grid_init / grid_init.abs().max(-1, keepdim=True)[0]).view(self.n_heads, 1, 1, 2)
+        grid_init = grid_init.repeat(1, self.n_levels, self.n_points, 1)
+        for i in range(self.n_points):
+            grid_init[:, :, i, :] *= i + 1
+        with torch.no_grad():
+            self.offset_modulation.bias = nn.Parameter(grid_init.view(-1))
+        
+        # Initialize projections
+        nn.init.xavier_uniform_(self.value_proj.weight.data)
+        nn.init.constant_(self.value_proj.bias.data, 0.0)
+        nn.init.xavier_uniform_(self.output_proj.weight.data)
+        nn.init.constant_(self.output_proj.bias.data, 0.0)
+
+    @torch.no_grad()
+    def _bias_table(self, device):
+        """Generate circular bias o_ms for each head (Eq. 10)."""
+        # (n_heads, n_points, 2)
+        return torch.stack([
+            circular_bias(m, self.n_points, self.n_heads, device) 
+            for m in range(self.n_heads)
+        ], 0)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        refer_bbox: torch.Tensor,
+        value: torch.Tensor,
+        value_shapes: list,
+        value_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Multi-scale oriented deformable attention forward pass.
+        
+        Args:
+            query: (bs, len_q, C) query features
+            refer_bbox: (bs, len_q, n_levels, 5) as (cx, cy, w, h, theta_degrees) in normalized [0,1] coords
+            value: (bs, len_v, C) value features from all levels concatenated
+            value_shapes: [(H_0, W_0), (H_1, W_1), ..., (H_{L-1}, W_{L-1})]
+            value_mask: (bs, len_v) optional mask
+            
+        Returns:
+            (bs, len_q, C) attended features
+        """
+        bs, len_q, C = query.shape
+        len_v = value.shape[1]
+        assert C == self.d_model
+        assert sum(s[0] * s[1] for s in value_shapes) == len_v
+        assert refer_bbox.shape[-1] == 5, "refer_bbox must be (cx, cy, w, h, theta)"
+
+        # Project values
+        value = self.value_proj(value)
+        if value_mask is not None:
+            value = value.masked_fill(value_mask[..., None], float(0))
+        value = value.view(bs, len_v, self.n_heads, self.head_dim)
+
+        # Compute attention weights (normalized over all levels and points)
+        attention_weights = self.attention_weights(query).view(
+            bs, len_q, self.n_heads, self.n_levels * self.n_points
+        )
+        attention_weights = F.softmax(attention_weights, -1).view(
+            bs, len_q, self.n_heads, self.n_levels, self.n_points
+        )
+
+        # Query-dependent offset modulation (z_q component in Eq. 9)
+        offset_mod = self.offset_modulation(query).view(
+            bs, len_q, self.n_heads, self.n_levels, self.n_points, 2
+        )
+
+        # Parse OBB parameters for each level
+        # refer_bbox: (bs, len_q, n_levels, 5)
+        cx = refer_bbox[..., 0]  # (bs, len_q, n_levels)
+        cy = refer_bbox[..., 1]
+        bw = refer_bbox[..., 2]
+        bh = refer_bbox[..., 3]
+        theta_deg = refer_bbox[..., 4]
+        theta = torch.deg2rad(theta_deg)  # (bs, len_q, n_levels)
+
+        # Compute Gaussian parameters per level (Eq. 7, 8)
+        BQL = bs * len_q * self.n_levels
+        Sigma_inv, log_norm = obb_to_gaussian_params(
+            bw.reshape(-1), bh.reshape(-1), theta.reshape(-1)
+        )
+        Sigma_inv = Sigma_inv.view(bs, len_q, self.n_levels, 2, 2)
+        log_norm = log_norm.view(bs, len_q, self.n_levels)
+
+        # Evaluate Gaussian pdf at reference box centers
+        centers = torch.stack([cx, cy], -1)  # (bs, len_q, n_levels, 2)
+        pdf_center = gaussian_pdf_2d(
+            centers, centers, Sigma_inv, log_norm
+        )  # (bs, len_q, n_levels)
+        pdf_center = pdf_center[:, :, None, :, None, None]  # (bs, len_q, 1, n_levels, 1, 1)
+
+        # Circular bias o_ms (Eq. 10)
+        bias_ms = self._bias_table(query.device)  # (n_heads, n_points, 2)
+        bias_ms = bias_ms[None, None, :, None, :, :]  # (1, 1, n_heads, 1, n_points, 2)
+        bias_ms = bias_ms.expand(bs, len_q, -1, self.n_levels, -1, -1)
+
+        # Scale factor: sqrt((w,h)/S) as in Eq. 9
+        scale = torch.stack([bw, bh], -1) / float(self.n_points) # (bs, len_q, n_levels, 2)
+        scale = scale[:, :, None, :, None, :]  # (bs, len_q, 1, n_levels, 1, 2)
+
+        # Compute offsets according to Eq. 9:
+        # Δp_mqs = sqrt((w_q, h_q)/S) * (z_q * f(μ_q, Σ_q) + o_ms) * F
+        offsets_local = scale * (offset_mod * pdf_center + bias_ms)  # (bs, len_q, n_heads, n_levels, n_points, 2)
+
+        # Rotate offsets by theta (multiply by rotation matrix F)
+        # Need to apply per-level rotation
+        R = rotmat(theta.reshape(-1)).view(bs, len_q, self.n_levels, 2, 2)  # (bs, len_q, n_levels, 2, 2)
+        R = R[:, :, None, :, :, :]  # (bs, len_q, 1, n_levels, 2, 2)
+        
+        # Rotate: (bs, len_q, n_heads, n_levels, n_points, 2) @ (bs, len_q, 1, n_levels, 2, 2)
+        offsets_rotated = torch.einsum('bqhlpd,bqlij->bqhlpi', offsets_local, R.transpose(-2, -1))
+        # offsets_rotated = torch.matmul(
+        #     offsets_local.unsqueeze(-2),  # (bs, len_q, n_heads, n_levels, n_points, 1, 2)
+        #     R.transpose(-2, -1)  # (bs, len_q, 1, n_levels, 2, 2)
+        # ).squeeze(-2)  # (bs, len_q, n_heads, n_levels, n_points, 2)
+
+        # Add to centers to get sampling locations (already in normalized [0,1] coords)
+        centers_exp = centers[:, :, None, :, None, :]  # (bs, len_q, 1, n_levels, 1, 2)
+        sampling_locations = centers_exp + offsets_rotated  # (bs, len_q, n_heads, n_levels, n_points, 2)
+        
+        # Clamp to [0, 1] to stay within valid range
+        sampling_locations = sampling_locations.clamp(0, 1)
+
+        # Apply multi-scale deformable attention
+        output = multi_scale_oriented_deformable_attn(
+            value, value_shapes, sampling_locations, attention_weights
+        )
+        
+        return self.output_proj(output)
+
 class DeformableTransformerDecoderLayer(nn.Module):
     """
     Deformable Transformer Decoder Layer inspired by PaddleDetection and Deformable-DETR implementations.
@@ -618,6 +896,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
         act: nn.Module = nn.ReLU(),
         n_levels: int = 4,
         n_points: int = 4,
+        use_obb: bool = False,
     ):
         """
         Initialize the DeformableTransformerDecoderLayer with the given parameters.
@@ -630,6 +909,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
             act (nn.Module): Activation function.
             n_levels (int): Number of feature levels.
             n_points (int): Number of sampling points.
+            use_obb (bool): Whether to use oriented bounding boxes.
         """
         super().__init__()
 
@@ -639,7 +919,10 @@ class DeformableTransformerDecoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
 
         # Cross attention
-        self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
+        if use_obb:
+            self.cross_attn = MultiScaleOrientedDeformableAttention(d_model, n_levels, n_heads, n_points)
+        else:
+            self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
 

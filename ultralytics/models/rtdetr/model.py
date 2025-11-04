@@ -10,12 +10,12 @@ References:
 """
 
 from ultralytics.engine.model import Model
-from ultralytics.nn.tasks import RTDETRDetectionModel
+from ultralytics.nn.tasks import RTDETRDetectionModel, RTDETRSegmentModel, RTDETROBBModel
 from ultralytics.utils.torch_utils import TORCH_1_11
 
-from .predict import RTDETRPredictor
-from .train import RTDETRTrainer
-from .val import RTDETRValidator
+from .predict import RTDETRPredictor, RTDETRSegmentPredictor, RTDETROBBPredictor
+from .train import RTDETRTrainer, RTDETRSegmentTrainer, RTDETROBBTrainer
+from .val import RTDETRValidator, RTDETRSegmentValidator, RTDETROBBValidator
 
 
 class RTDETR(Model):
@@ -38,7 +38,7 @@ class RTDETR(Model):
         >>> results = model("image.jpg")
     """
 
-    def __init__(self, model: str = "rtdetr-l.pt") -> None:
+    def __init__(self, model: str = "rtdetr-l.pt", task: str = "detect") -> None:
         """
         Initialize the RT-DETR model with the given pre-trained model file.
 
@@ -46,7 +46,7 @@ class RTDETR(Model):
             model (str): Path to the pre-trained model. Supports .pt, .yaml, and .yml formats.
         """
         assert TORCH_1_11, "RTDETR requires torch>=1.11"
-        super().__init__(model=model, task="detect")
+        super().__init__(model=model, task=task)
 
     @property
     def task_map(self) -> dict:
@@ -62,5 +62,17 @@ class RTDETR(Model):
                 "validator": RTDETRValidator,
                 "trainer": RTDETRTrainer,
                 "model": RTDETRDetectionModel,
-            }
+            },
+            "segment": {
+                "predictor": RTDETRSegmentPredictor,
+                "validator": RTDETRSegmentValidator,
+                "trainer": RTDETRSegmentTrainer,
+                "model": RTDETRSegmentModel,
+            },
+            "obb": {
+                "predictor": RTDETROBBPredictor,
+                "validator": RTDETROBBValidator,
+                "trainer": RTDETROBBTrainer,
+                "model": RTDETROBBModel,
+            },
         }

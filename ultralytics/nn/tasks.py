@@ -87,6 +87,8 @@ from ultralytics.nn.modules import (
     RepFPN,
     ScaleEqualizingFPN,
     BiFPN,
+    RTDETROBBDecoder,
+    RTDETRSegmentDecoder,
     # Mask2FormerHead,
     # CascadeRCNNHead,
 )
@@ -99,6 +101,9 @@ from ultralytics.utils.loss import (
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
+    RTDETRDetectionLoss,
+    RTDETROBBLoss,
+    RTDETRSegmentLoss,
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
@@ -1024,7 +1029,7 @@ class RTDETRDetectionModel(DetectionModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the RTDETRDetectionModel."""
-        from ultralytics.models.utils.loss import RTDETRDetectionLoss
+        # from ultralytics.utils.loss import RTDETRDetectionLoss
 
         return RTDETRDetectionLoss(nc=self.nc, use_vfl=True)
 
@@ -1109,6 +1114,229 @@ class RTDETRDetectionModel(DetectionModel):
         head = self.model[-1]
         x = head([y[j] for j in head.f], batch)  # head inference
         return x
+
+
+class RTDETRSegmentModel(RTDETRDetectionModel):
+    """
+    RTDETR (Real-time DEtection and Tracking using Transformers) Segmentation Model class.
+
+    This class extends RTDETRDetectionModel to support instance segmentation tasks with mask prediction.
+
+    Attributes:
+        nc (int): Number of classes for detection.
+        nm (int): Number of masks.
+        npr (int): Number of prototypes.
+        criterion (RTDETRDetectionLoss): Loss function for training.
+
+    Methods:
+        __init__: Initialize the RTDETRSegmentModel.
+        init_criterion: Initialize the loss criterion.
+
+    Examples:
+        Initialize an RTDETR segmentation model
+        >>> model = RTDETRSegmentModel("rtdetr-l-seg.yaml", ch=3, nc=80, nm=32, npr=256)
+        >>> results = model.predict(image_tensor)
+    """
+
+    def __init__(self, cfg="rtdetr-l-seg.yaml", ch=3, nc=None, verbose=True, nm=32, npr=256):
+        """
+        Initialize the RTDETRSegmentModel.
+
+        Args:
+            cfg (str | dict): Configuration file name or path.
+            ch (int): Number of input channels.
+            nc (int, optional): Number of classes.
+            verbose (bool): Print additional information during initialization.
+            nm (int): Number of masks.
+            npr (int): Number of prototypes.
+        """
+        self.nm = nm
+        self.npr = npr
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the RTDETRSegmentModel."""
+        # from ultralytics.utils.loss import RTDETRSegmentLoss
+
+        # Initialize with model args if available, otherwise use defaults
+        model_args = getattr(self, "args", None)
+        return RTDETRSegmentLoss(
+            nc=self.nc,
+            use_vfl=True,
+            use_mixed_loss=bool(getattr(model_args, "seg_use_mixed_loss", False)) if model_args else False,
+            use_soft_ignore_band=bool(getattr(model_args, "use_soft_ignore_band", False)) if model_args else False,
+            ignore_band_width=float(getattr(model_args, "ignore_band_width", 10.0)) if model_args else 10.0,
+            soft_ignore_transition_ratio=float(getattr(model_args, "soft_ignore_transition_ratio", 0.5))
+            if model_args
+            else 0.5,
+            tile_size=int(getattr(model_args, "imgsz", 640)) if model_args else 640,
+            use_ultrafast_ignore=bool(getattr(model_args, "use_ultrafast_ignore_band", False))
+            if model_args
+            else False,
+            seg_w_lovasz=float(getattr(model_args, "seg_w_lovasz", 1.0)) if model_args else 1.0,
+            seg_w_dice=float(getattr(model_args, "seg_w_dice", 0.3)) if model_args else 0.3,
+            seg_w_bce=float(getattr(model_args, "seg_w_bce", 0.2)) if model_args else 0.2,
+        )
+
+    def loss(self, batch, preds=None):
+        """
+        Compute the loss for the given batch of data with segmentation masks.
+
+        Args:
+            batch (dict): Dictionary containing image, label, and mask data.
+            preds (torch.Tensor, optional): Precomputed model predictions.
+
+        Returns:
+            loss_sum (torch.Tensor): Total loss value.
+            loss_items (torch.Tensor): Main losses in a tensor.
+        """
+        if not hasattr(self, "criterion"):
+            self.criterion = self.init_criterion()
+
+        img = batch["img"]
+        bs = img.shape[0]
+        batch_idx = batch["batch_idx"]
+        gt_groups = [(batch_idx == i).sum().item() for i in range(bs)]
+        targets = {
+            "cls": batch["cls"].to(img.device, dtype=torch.long).view(-1),
+            "bboxes": batch["bboxes"].to(device=img.device),
+            "batch_idx": batch_idx.to(img.device, dtype=torch.long).view(-1),
+            "gt_groups": gt_groups,
+        }
+
+        if "masks" in batch:
+            targets["masks"] = batch["masks"].to(device=img.device)
+
+        if preds is None:
+            preds = self.predict(img, batch=targets)
+        dec_bboxes, dec_scores, enc_bboxes, enc_scores, dec_mask_coeffs, enc_mask_coeffs, protos, dn_meta = (
+            preds if self.training else preds[1]
+        )
+
+        if dn_meta is None:
+            dn_bboxes, dn_scores, dn_mask_coeffs = None, None, None
+        else:
+            dn_bboxes, dec_bboxes = torch.split(dec_bboxes, dn_meta["dn_num_split"], dim=2)
+            dn_scores, dec_scores = torch.split(dec_scores, dn_meta["dn_num_split"], dim=2)
+            if dec_mask_coeffs is not None:
+                dn_mask_coeffs, dec_mask_coeffs = torch.split(dec_mask_coeffs, dn_meta["dn_num_split"], dim=2)
+            else:
+                dn_mask_coeffs = None
+
+        dec_bboxes = torch.cat([enc_bboxes.unsqueeze(0), dec_bboxes])  # (ndl+1, bs, 300, 4)
+        dec_scores = torch.cat([enc_scores.unsqueeze(0), dec_scores])
+
+        # Prepare mask predictions for loss computation
+        masks_tuple = None
+        if dec_mask_coeffs is not None and enc_mask_coeffs is not None and protos is not None:
+            masks_tuple = (dec_mask_coeffs, enc_mask_coeffs, protos)
+
+        # Add imgsz to targets for mask loss computation
+        targets["imgsz"] = torch.tensor([img.shape[-2], img.shape[-1]], device=img.device)
+
+        # Compute loss with mask predictions if available
+        loss = self.criterion(
+            (dec_bboxes, dec_scores),
+            targets,
+            masks=masks_tuple,
+            dn_bboxes=dn_bboxes,
+            dn_scores=dn_scores,
+            dn_mask_coeffs=dn_mask_coeffs,
+            dn_meta=dn_meta,
+        )
+
+        # Return main losses - include mask loss if available
+        loss_keys = ["loss_giou", "loss_class", "loss_bbox"]
+        if "loss_mask" in loss:
+            loss_keys.append("loss_mask")
+        return sum(loss.values()), torch.as_tensor(
+            [loss[k].detach() for k in loss_keys if k in loss], device=img.device
+        )
+
+
+class RTDETROBBModel(RTDETRDetectionModel):
+    """
+    RTDETR (Real-time DEtection and Tracking using Transformers) Oriented Bounding Box Model class.
+
+    This class extends RTDETRDetectionModel to support oriented bounding box detection with rotation angles.
+
+    Attributes:
+        nc (int): Number of classes for detection.
+        criterion (RTDETRDetectionLoss): Loss function for training.
+
+    Methods:
+        __init__: Initialize the RTDETROBBModel.
+        init_criterion: Initialize the loss criterion.
+
+    Examples:
+        Initialize an RTDETR OBB model
+        >>> model = RTDETROBBModel("rtdetr-l-obb.yaml", ch=3, nc=80)
+        >>> results = model.predict(image_tensor)
+    """
+
+    def __init__(self, cfg="rtdetr-l-obb.yaml", ch=3, nc=None, verbose=True):
+        """
+        Initialize the RTDETROBBModel.
+
+        Args:
+            cfg (str | dict): Configuration file name or path.
+            ch (int): Number of input channels.
+            nc (int, optional): Number of classes.
+            verbose (bool): Print additional information during initialization.
+        """
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the RTDETROBBModel."""
+        # from ultralytics.utils.loss import RTDETROBBLoss
+
+        return RTDETROBBLoss(nc=self.nc, use_vfl=True)
+
+    def loss(self, batch, preds=None):
+        """
+        Compute the loss for the given batch of data with oriented bounding boxes.
+
+        Args:
+            batch (dict): Dictionary containing image and label data.
+            preds (torch.Tensor, optional): Precomputed model predictions.
+
+        Returns:
+            loss_sum (torch.Tensor): Total loss value.
+            loss_items (torch.Tensor): Main losses in a tensor.
+        """
+        if not hasattr(self, "criterion"):
+            self.criterion = self.init_criterion()
+
+        img = batch["img"]
+        bs = img.shape[0]
+        batch_idx = batch["batch_idx"]
+        gt_groups = [(batch_idx == i).sum().item() for i in range(bs)]
+        targets = {
+            "cls": batch["cls"].to(img.device, dtype=torch.long).view(-1),
+            "bboxes": batch["bboxes"].to(device=img.device),
+            "batch_idx": batch_idx.to(img.device, dtype=torch.long).view(-1),
+            "gt_groups": gt_groups,
+        }
+
+        if preds is None:
+            preds = self.predict(img, batch=targets)
+        dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = preds if self.training else preds[1]
+        if dn_meta is None:
+            dn_bboxes, dn_scores = None, None
+        else:
+            dn_bboxes, dec_bboxes = torch.split(dec_bboxes, dn_meta["dn_num_split"], dim=2)
+            dn_scores, dec_scores = torch.split(dec_scores, dn_meta["dn_num_split"], dim=2)
+
+        dec_bboxes = torch.cat([enc_bboxes.unsqueeze(0), dec_bboxes])  # (ndl+1, bs, 300, 5)
+        dec_scores = torch.cat([enc_scores.unsqueeze(0), dec_scores])
+
+        # For now, use detection loss - OBB-specific angle loss can be added later
+        loss = self.criterion(
+            (dec_bboxes, dec_scores), targets, dn_bboxes=dn_bboxes, dn_scores=dn_scores, dn_meta=dn_meta
+        )
+        return sum(loss.values()), torch.as_tensor(
+            [loss[k].detach() for k in ["loss_giou", "loss_class", "loss_bbox"]], device=img.device
+        )
 
 
 class WorldModel(DetectionModel):
@@ -1963,7 +2191,7 @@ def parse_model(d, ch, verbose=True):
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
                 m.legacy = legacy
-        elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
+        elif m in frozenset({RTDETRDecoder, RTDETRSegmentDecoder, RTDETROBBDecoder}):  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
         # elif m in frozenset({CascadeRCNNHead}):
         #     args = [[ch[x] for x in f], *args]

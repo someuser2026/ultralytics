@@ -949,7 +949,7 @@ def entrypoint(debug: str = "") -> None:
     if "rtdetr" in stem:  # guess architecture
         from ultralytics import RTDETR
 
-        model = RTDETR(model)  # no task argument
+        model = RTDETR(model, task=task)  # no task argument
     elif "fastsam" in stem:
         from ultralytics import FastSAM
 
