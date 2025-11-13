@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from cgitb import text
+import textwrap as text
 import math
 import warnings
 from pathlib import Path

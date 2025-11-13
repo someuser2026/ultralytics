@@ -508,7 +508,6 @@ def on_train_end(trainer):
                 if "metrics/mAP50-95(B)" in test_results.results_dict:
                     map_value = test_results.results_dict["metrics/mAP50-95(B)"]
                     LOGGER.info(f"Test evaluation complete. mAP50-95: {map_value:.4f}")
-                print(test_results)
 
                 # store predictions on val and test set for downstream processing
                 list(best_model.predict(test_dir, True, save_txt = True, batch = 2, project = trainer.args.project, name = os.path.join(trainer.args.name, "labels", "test")))
