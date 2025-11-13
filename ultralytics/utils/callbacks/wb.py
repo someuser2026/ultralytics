@@ -4,6 +4,8 @@ import yaml
 from pathlib import Path
 import os
 from copy import deepcopy
+import numpy as np
+from PIL import Image
 # from ultralytics.models.yolo.model import YOLO
 
 from ultralytics.utils import SETTINGS, TESTS_RUNNING, LOGGER
@@ -55,6 +57,207 @@ def _custom_table(x, y, classes, title="Precision Recall Curve", x_title="Recall
         fields=fields,
         string_fields=string_fields,
     )
+
+
+def _ux_make_pair_tile(pred_path: Path, label_path: Path, tile_h: int = 256) -> Image.Image:
+    """
+    Create a single horizontal tile showing prediction and ground-truth side-by-side.
+    
+    Combines two overlay images into a single tile with format: [pred | label]
+    Both images are resized to the same height while preserving aspect ratio.
+    
+    Args:
+        pred_path (Path): Path to prediction overlay image (*_pred.jpg)
+        label_path (Path): Path to ground-truth overlay image (*_labels.jpg)
+        tile_h (int): Target height in pixels for both images. Default: 256
+    
+    Returns:
+        Image.Image: Combined PIL Image with predictions on left, labels on right
+    
+    Notes:
+        - Missing/corrupt images are replaced with light gray placeholders
+        - Images are resized to matching heights to create uniform tiles
+        - Original aspect ratios are preserved during resizing
+    """
+    def _safe_open(p):
+        """Safely open image or return placeholder if file is missing/corrupt."""
+        try:
+            return Image.open(p).convert("RGB")
+        except Exception:
+            # Return light gray placeholder (245, 245, 245) if image fails to load
+            return Image.new("RGB", (tile_h, tile_h), (245, 245, 245))
+
+    # Load both prediction and label images (or placeholders)
+    im_p = _safe_open(pred_path)
+    im_l = _safe_open(label_path)
+
+    def _resize_h(img):
+        """Resize image to target height while preserving aspect ratio."""
+        if img.height == 0:
+            return img  # Avoid division by zero
+        # Calculate new width to maintain aspect ratio at target height
+        new_w = max(1, int(round(img.width * (tile_h / img.height))))
+        return img.resize((new_w, tile_h))
+
+    # Resize both images to same height
+    im_p = _resize_h(im_p)
+    im_l = _resize_h(im_l)
+
+    # Create horizontal tile: [prediction | label]
+    tile = Image.new("RGB", (im_p.width + im_l.width, tile_h), (255, 255, 255))
+    tile.paste(im_p, (0, 0))           # Prediction on left
+    tile.paste(im_l, (im_p.width, 0))  # Label on right
+    return tile
+
+
+def _ux_save_grid(pairs: list[tuple[Path, Path]], out_path: Path, rows: int = 4, cols: int = 4, tile_h: int = 256) -> Path:
+    """
+    Assemble a rows×cols grid of (pred|label) tiles and save to disk.
+    
+    Creates a uniform grid where each cell contains a side-by-side comparison
+    of predictions vs ground-truth for a single validation image.
+    
+    Args:
+        pairs (list[tuple[Path, Path]]): List of (pred_path, label_path) tuples
+            Each tuple points to the prediction and label overlay images
+        out_path (Path): Destination path for the assembled grid image
+        rows (int): Number of grid rows. Default: 4
+        cols (int): Number of grid columns. Default: 4
+        tile_h (int): Height in pixels for each tile. Default: 256
+    
+    Returns:
+        Path: The output path where the grid was saved (same as out_path)
+    
+    Notes:
+        - Only the first (rows × cols) pairs are used; extras are ignored
+        - Tiles are centered in their grid cells with 6px padding between cells
+        - All tiles are resized to the width of the widest tile for uniformity
+        - Output directory is created automatically if it doesn't exist
+    """
+    # Ensure output directory exists
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Generate tiles for the grid (up to rows×cols images)
+    tiles = [_ux_make_pair_tile(a, b, tile_h) for a, b in pairs[: rows * cols]]
+
+    # Calculate grid dimensions with uniform cell sizing
+    max_w = max([t.width for t in tiles], default=2 * tile_h)  # Width of widest tile
+    cell_w, cell_h, pad = max_w, tile_h, 6  # Cell dimensions and inter-cell padding
+    grid_w = cols * cell_w + (cols - 1) * pad  # Total grid width
+    grid_h = rows * cell_h + (rows - 1) * pad  # Total grid height
+    
+    # Create white canvas for the grid
+    canvas = Image.new("RGB", (grid_w, grid_h), (255, 255, 255))
+
+    # Place each tile in its grid position
+    for i in range(rows * cols):
+        r, c = divmod(i, cols)  # Calculate row and column indices
+        x = c * (cell_w + pad)  # X position (left edge of cell)
+        y = r * (cell_h + pad)  # Y position (top edge of cell)
+        
+        if i < len(tiles):
+            t = tiles[i]
+            # Center tile horizontally within its cell
+            x_off = x + (cell_w - t.width) // 2
+            canvas.paste(t, (x_off, y))
+    
+    # Save assembled grid to disk
+    canvas.save(out_path)
+    return out_path
+
+
+def _ux_build_and_log_f2_grids(trainer, per_grid: int = 8):
+    """
+    Build and log 4 W&B grids showing best and worst F2 score examples.
+    
+    Creates visualization grids to help diagnose model performance:
+      - Top-F2 grids (2):   Show 16 examples with highest F2 scores (best predictions)
+      - Worst-F2 grids (2): Show 16 examples with lowest F2 scores (worst predictions)
+    
+    Each grid is 4×4 (8 examples per grid, 16 total per category).
+    Each cell displays: [prediction overlay | ground-truth overlay]
+    
+    Args:
+        trainer: Ultralytics trainer instance with validator and metrics
+        per_grid (int): Number of examples per grid (default: 8 for 4×4 grids)
+    
+    Returns:
+        None. Logs 4 grid images to W&B or returns silently if:
+        - W&B is not installed
+        - Validator or metrics are unavailable
+        - Per-image F2 scores haven't been computed
+    
+    Notes:
+        - Sources per-image overlays from <save_dir>/per_image/<stem>_{pred,labels}.jpg
+        - F2 scores must be stored in validator.metrics.per_image["box"]["f2"]
+        - Image IDs are retrieved from "image_id" or "img" keys in metrics
+        - All grids are saved to <save_dir>/per_image/grids/ before W&B upload
+    """
+    # Check if W&B is available
+    # try:
+    #     import wandb as wb
+    # except Exception:
+    #     return  # W&B not installed, exit silently
+
+    # Retrieve validator from trainer
+    validator = getattr(trainer, "validator", None)
+    if validator is None:
+        return  # No validator available
+    
+    # Access per-image metrics
+    m = getattr(validator.metrics, "per_image", None)
+    if not m or "box" not in m:
+        return  # Per-image metrics not available
+
+    # Extract per-image F2 scores and image identifiers
+    box = m["box"]
+    img_ids = np.asarray(box.get("image_id") or box.get("img") or [])
+    f2 = np.asarray(box.get("f2") or [])
+    
+    # Validate data availability
+    if len(img_ids) == 0 or len(f2) == 0:
+        return  # No F2 scores computed
+
+    # Sort images by F2 score
+    order_asc = np.argsort(f2)       # Ascending: worst -> best F2 scores
+    order_desc = order_asc[::-1]     # Descending: best -> worst F2 scores
+
+    # Locate per-image overlay directory
+    per_img_dir = Path(getattr(validator.metrics, "save_dir", getattr(validator, "save_dir", Path(".")))) / "per_image"
+
+    def _pairs(indices):
+        """Build list of (pred_path, label_path) tuples for given image indices."""
+        out = []
+        for i in indices:
+            stem = str(img_ids[i])  # Image filename stem
+            out.append((
+                per_img_dir / f"{stem}_pred.jpg",    # Prediction overlay
+                per_img_dir / f"{stem}_labels.jpg"   # Ground-truth overlay
+            ))
+        return out
+
+    # Select examples for grids
+    top_pairs = _pairs(order_desc[: 2 * per_grid])  # Best 16 examples (highest F2)
+    low_pairs = _pairs(order_asc[: 2 * per_grid])   # Worst 16 examples (lowest F2)
+
+    # Assemble and save grids
+    grids_dir = per_img_dir / "grids"
+    
+    # Top F2 grids (split into 2 grids of 8 examples each)
+    top_g1 = _ux_save_grid(top_pairs[:per_grid], grids_dir / "topF2_grid_1.jpg")
+    top_g2 = _ux_save_grid(top_pairs[per_grid: 2 * per_grid], grids_dir / "topF2_grid_2.jpg")
+    
+    # Worst F2 grids (split into 2 grids of 8 examples each)
+    low_g1 = _ux_save_grid(low_pairs[:per_grid], grids_dir / "lowF2_grid_1.jpg")
+    low_g2 = _ux_save_grid(low_pairs[per_grid: 2 * per_grid], grids_dir / "lowF2_grid_2.jpg")
+
+    # Log all grids to W&B with descriptive keys
+    wb.log({
+        "examples/topF2_grid_1": wb.Image(str(top_g1)),  # Best 8 examples (grid 1)
+        "examples/topF2_grid_2": wb.Image(str(top_g2)),  # Best 8 examples (grid 2)
+        "examples/lowF2_grid_1": wb.Image(str(low_g1)),  # Worst 8 examples (grid 1)
+        "examples/lowF2_grid_2": wb.Image(str(low_g2)),  # Worst 8 examples (grid 2)
+    })
 
 
 def _plot_curve(
@@ -174,7 +377,7 @@ def on_train_epoch_end(trainer):
     if trainer.epoch == 1:
         _log_plots(trainer.plots, step=trainer.epoch + 1)
 
-def _has_test_split(data_spec) -> bool:
+def _get_val_test_dir(data_spec) -> tuple[bool, Path, Path]:
     """
     Return True iff 'test:' exists in the dataset YAML.
     Handles multiple data specification formats:
@@ -182,6 +385,8 @@ def _has_test_split(data_spec) -> bool:
     - Dictionary with 'test' key
     - Inline string (returns True optimistically)
     """
+    val_dir = None
+    test_dir = None
     try:
         # Case 1: data_spec is a Path or string pointing to a YAML file
         if isinstance(data_spec, (str, Path)):
@@ -192,13 +397,15 @@ def _has_test_split(data_spec) -> bool:
                 
                 if isinstance(data_dict, dict):
                     # Check if 'test' key exists and is not None/empty
-                    test_value = data_dict.get("test")
-                    return test_value is not None and test_value != ""
+                    test_dir = data_dict.get("test")
+                    val_dir = data_dict.get("val")
+                    return test_dir is not None and test_dir != "", Path(data_dict.get("path")) / test_dir, Path(data_dict.get("path")) / val_dir
         
         # Case 2: data_spec is already a dictionary
         elif isinstance(data_spec, dict):
-            test_value = data_spec.get("test")
-            return test_value is not None and test_value != ""
+            test_dir = data_spec.get("test")
+            val_dir = data_spec.get("val")
+            return test_dir is not None and test_dir != "", Path(data_spec.get("path")) / test_dir, Path(data_spec.get("path")) / val_dir
         
     except Exception as e:
         # If parsing fails (e.g., custom YAML loader, encoding issues),
@@ -209,6 +416,12 @@ def _has_test_split(data_spec) -> bool:
     # Optimistic default: if we can't determine, assume test exists
     # This prevents skipping test eval when it might be available
     return False
+
+def _log_predictions(pred_dir, run_name, subset):
+    LOGGER.info(f"Logging test labels from {pred_dir} to wandb")
+    artifact = wb.Artifact(run_name + "_predictions_" + subset, type = "predictions_" + subset)
+    artifact.add_dir(str(pred_dir))
+    wb.log_artifact(artifact)
 
 
 def on_train_end(trainer):
@@ -244,20 +457,28 @@ def on_train_end(trainer):
         data = getattr(trainer.args, "data", None)
         if not data:
             LOGGER.info("No data config provided; skipping test evaluation.")
-        elif not _has_test_split(data):
+        else:
+            has_test, test_dir, val_dir = _get_val_test_dir(data)
+        
+        # Determine which model to use for evaluation
+        best_path = getattr(trainer, "best", None)
+        best_exists = bool(best_path) and Path(best_path).exists()
+        if best_exists:
+            LOGGER.info(f"Evaluating best checkpoint on test split: {best_path}")
+            best_model = YOLO(str(best_path))
+        else:
+            LOGGER.info("Best checkpoint not found; using current model for test evaluation.")
+            best_model = trainer.model
+        
+        # prediction on val set
+        list(best_model.predict(val_dir, True, save_txt = True, project = trainer.args.project, name = os.path.join(trainer.args.name, "labels", "val")))
+        labels_dir = Path(trainer.args.project) / trainer.args.name / "labels"
+        val_labels = labels_dir / "val"
+        _log_predictions(val_labels, trainer.args.name, "val")
+
+        if not has_test:
             LOGGER.info("No 'test' split in data.yaml; skipping test evaluation.")
         else:
-            # Determine which model to use for test evaluation
-            best_path = getattr(trainer, "best", None)
-            best_exists = bool(best_path) and Path(best_path).exists()
-
-            if best_exists:
-                LOGGER.info(f"Evaluating best checkpoint on test split: {best_path}")
-                best_model = YOLO(str(best_path))
-            else:
-                LOGGER.info("Best checkpoint not found; using current model for test evaluation.")
-                best_model = trainer.model
-
             # Run test evaluation with plots disabled
             test_results = best_model.val(
                 data=data,
@@ -287,6 +508,13 @@ def on_train_end(trainer):
                 if "metrics/mAP50-95(B)" in test_results.results_dict:
                     map_value = test_results.results_dict["metrics/mAP50-95(B)"]
                     LOGGER.info(f"Test evaluation complete. mAP50-95: {map_value:.4f}")
+                print(test_results)
+
+                # store predictions on val and test set for downstream processing
+                list(best_model.predict(test_dir, True, save_txt = True, batch = 2, project = trainer.args.project, name = os.path.join(trainer.args.name, "labels", "test")))
+                test_labels = labels_dir / "test"
+                if test_labels.exists():
+                    _log_predictions(test_labels, trainer.args.name, "test")
             else:
                 LOGGER.info("Test results object missing 'results_dict' attribute.")
 
@@ -300,9 +528,20 @@ def on_train_end(trainer):
         # LOGGER.info(error_info)
         LOGGER.error(e)
         wb.run.summary.update({"test_eval_failed": True})
+    
+    try:
+        # Generate and log F2 visualization grids
+        # Creates 4 grids: 2 showing best predictions, 2 showing worst predictions
+        # Each grid contains 8 examples in 4×4 layout
+        _ux_build_and_log_f2_grids(trainer, per_grid=8)
+    except Exception as e:
+        # Log failures gracefully without interrupting training cleanup
+        # from ultralytics.utils import LOGGER
+        LOGGER.warning(f"W&B F2 grids skipped: {e}")
 
     # Finish the run (existing behavior)
     wb.run.finish()
+
 
 
 callbacks = (

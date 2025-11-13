@@ -26,7 +26,7 @@ from .utils import bias_init_with_prob, inverse_sigmoid, linear_init
 # from .roi_heads import MaskHead, TwoFCBBoxHead, decode_boxes, encode_boxes, roi_align_pyramid
 # from .rpn import AnchorGenerator, RPNConfig, RPNHead, rpn_inference_single_image
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "RTDETRSegmentDecoder", "RTDETROBBDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"#, "CascadeRCNNHead"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "RTDETRSegmentDecoder", "RTDETROBBDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment", "Mask2FormerHead" #, "CascadeRCNNHead"
 
 
 class Detect(nn.Module):
@@ -1959,3 +1959,418 @@ class v10Detect(Detect):
 #             start = end
 
 #         return results
+
+# --- Mask2Former-like Head (ULY) --------------------------------------------
+from .transformer import MSDeformAttn, MLP  # reuse your existing modules
+
+# __all__ = (*__all__, "Mask2FormerHeadULY") if isinstance(__all__, tuple) else "Mask2FormerHeadULY"
+
+
+class _SinePosEnc2D(nn.Module):
+    """2D sine-cosine PE: gives geometry to attention."""
+    def __init__(self, dim: int = 256, temperature: int = 10000):
+        super().__init__()
+        assert dim % 2 == 0
+        self.half = dim // 2
+        self.temperature = temperature
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Generate 2D sine-cosine positional encodings for spatial features.
+        
+        Args:
+            x: Input tensor of shape (B, C, H, W)
+            
+        Returns:
+            Positional encoding tensor of shape (B, dim, H, W)
+        """
+        b, _, h, w = x.shape
+        device, dtype = x.device, x.dtype
+        
+        # Create normalized y and x coordinate grids in range [0, h-1] and [0, w-1]
+        yy = torch.linspace(0, h - 1, h, device=device, dtype=dtype).unsqueeze(1).repeat(1, w)
+        xx = torch.linspace(0, w - 1, w, device=device, dtype=dtype).unsqueeze(0).repeat(h, 1)
+        
+        # Compute temperature-based dimension scaling for positional encoding
+        dim_t = self.temperature ** (2 * (torch.arange(self.half, device=device, dtype=dtype) // 2) / self.half)
+        
+        # Apply sine and cosine functions to x and y coordinates
+        px = xx[..., None] / dim_t
+        py = yy[..., None] / dim_t
+        px = torch.stack((px.sin(), px.cos()), dim=-1).flatten(-2)
+        py = torch.stack((py.sin(), py.cos()), dim=-1).flatten(-2)
+        
+        # Concatenate y and x encodings and reshape to (C, H, W)
+        pos = torch.cat((py, px), dim=-1).permute(2, 0, 1)  # (C,H,W)
+        
+        # Expand to batch dimension
+        return pos.unsqueeze(0).repeat(b, 1, 1, 1)
+
+
+class _DeformEncoderLayer(nn.Module):
+    """Deformable encoder block: MSDeformAttn + FFN (with residuals & norms)."""
+    def __init__(self, d: int, n_heads: int, n_lvls: int, n_pts: int, ffn: int = 1024, drop: float = 0.1):
+        super().__init__()
+        # Multi-scale deformable attention for cross-level feature aggregation
+        self.self_attn = MSDeformAttn(d_model=d, n_levels=n_lvls, n_heads=n_heads, n_points=n_pts)
+        self.norm1 = nn.LayerNorm(d)
+        self.drop1 = nn.Dropout(drop)
+        
+        # Feed-forward network for feature transformation
+        self.fc1 = nn.Linear(d, ffn)
+        self.fc2 = nn.Linear(ffn, d)
+        self.norm2 = nn.LayerNorm(d)
+        self.drop2 = nn.Dropout(drop)
+
+    @staticmethod
+    def _with_pos(x: torch.Tensor, pos: Optional[torch.Tensor]) -> torch.Tensor:
+        """Add positional encoding to input if provided."""
+        return x if pos is None else x + pos
+
+    def forward(self, src: torch.Tensor, pos: torch.Tensor, refpts: torch.Tensor,
+                spatial_shapes: List[Tuple[int,int]]) -> torch.Tensor:
+        """
+        Forward pass with deformable attention and FFN.
+        
+        Args:
+            src: Source features (B, Len, D)
+            pos: Positional encodings (B, Len, D)
+            refpts: Reference points for deformable attention (B, Len, n_levels, 2)
+            spatial_shapes: List of (H, W) tuples for each feature level
+            
+        Returns:
+            Transformed features (B, Len, D)
+        """
+        # Apply multi-scale deformable attention with residual connection
+        attn = self.self_attn(self._with_pos(src, pos), refpts, src, spatial_shapes, None)
+        src = self.norm1(src + self.drop1(attn))
+        
+        # Apply feed-forward network with residual connection
+        ffn = self.fc2(F.relu(self.fc1(src)))
+        src = self.norm2(src + self.drop2(ffn))
+        return src
+
+
+class _PixelDecoderDeformable(nn.Module):
+    """
+    Pixel decoder: 1x1 unify -> deformable encoder over concatenated multi-level tokens.
+    Outputs:
+      - mask_features: highest-res map projected to D
+      - tokens/pos per level for the decoder memory
+    Why: deformable encoder aggregates content across pyramid levels, aligning with Mask2Former's pixel-decoder spirit.
+    """
+    def __init__(self, in_channels: List[int], d: int = 256, n_heads: int = 8,
+                 n_pts: int = 4, n_enc_layers: int = 6, num_out: int = 3):
+        super().__init__()
+        assert len(in_channels) >= num_out
+        self.num_out = num_out
+        self.d = d
+        
+        # 1x1 convolutions to project each level to unified dimension
+        self.proj = nn.ModuleList([nn.Conv2d(c, d, 1) for c in in_channels[-num_out:]])
+        
+        # Learnable embeddings to distinguish different feature levels
+        self.level_embed = nn.Parameter(torch.randn(num_out, d))
+        
+        # Positional encoding generator
+        self.pos = _SinePosEnc2D(d)
+        
+        # Stack of deformable encoder layers for multi-scale feature fusion
+        self.enc = nn.ModuleList([_DeformEncoderLayer(d, n_heads, num_out, n_pts) for _ in range(n_enc_layers)])
+        
+        # Final projection for mask features
+        self.mask_proj = nn.Conv2d(d, d, 1)
+
+    @staticmethod
+    def _spatial_shapes(tensors: List[torch.Tensor]) -> List[Tuple[int,int]]:
+        """Extract spatial dimensions (H, W) from list of feature tensors."""
+        return [(t.shape[-2], t.shape[-1]) for t in tensors]
+
+    def _make_ref_points(self, spatial_shapes: List[Tuple[int,int]], B: int, device, dtype) -> torch.Tensor:
+        """
+        Build reference points for deformable attention.
+        
+        Args:
+            spatial_shapes: List of (H, W) for each level
+            B: Batch size
+            device: Target device
+            dtype: Target dtype
+            
+        Returns:
+            Reference points of shape (B, Len, n_levels, 2) with normalized [0,1] coordinates
+        """
+        ref_all = []
+        for (H, W) in spatial_shapes:
+            # Create normalized grid centers for each spatial location
+            yy, xx = torch.meshgrid(
+                torch.linspace(0.5/H, 1-0.5/H, H, device=device, dtype=dtype),
+                torch.linspace(0.5/W, 1-0.5/W, W, device=device, dtype=dtype),
+                indexing='ij'
+            )
+            # Stack x, y coordinates and flatten spatial dimensions
+            ref_all.append(torch.stack((xx, yy), -1).reshape(-1, 2))  # (HW,2)
+        
+        # Concatenate all levels
+        ref = torch.cat(ref_all, 0)  # (Len,2)
+        
+        # Repeat reference points across all levels (for cross-level attention)
+        ref = ref[:, None, :].repeat(1, len(spatial_shapes), 1)       # (Len,n_levels,2)
+        
+        # Expand to batch dimension
+        return ref.unsqueeze(0).repeat(B, 1, 1, 1)
+
+    def forward(self, xs: List[torch.Tensor]) -> Dict[str, torch.Tensor | List[torch.Tensor]]:
+        """
+        Process multi-scale features through deformable pixel decoder.
+        
+        Args:
+            xs: List of feature maps from backbone, ordered low-to-high resolution
+            
+        Returns:
+            Dictionary containing:
+                - mask_features: Highest resolution features for mask prediction
+                - tokens: Per-level feature tokens
+                - pos: Per-level positional encodings
+                - shapes: Spatial shapes of each level
+        """
+        # Project all levels to unified dimension
+        feats = [m(x) for m, x in zip(self.proj, xs[-self.num_out:])]  # low->high
+        
+        # Flatten spatial dimensions and generate positional encodings
+        tokens = [f.flatten(2).transpose(1, 2) for f in feats]
+        poss   = [self.pos(f).flatten(2).transpose(1, 2) for f in feats]
+        spatial_shapes = self._spatial_shapes(feats)
+        B, D = feats[0].shape[0], feats[0].shape[1]
+
+        # Concatenate all levels into single sequence (Len = sum of all HW)
+        src = torch.cat(tokens, 1)   # (B,Len,D)
+        pos = torch.cat(poss, 1)     # (B,Len,D)
+        
+        # Add learnable level embeddings to distinguish different scales
+        start = 0
+        for i, (H, W) in enumerate(spatial_shapes):
+            L = H * W
+            src[:, start:start+L, :] += self.level_embed[i]
+            start += L
+
+        # Generate reference points for deformable attention
+        refpts = self._make_ref_points(spatial_shapes, B, src.device, src.dtype)  # (B,Len,Lvls,2)
+        
+        # Apply deformable encoder layers for multi-scale feature aggregation
+        for layer in self.enc:
+            src = layer(src, pos, refpts, spatial_shapes)
+
+        # Split concatenated features back to per-level representations
+        outs = []
+        start = 0
+        for (H, W) in spatial_shapes:
+            L = H * W
+            y = src[:, start:start+L, :].transpose(1, 2).reshape(B, D, H, W)
+            outs.append(y)
+            start += L
+
+        # Use highest resolution level for mask features
+        mask_features = self.mask_proj(outs[-1])  # highest-res
+        
+        # Prepare per-level tokens and positional encodings for decoder
+        dec_tokens = [o.flatten(2).transpose(1, 2) for o in outs]
+        dec_pos    = [self.pos(o).flatten(2).transpose(1, 2) for o in outs]
+        
+        return {"mask_features": mask_features, "tokens": dec_tokens, "pos": dec_pos, "shapes": spatial_shapes}
+    
+
+class _MaskedXAttn(nn.Module):
+    """Masked cross-attn: queries attend only where their masks are confident. Stabilizes instance separation."""
+    def __init__(self, d: int, heads: int = 8, dropout: float = 0.0):
+        super().__init__()
+        assert d % heads == 0
+        self.h, self.dh = heads, d // heads
+        
+        # Query, key, value, and output projections
+        self.q = nn.Linear(d, d)
+        self.k = nn.Linear(d, d)
+        self.v = nn.Linear(d, d)
+        self.o = nn.Linear(d, d)
+        self.drop = dropout
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_soft_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Masked cross-attention with soft attention mask.
+        
+        Args:
+            q: Query tensor (B, Q, D)
+            k: Key tensor (B, K, D)
+            v: Value tensor (B, K, D)
+            attn_soft_mask: Soft attention mask in [0,1] range (B, Q, K)
+            
+        Returns:
+            Attended features (B, Q, D)
+        """
+        B, Q, D = q.shape
+        K = k.shape[1]
+        
+        # Project and reshape to multi-head format
+        q = self.q(q).view(B, Q, self.h, self.dh).transpose(1, 2)  # (B,H,Q,dh)
+        k = self.k(k).view(B, K, self.h, self.dh).transpose(1, 2)  # (B,H,K,dh)
+        v = self.v(v).view(B, K, self.h, self.dh).transpose(1, 2)  # (B,H,K,dh)
+        
+        # Convert soft mask [0,1] to additive mask via log for attention computation
+        eps = 1e-6
+        additive = torch.log(attn_soft_mask.clamp(min=eps)).unsqueeze(1)  # (B,1,Q,K), broadcast over heads
+        
+        # Apply scaled dot-product attention with mask
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=additive, dropout_p=self.drop, is_causal=False)
+        
+        # Reshape back to (B, Q, D) and apply output projection
+        out = out.transpose(1, 2).reshape(B, Q, D)
+        return self.o(out)
+
+
+class _DecoderLayer(nn.Module):
+    """Self-attn -> masked cross-attn -> FFN."""
+    def __init__(self, d: int, heads: int = 8, ffn: int = 1024, dropout: float = 0.1):
+        super().__init__()
+        # Self-attention for query-to-query interaction
+        self.self_attn = nn.MultiheadAttention(d, heads, dropout=dropout, batch_first=True)
+        self.n1 = nn.LayerNorm(d)
+        self.d1 = nn.Dropout(dropout)
+        
+        # Masked cross-attention for query-to-memory interaction
+        self.xattn = _MaskedXAttn(d, heads, dropout)
+        self.n2 = nn.LayerNorm(d)
+        self.d2 = nn.Dropout(dropout)
+        
+        # Feed-forward network
+        self.fc1 = nn.Linear(d, ffn)
+        self.fc2 = nn.Linear(ffn, d)
+        self.n3 = nn.LayerNorm(d)
+        self.d3 = nn.Dropout(dropout)
+
+    def forward(self, q: torch.Tensor, mem: torch.Tensor, attn_soft_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Decoder layer forward pass.
+        
+        Args:
+            q: Query embeddings (B, Q, D)
+            mem: Memory features from encoder (B, K, D)
+            attn_soft_mask: Soft mask for cross-attention (B, Q, K)
+            
+        Returns:
+            Updated query embeddings (B, Q, D)
+        """
+        # Self-attention among queries with residual connection
+        x, _ = self.self_attn(q, q, q)
+        q = self.n1(q + self.d1(x))
+        
+        # Masked cross-attention to memory with residual connection
+        x = self.xattn(q, mem, mem, attn_soft_mask)
+        q = self.n2(q + self.d2(x))
+        
+        # Feed-forward network with residual connection
+        x = self.fc2(F.relu(self.fc1(q)))
+        q = self.n3(q + self.d3(x))
+        return q
+
+
+class Mask2FormerHead(nn.Module):
+    """
+    Faithful Mask2Former-like instance segmentation head.
+    Why these choices:
+      • Deformable pixel-encoder aggregates multi-scale features content-aware (robust mask features).
+      • Masked cross-attn gates each query to its own spatial support, improving instance separation.
+      • Per-layer aux predictions stabilize training (deep supervision).
+    """
+    def __init__(self, ch: List[int], nc: int, num_queries: int = 100, dim: int = 256,
+                 nheads: int = 8, n_dec_layers: int = 6, n_enc_layers: int = 6, n_points: int = 4):
+        super().__init__()
+        self.nc, self.num_queries = nc, num_queries
+        
+        # Pixel decoder for multi-scale feature aggregation
+        self.pixel = _PixelDecoderDeformable(ch, d=dim, n_heads=nheads, n_pts=n_points, n_enc_layers=n_enc_layers)
+        
+        # Learnable query embeddings for instance detection
+        self.query_embed = nn.Embedding(num_queries, dim)
+        
+        # Stack of decoder layers
+        self.layers = nn.ModuleList([_DecoderLayer(dim, nheads) for _ in range(n_dec_layers)])
+        
+        # Per-layer classification heads for deep supervision
+        self.cls_heads  = nn.ModuleList([nn.Linear(dim, nc) for _ in range(n_dec_layers)])
+        
+        # Per-layer mask embedding heads for deep supervision
+        self.mask_heads = nn.ModuleList([MLP(dim, dim, dim, 3) for _ in range(n_dec_layers)])
+
+    def _build_soft_mask(self, pred_masks: torch.Tensor, shapes: List[Tuple[int,int]]) -> torch.Tensor:
+        """
+        Build soft attention mask from predicted masks for cross-attention gating.
+        
+        Args:
+            pred_masks: Predicted mask logits (B, Q, Hh, Wh) at highest resolution
+            shapes: List of (H, W) tuples for each feature level
+            
+        Returns:
+            Soft attention mask (B, Q, K) where K is concatenated length of all levels
+            
+        Reason: Memory tokens are concatenated level-wise; this keeps gating aligned per level.
+        """
+        B, Q, Hh, Wh = pred_masks.shape
+        per_level = []
+        
+        # Resize masks to each level's resolution and flatten
+        for (H, W) in shapes:
+            m = F.interpolate(pred_masks.sigmoid(), size=(H, W), mode="bilinear", align_corners=False)  # (B,Q,H,W)
+            per_level.append(m.flatten(2))  # (B,Q,HW)
+        
+        # Concatenate all levels to match memory token order
+        return torch.cat(per_level, dim=-1)  # (B,Q,K)
+
+    def forward(self, x: List[torch.Tensor]) -> Dict[str, torch.Tensor | List[Dict[str, torch.Tensor]]]:
+        """
+        Forward pass for instance segmentation.
+        
+        Args:
+            x: List of multi-scale feature maps from backbone
+            
+        Returns:
+            Dictionary containing:
+                - pred_logits: Classification logits for each query (B, Q, C)
+                - pred_masks: Mask predictions for each query (B, Q, H, W)
+                - aux_outputs: List of intermediate predictions for deep supervision
+        """
+        # Process features through pixel decoder
+        feats = self.pixel(x)
+        
+        # Combine tokens and positional encodings for decoder memory
+        mem = torch.cat([t + p for t, p in zip(feats["tokens"], feats["pos"])], dim=1)  # (B,K,D)
+        shapes = feats["shapes"]
+        B = x[0].shape[0]
+        
+        # Initialize query embeddings
+        q = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # (B,Q,D)
+
+        aux = []
+        
+        # Initialize with global attention (all queries attend to all memory)
+        attn_soft_mask = torch.ones((B, q.shape[1], mem.shape[1]), device=mem.device, dtype=mem.dtype)
+        
+        # Iteratively refine queries through decoder layers
+        for i, layer in enumerate(self.layers):
+            # Update queries through self-attention, cross-attention, and FFN
+            q = layer(q, mem, attn_soft_mask)
+            
+            # Predict class logits for each query
+            cls = self.cls_heads[i](q)                # (B,Q,C)
+            
+            # Generate mask embeddings and compute mask predictions
+            m_embed = self.mask_heads[i](q)           # (B,Q,D)
+            masks = torch.einsum("bqd,bdhw->bqhw", m_embed, feats["mask_features"])  # (B,Q,Hh,Wh)
+            
+            # Update attention mask based on predicted masks (except for last layer)
+            if i < len(self.layers) - 1:
+                with torch.no_grad():
+                    attn_soft_mask = self._build_soft_mask(masks, shapes)  # (B,Q,K)
+                # Store intermediate predictions for auxiliary loss
+                aux.append({"pred_logits": cls, "pred_masks": masks})
+        
+        # Return final predictions and auxiliary outputs
+        return {"pred_logits": cls, "pred_masks": masks, "aux_outputs": aux}

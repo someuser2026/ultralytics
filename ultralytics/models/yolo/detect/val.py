@@ -189,9 +189,17 @@ class DetectionValidator(BaseValidator):
             pbatch = self._prepare_batch(si, batch)
             predn = self._prepare_pred(pred)
 
+            im_uid = Path(pbatch["im_file"]).stem
+
             cls = pbatch["cls"].cpu().numpy()
             areas = pbatch["areas"].cpu().numpy()
             no_pred = predn["cls"].shape[0] == 0
+
+            n_pred = int(predn["conf"].shape[0])
+            n_gt = int(cls.shape[0])
+
+            pred_img_ids = np.full(n_pred, im_uid, dtype=object)
+            target_img_ids = np.full(n_gt, im_uid, dtype=object)
 
             processed = self._process_batch(pred, pbatch)
 
@@ -203,6 +211,8 @@ class DetectionValidator(BaseValidator):
                     "target_areas": areas,
                     "conf": np.zeros(0) if no_pred else predn["conf"].cpu().numpy(),
                     "pred_cls": np.zeros(0) if no_pred else predn["cls"].cpu().numpy(),
+                    "pred_img": pred_img_ids,
+                    "target_img_names": target_img_ids,
                 }
             )
             # Evaluate
@@ -210,6 +220,7 @@ class DetectionValidator(BaseValidator):
                 self.confusion_matrix.process_batch(predn, pbatch, conf=self.args.conf)
                 if self.args.visualize:
                     self.confusion_matrix.plot_matches(batch["img"][si], pbatch["im_file"], self.save_dir)
+                # self._plot_one_image_pair(batch["img"][si], pbatch, predn, out_dir = Path(self.save_dir) / "pre_image")
 
             if no_pred:
                 continue
@@ -374,6 +385,103 @@ class DetectionValidator(BaseValidator):
             names=self.names,
             on_plot=self.on_plot,
         )  # pred
+    
+    def _plot_one_image_pair(self, img_tensor, pbatch, predn, out_dir: Path) -> None:
+        """
+        Generate and save per-image visualization overlays for validation images.
+        
+        Creates two overlay images using ultralytics.utils.plotting.plot_images:
+        - <image_stem>_pred.jpg   : Model predictions with confidence scores
+        - <image_stem>_labels.jpg : Ground-truth annotations
+        
+        Both overlays respect the validator's confidence threshold (self.args.conf)
+        and are saved to the specified output directory for later analysis (e.g., W&B grids).
+        
+        Args:
+            img_tensor (torch.Tensor): Single image tensor, shape (C, H, W), normalized [0, 1]
+            pbatch (dict): Per-image batch dict containing:
+                - "im_file" (str): Source image filepath
+                - "bboxes" (torch.Tensor): Ground-truth boxes in xyxy format, shape (N, 4)
+                - "cls" (torch.Tensor): Ground-truth class indices, shape (N,)
+            predn (dict): Per-image predictions dict containing:
+                - "bboxes" (torch.Tensor): Predicted boxes in xyxy format, shape (M, 4)
+                - "cls" (torch.Tensor): Predicted class indices, shape (M,)
+                - "conf" (torch.Tensor): Prediction confidence scores, shape (M,)
+            outdir (Path): Output directory for saved overlay images
+        
+        Returns:
+            None. Saves two .jpg files to disk.
+        
+        Notes:
+            - Failures are logged as warnings but do not interrupt validation
+            - Uses validator's confidence threshold for consistency with metrics
+            - Converts xyxy boxes to xywh format as required by plot_images()
+        """
+        try:
+            # Ensure output directory exists (safe if already present)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Extract filename stem (e.g., "image001" from "/path/to/image001.jpg")
+            stem = Path(pbatch["im_file"]).stem
+            
+            # Add batch dimension: (C, H, W) -> (1, C, H, W) for plot_images API
+            im = img_tensor.unsqueeze(0)
+            
+            # ======================================================================
+            # GROUND-TRUTH LABELS OVERLAY
+            # ======================================================================
+            # Convert GT boxes from xyxy (x1, y1, x2, y2) to xywh (center_x, center_y, width, height)
+            gt_boxes_xywh = ops.xyxy2xywh(pbatch["bboxes"].clone())
+            
+            # Build labels dict in format expected by plot_images()
+            gt_labels = {
+                "bboxes": gt_boxes_xywh,        # Ground-truth boxes (N, 4) in xywh pixel coords
+                "cls": pbatch["cls"],            # Ground-truth class indices (N,)
+                # Note: batch_idx omitted → plot_images defaults to zeros for single-image batches
+            }
+            
+            # Render ground-truth overlay and save to disk
+            plot_images(
+                labels=gt_labels,                # Ground-truth annotations to draw
+                images=im,                       # Image tensor (1, C, H, W)
+                paths=[pbatch["im_file"]],      # Source filepath (for metadata)
+                fname=out_dir / f"{stem}_labels.jpg",  # Output path for GT overlay
+                names=self.names,                # Class name mapping (list or dict)
+                on_plot=self.on_plot,            # Optional callback for custom plot hooks
+                conf_thres=self.args.conf,       # IMPORTANT: Use validator's conf threshold for consistency
+            )
+            
+            # ======================================================================
+            # PREDICTIONS OVERLAY
+            # ======================================================================
+            # Convert predicted boxes from xyxy to xywh format
+            pr_boxes_xywh = ops.xyxy2xywh(predn["bboxes"].clone())
+            
+            # Build predictions dict with confidence scores
+            pr_labels = {
+                "bboxes": pr_boxes_xywh,         # Predicted boxes (M, 4) in xywh pixel coords
+                "cls": predn["cls"],             # Predicted class indices (M,)
+                "conf": predn["conf"],           # Prediction confidence scores (M,)
+                # Create zero-filled batch indices (M,) since this is a single-image batch
+                "batch_idx": predn["cls"].new_zeros((pr_boxes_xywh.shape[0],)),
+            }
+            
+            # Render predictions overlay and save to disk
+            plot_images(
+                labels=pr_labels,                # Predictions to draw (with confidence)
+                images=im,                       # Same image tensor (1, C, H, W)
+                paths=[pbatch["im_file"]],      # Source filepath (for metadata)
+                fname=out_dir / f"{stem}_pred.jpg",    # Output path for predictions overlay
+                names=self.names,                # Class name mapping
+                on_plot=self.on_plot,            # Optional callback
+                conf_thres=self.args.conf,       # IMPORTANT: Use validator's conf threshold
+            )
+            
+        except Exception as e:
+            # Log failures gracefully without interrupting validation loop
+            # Fallback to '<?>' if im_file key is missing from pbatch
+            LOGGER.warning(f"Per-image plotting failed for {pbatch.get('im_file', '<?>')}: {e}")
+
 
     def save_one_txt(self, predn: dict[str, torch.Tensor], save_conf: bool, shape: tuple[int, int], file: Path) -> None:
         """

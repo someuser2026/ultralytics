@@ -1568,10 +1568,11 @@ class DetMetrics(SimpleClass, DataExportMixin):
             'precision': 0.0,
             'recall': 0.0,
             'mAP50': 0.0,
-            'mAP50_95': 1.0,
+            'mAP50_95': 0.1,
             'f1': 0.0,
-            'f2': 0.0
+            'f2': 0.9
         }
+        # self.fitness_weights = fitness_weights or default_weights
         self.fitness_weights = fitness_weights or default_weights
         
         self.box = Metric(fitness_weights=self.fitness_weights)
@@ -1583,10 +1584,24 @@ class DetMetrics(SimpleClass, DataExportMixin):
             conf=[],
             pred_cls=[], target_cls=[],
             target_areas = [],
-            target_img=[]
+            target_img=[],
+            target_img_names = [],
+            pred_img = [],
         )
+        self.per_image = {}
+        self.per_image_conf_thr = None
         self.nt_per_class = None
         self.nt_per_image = None
+    
+    def _conf_for_per_image(self) -> float:
+        """
+        Get the confidence threshold to use for per-image metric computation.
+        
+        Returns the validator-provided threshold if set, otherwise defaults to 0.25
+        (matching the ConfusionMatrix default threshold).
+        """
+        return 0.01
+        return 0.25 if self.per_image_conf_thr is None else float(self.per_image_conf_thr)
 
     def update_stats(self, stat: dict[str, Any]) -> None:
         """
@@ -1631,7 +1646,66 @@ class DetMetrics(SimpleClass, DataExportMixin):
         self.box.update(results)
         self.nt_per_class = np.bincount(stats["target_cls"].astype(int), minlength=len(self.names))
         self.nt_per_image = np.bincount(stats["target_img"].astype(int), minlength=len(self.names))
+
+        conf_thr = self._conf_for_per_image()
+        self.per_image["box"] = self._compute_per_image_prf(stats, conf_thr, iou_index=0)
         return stats
+    
+    def _compute_per_image_prf(self, stats, conf_thr: float, iou_index: int = 0) -> dict[str, list]:
+        """
+        Compute per-image precision, recall, and F2 score for bounding boxes.
+        
+        Args:
+            stats: Dictionary of concatenated statistics arrays
+            conf_thr: Confidence threshold to filter predictions
+            iou_index: Index into tp array (0 for IoU=0.50, 1 for IoU=0.75, etc.)
+        
+        Returns:
+            Dictionary with lists of per-image metrics:
+            - image_id: Image identifier
+            - tp: True positives count
+            - fp: False positives count
+            - fn: False negatives count
+            - precision: TP / (TP + FP)
+            - recall: TP / (TP + FN)
+            - f2: F2 score (weighted F-score favoring recall: 5*P*R / (4*P + R))
+        """
+        # Filter predictions by confidence threshold
+        pred_keep = stats["conf"] >= conf_thr
+        
+        # Get all unique image IDs that have either predictions or ground truth
+        img_ids = np.union1d(stats["pred_img"][pred_keep], stats["target_img_names"])
+        
+        # Initialize output dictionary
+        out = {"image_id": [], "tp": [], "fp": [], "fn": [], "precision": [], "recall": [], "f2": []}
+        
+        # Compute metrics for each image independently
+        for gid in img_ids:
+            # Filter predictions for this image
+            pid = (stats["pred_img"] == gid) & pred_keep
+            
+            # Extract TP values for this image at the specified IoU threshold
+            tp_vec = stats["tp"][pid, iou_index] if pid.any() else np.zeros((0,), dtype=np.float32)
+            
+            # Count true positives, false positives, and false negatives
+            tp = int(tp_vec.sum())
+            fp = int(pid.sum() - tp)  # Total predictions minus TPs
+            fn = int((stats["target_img_names"] == gid).sum() - tp)  # Total GTs minus TPs
+            
+            # Compute precision, recall, and F2 score with zero-division handling
+            p = tp / (tp + fp) if (tp + fp) else 0.0
+            r = tp / (tp + fn) if (tp + fn) else 0.0
+            f2 = (5 * p * r) / (4 * p + r) if (4 * p + r) else 0.0
+            
+            # Store results
+            out["image_id"].append(str(gid))
+            out["tp"].append(tp)
+            out["fp"].append(fp)
+            out["fn"].append(fn)
+            out["precision"].append(float(p))
+            out["recall"].append(float(r))
+            out["f2"].append(float(f2))
+        return out
 
     def clear_stats(self):
         """Clear the stored statistics."""
@@ -1809,16 +1883,16 @@ class SegmentMetrics(DetMetrics):
             'precision': 0.0,
             'recall': 0.0,
             'mAP50': 0.0,
-            'mAP50_95': 0.5,
+            'mAP50_95': 0.0,
             'f1': 0.0,
             'f2': 0.0,
             # Mask metrics
             'mask_precision': 0.0,
             'mask_recall': 0.0,
             'mask_mAP50': 0.0,
-            'mask_mAP50_95': 0.5,
+            'mask_mAP50_95': 0.1,
             'mask_f1': 0.0,
-            'mask_f2': 0.0,
+            'mask_f2': 0.9,
             # Additional segmentation metrics
             'dice': 0.0,
             'miou': 0.0,
@@ -1826,7 +1900,8 @@ class SegmentMetrics(DetMetrics):
             'boundary_iou': 0.0
         }
         
-        self.fitness_weights = fitness_weights or default_weights
+        # self.fitness_weights = fitness_weights or default_weights
+        self.fitness_weights = default_weights
         
         # Initialize parent with box-specific weights
         # box_weights = {k: v for k, v in self.fitness_weights.items() if k.startswith('box_')}
@@ -2178,7 +2253,61 @@ class SegmentMetrics(DetMetrics):
         )[2:]
         self.seg.nc = len(self.names)
         self.seg.update(results_mask)
+
+        conf_thr = self._conf_for_per_image()
+        self.per_image["mask"] = self._compute_per_image_prf_masks(stats, conf_thr, iou_index=0)
         return stats
+    
+    def _compute_per_image_prf_masks(self, stats, conf_thr: float, iou_index: int = 0) -> dict[str, list]:
+        """
+        Compute per-image precision, recall, and F2 score for segmentation masks.
+        
+        Args:
+            stats: Dictionary of concatenated statistics arrays
+            conf_thr: Confidence threshold to filter predictions
+            iou_index: Index into tp_m array (0 for IoU=0.50, 1 for IoU=0.75, etc.)
+        
+        Returns:
+            Dictionary with lists of per-image metrics (same structure as _compute_per_image_prf)
+        
+        Note: Uses stats["tp_m"] (mask TPs) instead of stats["tp"] (box TPs)
+        """
+        # Filter predictions by confidence threshold
+        pred_keep = stats["conf"] >= conf_thr
+        
+        # Get all unique image IDs that have either predictions or ground truth
+        img_ids = np.union1d(stats["pred_img"][pred_keep], stats["target_img_names"])
+        
+        # Initialize output dictionary
+        out = {"image_id": [], "tp": [], "fp": [], "fn": [], "precision": [], "recall": [], "f2": []}
+        
+        # Compute metrics for each image independently
+        for gid in img_ids:
+            # Filter predictions for this image
+            pid = (stats["pred_img"] == gid) & pred_keep
+            
+            # Extract mask TP values for this image at the specified IoU threshold
+            tp_vec = stats["tp_m"][pid, iou_index] if pid.any() else np.zeros((0,), dtype=np.float32)
+            
+            # Count true positives, false positives, and false negatives
+            tp = int(tp_vec.sum())
+            fp = int(pid.sum() - tp)  # Total predictions minus TPs
+            fn = int((stats["target_img_names"] == gid).sum() - tp)  # Total GTs minus TPs
+            
+            # Compute precision, recall, and F2 score with zero-division handling
+            p = tp / (tp + fp) if (tp + fp) else 0.0
+            r = tp / (tp + fn) if (tp + fn) else 0.0
+            f2 = (5 * p * r) / (4 * p + r) if (4 * p + r) else 0.0
+            
+            # Store results
+            out["image_id"].append(str(gid))
+            out["tp"].append(tp)
+            out["fp"].append(fp)
+            out["fn"].append(fn)
+            out["precision"].append(float(p))
+            out["recall"].append(float(r))
+            out["f2"].append(float(f2))
+        return out
 
     @property
     def keys(self) -> list[str]:

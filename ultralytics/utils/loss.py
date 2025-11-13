@@ -1975,10 +1975,9 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
 
         # Assemble masks: einsum over all matched instances
         all_coeffs = torch.cat(matched_coeffs, dim=0)  # (N_matched_total, nm)
-        # For simplicity, use first proto (assuming shared across batch or process per image)
         # In practice, need to handle per-image protos
-        proto_flat = protos[0]  # (nm, H, W) - using first image's proto as approximation
-        pred_masks = torch.einsum("in,nhw->ihw", all_coeffs, proto_flat)  # (N_matched, H, W)
+        for b in range(bs):
+            pred_masks = torch.einsum("in,nhw->ihw", all_coeffs, protos[b])  # (N_matched, H, W)
 
         # Get corresponding GT masks
         # TODO: Proper GT mask indexing based on match_indices and batch structure
@@ -2062,7 +2061,7 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
             (dict[str, torch.Tensor]): Loss dictionary including mask losses.
         """
         pred_bboxes, pred_scores = preds
-        total_loss = super().forward(preds, batch, dn_bboxes=dn_bboxes, dn_scores=dn_scores, dn_mask_coeffs=dn_mask_coeffs, dn_meta=dn_meta)
+        total_loss = super().forward(preds, batch, dn_bboxes=dn_bboxes, dn_scores=dn_scores, dn_meta=dn_meta)
 
         # Compute mask loss if masks are provided
         if masks is not None and "masks" in batch:
@@ -2098,7 +2097,7 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
             assert len(batch["gt_groups"]) == len(dn_pos_idx)
 
             match_indices = self.get_dn_match_indices(dn_pos_idx, dn_num_group, batch["gt_groups"])
-            dn_loss = super().forward(dn_bboxes, dn_scores, batch, postfix="_dn", match_indices=match_indices)
+            dn_loss = super().forward(dn_bboxes, dn_scores, batch, match_indices=match_indices)
             total_loss.update(dn_loss)
 
             # Denoising mask loss if provided
@@ -2180,3 +2179,407 @@ class RTDETROBBLoss(RTDETRDetectionLoss):
 
         loss[name_giou] = self.loss_gain["giou"] * loss[name_giou]
         return {k: v.squeeze() for k, v in loss.items()}
+
+# --- Mask2Former losses ------------------------------------------------------
+from typing import List, Dict, Tuple
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def _sigmoid_focal(inputs: torch.Tensor, targets: torch.Tensor, alpha: float = 0.25, gamma: float = 2.0,
+                   reduction: str = "none"):
+    """
+    Compute sigmoid focal loss for addressing class imbalance.
+    
+    Args:
+        inputs: Raw logits (before sigmoid)
+        targets: Binary target labels
+        alpha: Weighting factor for positive/negative examples (default: 0.25)
+        gamma: Focusing parameter to down-weight easy examples (default: 2.0)
+        reduction: Reduction method - 'none', 'mean', or 'sum'
+        
+    Returns:
+        Focal loss value(s)
+        
+    Why focal loss: Down-weights easy examples and focuses training on hard negatives,
+    particularly useful for segmentation where background pixels dominate.
+    """
+    # Apply sigmoid to get probabilities
+    p = inputs.sigmoid()
+    
+    # Compute standard binary cross-entropy
+    ce = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    
+    # Compute probability of correct class (pt)
+    pt = p * targets + (1 - p) * (1 - targets)
+    
+    # Apply modulating factor (1 - pt)^gamma to focus on hard examples
+    loss = ce * ((1 - pt) ** gamma)
+    
+    # Apply alpha weighting if specified
+    if alpha >= 0:
+        at = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = at * loss
+    
+    # Apply reduction
+    if reduction == "mean": return loss.mean()
+    if reduction == "sum":  return loss.sum()
+    return loss
+
+def _point_sample(x: torch.Tensor, pts: torch.Tensor, align_corners: bool = False) -> torch.Tensor:
+    """
+    Sample values from feature map at specified point coordinates.
+    
+    Args:
+        x: Feature map of shape (B, C, H, W)
+        pts: Normalized point coordinates in [0, 1] of shape (B, P, 2)
+        align_corners: Whether to align corners in grid sampling
+        
+    Returns:
+        Sampled values of shape (B, C, P)
+        
+    Why point sampling: More efficient than full mask comparison, focuses on uncertain
+    regions, and provides better gradient signal for mask prediction.
+    """
+    # Convert from [0,1] to [-1,1] for grid_sample
+    grid = pts * 2 - 1
+    
+    # Reshape to (B, P, 1, 2) for grid_sample compatibility
+    grid = grid.view(x.size(0), -1, 1, 2)
+    
+    # Sample using bilinear interpolation
+    out = F.grid_sample(x, grid, mode="bilinear", align_corners=align_corners)
+    
+    # Reshape to (B, C, P)
+    return out.view(x.size(0), x.size(1), -1)
+
+def _uncertain_points(logits: torch.Tensor, num_points: int, oversample: int = 3, importance: float = 0.75):
+    """
+    Sample points focusing on uncertain regions of predicted masks.
+    
+    Args:
+        logits: Predicted mask logits of shape (B, 1, H, W)
+        num_points: Number of points to sample (P)
+        oversample: Oversampling factor for candidate selection (default: 3)
+        importance: Fraction of points from uncertain regions vs random (default: 0.75)
+        
+    Returns:
+        Sampled point coordinates of shape (B, P, 2) in [0, 1] range
+        
+    Why uncertain sampling: Focuses computation on decision boundaries where the model
+    is most uncertain, leading to better training signal and faster convergence.
+    """
+    B = logits.shape[0]
+    
+    # Generate oversampled candidate points
+    k = int(num_points * oversample)
+    pts = torch.rand(B, k, 2, device=logits.device, dtype=logits.dtype)
+    
+    with torch.no_grad():
+        # Sample logits at candidate points
+        cand = _point_sample(logits, pts).squeeze(1)     # (B,k)
+        
+        # Compute uncertainty: logits near 0 are most uncertain (sigmoid ≈ 0.5)
+        uncert = -torch.abs(cand)
+        
+        # Select top uncertain points
+        topk = uncert.topk(max(int(num_points * importance), 1), dim=1).indices
+        pick = pts[torch.arange(B, device=pts.device)[:, None], topk]
+        
+        # Fill remaining points with random samples if needed
+        if pick.shape[1] < num_points:
+            rnd = torch.rand(B, num_points - pick.shape[1], 2, device=pts.device, dtype=pts.dtype)
+            pick = torch.cat([pick, rnd], 1)
+    
+    return pick  # (B,P,2)
+
+class HungarianMatcherM2F(nn.Module):
+    """
+    Hungarian matcher with class focal + point BCE + point Dice costs.
+    
+    Performs bipartite matching between predicted instances and ground truth instances
+    using the Hungarian algorithm. This is a key component of set prediction losses.
+    
+    Why Hungarian matching: Enables set-to-set prediction without predefined anchor boxes,
+    allowing flexible number of instances and better handling of overlapping objects.
+    """
+    def __init__(self, cost_class=2.0, cost_mask=1.0, cost_dice=1.0, alpha=0.25, gamma=2.0, num_points=1024):
+        """
+        Args:
+            cost_class: Weight for classification cost (default: 2.0)
+            cost_mask: Weight for mask BCE cost (default: 1.0)
+            cost_dice: Weight for Dice cost (default: 1.0)
+            alpha: Focal loss alpha parameter (default: 0.25)
+            gamma: Focal loss gamma parameter (default: 2.0)
+            num_points: Number of points to sample for mask comparison (default: 1024)
+        """
+        super().__init__()
+        self.cc, self.cm, self.cd = cost_class, cost_mask, cost_dice
+        self.alpha, self.gamma, self.num_points = alpha, gamma, num_points
+
+    @torch.no_grad()
+    def forward(self, outputs: Dict[str, torch.Tensor], targets: List[Dict[str, torch.Tensor]]):
+        """
+        Compute optimal assignment between predictions and targets.
+        
+        Args:
+            outputs: Model predictions with 'pred_logits' (B,Q,C) and 'pred_masks' (B,Q,H,W)
+            targets: List of target dicts with 'labels' and 'masks' for each image
+            
+        Returns:
+            List of (query_indices, target_indices) tuples for each batch element
+        """
+        B, Q, C = outputs["pred_logits"].shape
+        pm = outputs["pred_masks"]  # (B,Q,H,W)
+        indices = []
+        
+        # Process each image in batch independently
+        for b in range(B):
+            labels = targets[b]["labels"]
+            
+            # Handle empty target case
+            if labels.numel() == 0:
+                indices.append((torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)))
+                continue
+            
+            # Resize target masks to match prediction resolution
+            H, W = pm.shape[-2:]
+            tmask = targets[b]["masks"].float()
+            tmask = F.interpolate(tmask.unsqueeze(1), size=(H, W), mode="nearest").squeeze(1)  # (N,H,W)
+
+            # Sample uncertain points from predicted masks for efficient comparison
+            pts = _uncertain_points(pm[b].unsqueeze(1), self.num_points).squeeze(0)  # (Q,P,2)
+            pred_pts = _point_sample(pm[b].unsqueeze(1), pts.unsqueeze(0)).squeeze(0)  # (Q,P)
+
+            # Sample same points from target masks
+            tgt_pts = []
+            for n in range(tmask.shape[0]):
+                tgt_pts.append(_point_sample(tmask[n].unsqueeze(0).unsqueeze(0), pts.unsqueeze(0)).squeeze(0).squeeze(0))
+            tgt_pts = torch.stack(tgt_pts, 0)  # (N,P)
+
+            # Compute pairwise costs between all query-target pairs
+            predP = pred_pts.unsqueeze(1).repeat(1, tmask.shape[0], 1)  # (Q,N,P)
+            tgtP  = tgt_pts.unsqueeze(0).repeat(pred_pts.shape[0], 1, 1) # (Q,N,P)
+            
+            # Mask BCE cost
+            bce   = F.binary_cross_entropy_with_logits(predP, tgtP, reduction="none").mean(-1)  # (Q,N)
+            
+            # Mask Dice cost
+            predS = predP.sigmoid()
+            inter = (predS * tgtP).sum(-1)
+            union = predS.sum(-1) + tgtP.sum(-1)
+            dice  = 1 - (2*inter + 1e-6) / (union + 1e-6)  # (Q,N)
+
+            # Classification focal cost (convert to one-hot for each target)
+            logits = outputs["pred_logits"][b]  # (Q,C)
+            tgt_oh = torch.zeros((Q, labels.numel(), C), device=logits.device, dtype=logits.dtype)
+            for n, cid in enumerate(labels.tolist()):
+                tgt_oh[:, n, cid] = 1.0
+            c_cost = _sigmoid_focal(logits.unsqueeze(1).repeat(1, labels.numel(), 1),
+                                    tgt_oh, alpha=self.alpha, gamma=self.gamma, reduction="none").sum(-1)
+            
+            # Combine all costs into final cost matrix
+            Cmat = self.cc * c_cost + self.cm * bce + self.cd * dice
+
+            # Solve optimal assignment using Hungarian algorithm
+            from scipy.optimize import linear_sum_assignment
+            qi, ti = linear_sum_assignment(Cmat.detach().cpu())
+            indices.append((torch.as_tensor(qi, dtype=torch.long), torch.as_tensor(ti, dtype=torch.long)))
+        
+        return indices
+
+
+class Mask2FormerLoss(nn.Module):
+    """
+    Ultralytics-compatible set-prediction loss for Mask2Former-like heads.
+    
+    Implements the full Mask2Former loss with:
+    - Hungarian matching for optimal query-target assignment
+    - Focal loss for classification
+    - BCE + Dice loss for masks (evaluated at sampled points)
+    - Deep supervision via auxiliary losses
+    
+    Expects model outputs: dict {'pred_logits','pred_masks','aux_outputs'}
+    Targets accepted from standard Ultralytics batch (tensor or per-image lists).
+    """
+    def __init__(self, num_classes: int, alpha: float = 0.25, gamma: float = 2.0, num_points: int = 1024, aux_weight: float = 1.0):
+        """
+        Args:
+            num_classes: Number of segmentation classes
+            alpha: Focal loss alpha parameter (default: 0.25)
+            gamma: Focal loss gamma parameter (default: 2.0)
+            num_points: Number of points to sample for mask loss (default: 1024)
+            aux_weight: Weight for auxiliary (intermediate) layer losses (default: 1.0)
+        """
+        super().__init__()
+        self.num_classes = num_classes
+        self.aux_weight  = aux_weight
+        self.matcher     = HungarianMatcherM2F(alpha=alpha, gamma=gamma, num_points=num_points)
+
+    def _build_targets(self, batch: dict, H: int, W: int) -> List[Dict[str, torch.Tensor]]:
+        """
+        Convert batch dictionary to list of per-image target dictionaries.
+        
+        Args:
+            batch: Batch dictionary from dataloader
+            H: Target height for masks
+            W: Target width for masks
+            
+        Returns:
+            List of dicts with 'labels' and 'masks' for each image
+            
+        Supports two formats:
+          (A) Pre-split per-image: batch['gt_labels'][i], batch['gt_masks'][i]
+          (B) Concatenated tensors + batch_idx: batch['cls'], batch['masks'], batch['batch_idx']
+        """
+        # Format A: Pre-split per-image lists
+        if "gt_labels" in batch and "gt_masks" in batch:
+            return [{"labels": batch["gt_labels"][i].to(torch.long),
+                     "masks":  batch["gt_masks"][i].float()} for i in range(len(batch["gt_labels"]))]
+
+        # Format B: Concatenated format - determine batch size
+        imgs = batch.get("img", batch.get("imgs"))
+        bs = int(imgs.shape[0]) if imgs is not None else int(batch["batch_idx"].max().item() + 1)
+        
+        cls = batch["cls"]
+        
+        # Handle list format
+        if isinstance(cls, list):
+            return [{"labels": c.view(-1).to(torch.long), "masks": m.float()} for c, m in zip(cls, batch["masks"])]
+        
+        # Handle concatenated tensor format - split by batch_idx
+        bidx = batch["batch_idx"].to(torch.long)
+        cls = cls.view(-1).to(torch.long)
+        masks = batch["masks"].float()
+        
+        out = []
+        for i in range(bs):
+            sel = (bidx == i)
+            out.append({"labels": cls[sel], "masks": masks[sel]})
+        return out
+
+    def _loss_class(self, logits: torch.Tensor, targets, indices):
+        """
+        Compute classification loss using focal loss.
+        
+        Args:
+            logits: Predicted class logits of shape (B, Q, C)
+            targets: List of target dicts
+            indices: Matched query-target pairs from Hungarian matcher
+            
+        Returns:
+            Scalar classification loss
+            
+        Why focal loss: Handles class imbalance between matched queries (positive)
+        and unmatched queries (negative/background).
+        """
+        B, Q, C = logits.shape
+        
+        # Initialize all queries as background (zeros)
+        tgt = torch.zeros((B, Q, C), device=logits.device, dtype=torch.float32)
+        
+        # Set matched queries to their target class (one-hot)
+        for b, (qi, ti) in enumerate(indices):
+            if ti.numel():
+                tgt[b, qi, targets[b]["labels"][ti]] = 1.0
+        
+        # Compute focal loss
+        return _sigmoid_focal(logits.view(-1, C), tgt.view(-1, C), reduction="mean")
+
+    def _loss_masks(self, pm: torch.Tensor, targets, indices):
+        """
+        Compute mask losses using BCE and Dice on sampled points.
+        
+        Args:
+            pm: Predicted masks of shape (B, Q, H, W)
+            targets: List of target dicts
+            indices: Matched query-target pairs from Hungarian matcher
+            
+        Returns:
+            Tuple of (bce_loss, dice_loss)
+            
+        Why point sampling: Significantly reduces memory and computation compared to
+        full-resolution masks while maintaining good training signal.
+        """
+        B, Q, H, W = pm.shape
+        
+        # Handle case with no matched instances
+        if sum(len(t["labels"]) for t in targets) == 0:
+            z = pm.sum() * 0.0
+            return z, z
+        
+        # Gather all matched predictions
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx   = torch.cat([src for (src, _) in indices])
+        pred = pm[batch_idx, src_idx]  # (M,H,W) where M is total matched instances
+        
+        # Gather and resize all matched target masks
+        tcat = []
+        for i, (_, ti) in enumerate(indices):
+            if ti.numel():
+                m = targets[i]["masks"][ti].float()
+                # Resize to prediction resolution
+                m = F.interpolate(m.unsqueeze(1), size=(H, W), mode="nearest").squeeze(1)
+                tcat.append(m)
+        tgt = torch.cat(tcat, 0) if tcat else torch.zeros_like(pred)
+
+        # Sample uncertain points for efficient mask comparison
+        pts = _uncertain_points(pred.unsqueeze(1), num_points=1024).squeeze(1)  # (M,P,2)
+        p = _point_sample(pred.unsqueeze(1), pts).squeeze(1)    # (M,P)
+        t = _point_sample(tgt.unsqueeze(1),  pts).squeeze(1)    # (M,P)
+
+        # Compute BCE loss at sampled points
+        bce = F.binary_cross_entropy_with_logits(p, t, reduction="mean")
+        
+        # Compute Dice loss at sampled points
+        ps = p.sigmoid()
+        inter = (ps * t).sum(-1).mean()
+        uni = (ps + t).sum(-1).mean()
+        dice = 1 - (2*inter + 1e-6) / (uni + 1e-6)
+        
+        return bce, dice
+
+    def forward(self, outputs: Dict[str, torch.Tensor], batch: dict):
+        """
+        Compute total loss with deep supervision.
+        
+        Args:
+            outputs: Model predictions dict with 'pred_logits', 'pred_masks', and 'aux_outputs'
+            batch: Batch dictionary with ground truth annotations
+            
+        Returns:
+            Tuple of (total_loss, loss_components_tensor)
+            
+        Deep supervision: Auxiliary losses from intermediate decoder layers help stabilize
+        training and improve feature learning throughout the decoder stack.
+        """
+        # Prepare targets in standard format
+        H, W = outputs["pred_masks"].shape[-2:]
+        targets = self._build_targets(batch, H, W)
+        
+        # Compute matching for final predictions
+        indices = self.matcher(outputs, targets)
+
+        # Compute losses for final predictions
+        lcls = self._loss_class(outputs["pred_logits"], targets, indices)
+        lbce, ldice = self._loss_masks(outputs["pred_masks"], targets, indices)
+
+        # Add auxiliary losses from intermediate decoder layers (deep supervision)
+        for aux in outputs.get("aux_outputs", []):
+            # Compute new matching for each auxiliary output
+            aidx = self.matcher(aux, targets)
+            
+            # Add weighted auxiliary losses
+            lcls  = lcls  + self._loss_class(aux["pred_logits"], targets, aidx) * self.aux_weight
+            b, d  = self._loss_masks(aux["pred_masks"], targets, aidx)
+            lbce  = lbce  + b * self.aux_weight
+            ldice = ldice + d * self.aux_weight
+
+        # Combine losses: weighted classification + BCE + Dice
+        # Why 2x weight on classification: Balances gradient magnitudes between
+        # classification and mask prediction tasks
+        loss = 2.0 * lcls + lbce + ldice
+        
+        # Return total loss and individual components for logging
+        return loss, torch.tensor([lcls.detach(), lbce.detach(), ldice.detach()],
+                                  device=outputs["pred_masks"].device)
