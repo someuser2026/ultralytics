@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import textwrap as text
 import math
 import warnings
 from pathlib import Path

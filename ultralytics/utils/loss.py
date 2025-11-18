@@ -1936,104 +1936,117 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
     def _get_loss_mask_single_layer(
         self,
         mask_coeffs: torch.Tensor,  # (bs, nq, nm)
-        protos: torch.Tensor,  # (bs, nm, H, W)
-        gt_masks: torch.Tensor,  # (N, H, W)
+        protos: torch.Tensor,       # (bs, nm, H, W)
+        gt_masks: torch.Tensor,     # (N_total, H, W) flattened across batch
         match_indices: list[tuple],
         imgsz: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Compute mask loss for a single layer."""
+        """Compute mask loss for a single layer using per-image matching."""
         bs, nq, nm = mask_coeffs.shape
         _, _, proto_h, proto_w = protos.shape
 
-        # Collect matched mask coefficients and GT masks per image
-        matched_coeffs = []
-        matched_gt_masks = []
-        matched_bboxes = []
-
+        # Flatten matcher indices into (batch_idx, src_idx) and global gt_idx
         idx, gt_idx = self._get_index(match_indices)
-        batch_idx, src_idx = idx
+        batch_idx, src_idx = idx  # each element corresponds to one matched pair
 
-        # Group by batch
+        if gt_masks.numel() == 0 or gt_idx.numel() == 0:
+            return {
+                "mask": torch.tensor(0.0, device=self.device),
+                "dice": torch.tensor(0.0, device=self.device),
+            }
+
+        per_img_mask_losses: list[torch.Tensor] = []
+        per_img_dice_losses: list[torch.Tensor] = []
+
         for b in range(bs):
-            batch_mask = batch_idx == b
-            if not batch_mask.any():
+            sel = (batch_idx == b)
+            if not sel.any():
                 continue
 
-            # Get matched coefficients for this image
-            img_coeffs = mask_coeffs[b, src_idx[batch_mask]]  # (n_matched, nm)
-            img_gt_indices = gt_idx[batch_mask]  # (n_matched,)
+            # Query indices and GT indices for image b
+            q_idx_b = src_idx[sel]    # (n_b,)
+            gt_idx_b = gt_idx[sel]    # (n_b,) indices into flattened GT
 
-            # Get GT masks for this batch image
-            # Need to map gt_idx to actual GT mask indices - this requires tracking GT grouping
-            # For now, assume gt_masks are in order and we need to find which ones belong to this batch
-            # This is simplified - actual implementation may need batch_idx from batch dict
-            matched_coeffs.append(img_coeffs)
-            # Note: GT mask indexing needs to be handled carefully based on batch structure
+            # (n_b, nm), (nm, H, W)
+            coeffs_b = mask_coeffs[b, q_idx_b]         # (n_b, nm)
+            protos_b = protos[b]                       # (nm, H, W)
+            gt_masks_b = gt_masks[gt_idx_b]           # (n_b, H, W)
 
-        if len(matched_coeffs) == 0:
-            return {"mask": torch.tensor(0.0, device=self.device), "dice": torch.tensor(0.0, device=self.device)}
+            if coeffs_b.numel() == 0 or gt_masks_b.numel() == 0:
+                continue
 
-        # Assemble masks: einsum over all matched instances
-        all_coeffs = torch.cat(matched_coeffs, dim=0)  # (N_matched_total, nm)
-        # In practice, need to handle per-image protos
-        for b in range(bs):
-            pred_masks = torch.einsum("in,nhw->ihw", all_coeffs, protos[b])  # (N_matched, H, W)
+            # Predicted masks for image b
+            pred_masks_b = torch.einsum("in,nhw->ihw", coeffs_b, protos_b)  # (n_b, H, W)
 
-        # Get corresponding GT masks
-        # TODO: Proper GT mask indexing based on match_indices and batch structure
-        # For now, placeholder - actual implementation needs proper GT mask extraction
-        gt_masks_matched = gt_masks[: len(pred_masks)] if len(gt_masks) >= len(pred_masks) else gt_masks
+            # Optional soft-ignore weights (per image)
+            weight_map_b = None
+            if self.use_soft_ignore_band:
+                scale = float(proto_h) / float(max(1, self.tile_size))
+                scaled_ignore = max(0.0, self.ignore_band_width * scale)
 
-        # Generate soft ignore weight maps
-        weight_map = None
-        if self.use_soft_ignore_band:
-            scale = float(proto_h) / float(max(1, self.tile_size))
-            scaled_ignore = max(0.0, self.ignore_band_width * scale)
+                try:
+                    # fast path if available
+                    weight_map_b = create_soft_ignore_weights_fast(
+                        gt_masks_b, scaled_ignore, self.soft_ignore_transition_ratio, device=gt_masks_b.device
+                    )
+                except Exception:
+                    weight_map_b = create_soft_ignore_weights_torch(
+                        gt_masks_b, scaled_ignore, self.soft_ignore_transition_ratio, device=gt_masks_b.device
+                    )
 
-            if _HAS_SCI_CV and not self.use_ultrafast_ignore:
-                weight_map = create_soft_ignore_weights_fast(
-                    gt_masks_matched, scaled_ignore, self.soft_ignore_transition_ratio, device=gt_masks_matched.device
+            # --- MixedMaskLoss branch -------------------------------------------------
+            if self.use_mixed_loss and hasattr(self, "mixed_mask_loss"):
+                # NOTE: still using full-image crop; xyxy/area are placeholders
+                n_b = pred_masks_b.shape[0]
+                xyxy = torch.zeros(n_b, 4, device=pred_masks_b.device)
+                area = gt_masks_b.float().sum(dim=(1, 2)).clamp_min(1.0)
+
+                mask_loss_b = self.mixed_mask_loss(
+                    logits=pred_masks_b,
+                    targets=gt_masks_b.float(),
+                    xyxy=xyxy,
+                    area=area,
+                    crop_mask_fn=crop_mask,
+                    weight_map=weight_map_b,
                 )
+                # MixedMaskLoss usually already includes a Dice-like term; set dice=0 here
+                dice_loss_b = torch.tensor(0.0, device=pred_masks_b.device)
             else:
-                weight_map = create_soft_ignore_weights_torch(
-                    gt_masks_matched, scaled_ignore, self.soft_ignore_transition_ratio, device=gt_masks_matched.device
-                )
+                # --- Legacy BCE + Dice -------------------------------------------------
+                loss_map = F.binary_cross_entropy_with_logits(
+                    pred_masks_b, gt_masks_b.float(), reduction="none"
+                )  # (n_b, H, W)
 
-        # Compute mask loss
-        if self.use_mixed_loss and hasattr(self, "mixed_mask_loss"):
-            # Use MixedMaskLoss - needs xyxy bboxes for cropping
-            # For RT-DETR, we need bboxes from matched predictions
-            # Placeholder: create dummy xyxy for now - actual implementation needs matched bboxes
-            N = pred_masks.shape[0]
-            xyxy = torch.zeros(N, 4, device=pred_masks.device)  # TODO: get from matched predictions
-            area = torch.ones(N, device=pred_masks.device)  # TODO: compute from masks or bboxes
+                if weight_map_b is not None:
+                    # apply per-instance weight map and normalize per instance
+                    loss_map = loss_map * weight_map_b
+                    valid_sum = weight_map_b.sum(dim=(1, 2)).clamp_min(1e-6)  # (n_b,)
+                    mask_loss_b = (loss_map.sum(dim=(1, 2)) / valid_sum).mean()
+                else:
+                    mask_loss_b = loss_map.mean()
 
-            mask_loss = self.mixed_mask_loss(
-                logits=pred_masks,
-                targets=gt_masks_matched.float(),
-                xyxy=xyxy,
-                area=area,
-                crop_mask_fn=crop_mask,
-                weight_map=weight_map,
-            )
-            return {"mask": mask_loss, "dice": torch.tensor(0.0, device=self.device)}
-        else:
-            # Legacy BCE with optional weighting
-            loss_map = F.binary_cross_entropy_with_logits(pred_masks, gt_masks_matched.float(), reduction="none")
-            if weight_map is not None:
-                loss_map = loss_map * weight_map
-                valid_sum = weight_map.sum(dim=(1, 2)).clamp_min(1e-6)
-                mask_loss = (loss_map.sum(dim=(1, 2)) / valid_sum).sum()
-            else:
-                mask_loss = loss_map.mean()
+                probs_b = torch.sigmoid(pred_masks_b)
+                intersection = (probs_b * gt_masks_b.float()).sum(dim=(1, 2))
+                union = (probs_b * probs_b).sum(dim=(1, 2)) + (gt_masks_b.float() * gt_masks_b.float()).sum(
+                    dim=(1, 2)
+                ) + 1e-6
+                dice_b = 1.0 - (2.0 * intersection + 1e-6) / union
+                dice_loss_b = dice_b.mean()
 
-            # Compute dice loss
-            probs = torch.sigmoid(pred_masks)
-            num = 2.0 * (probs * gt_masks_matched.float()).sum(dim=(1, 2))
-            den = (probs * probs).sum(dim=(1, 2)) + (gt_masks_matched.float() * gt_masks_matched.float()).sum(dim=(1, 2)) + 1e-6
-            dice_loss = (1.0 - (num + 1e-6) / den).mean()
+            per_img_mask_losses.append(mask_loss_b)
+            per_img_dice_losses.append(dice_loss_b)
 
-            return {"mask": mask_loss, "dice": dice_loss}
+        if not per_img_mask_losses:
+            return {
+                "mask": torch.tensor(0.0, device=self.device),
+                "dice": torch.tensor(0.0, device=self.device),
+            }
+
+        mask_loss = torch.stack(per_img_mask_losses).mean()
+        dice_loss = torch.stack(per_img_dice_losses).mean()
+
+        return {"mask": mask_loss, "dice": dice_loss}
+
 
     def forward(
         self,

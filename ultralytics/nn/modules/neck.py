@@ -300,6 +300,245 @@ class SimAM(nn.Module):
         # Apply sigmoid to get attention weights
         return x * torch.sigmoid(attn)
 
+class CarafePPResample2d(nn.Module):
+    """
+    CARAFE++-style content-aware resampling (upsample or downsample) in pure PyTorch.
+    
+    CARAFE++ (Content-Aware ReAssembly of FEatures) is a learnable upsampling/downsampling
+    operator that generates position-specific reassembly kernels based on content features.
+    Unlike fixed interpolation (bilinear, nearest), it adapts kernels spatially for better
+    feature preservation.
+
+    Modes:
+      - 'up'   : scale>1   (default scale=2)   -> content-aware upsampling
+      - 'down' : scale>1   (default scale=2)   -> content-aware downsampling
+
+    Args:
+        channels (int): input/output channels (kept constant throughout)
+        mode (str): 'up' for upsampling or 'down' for downsampling
+        scale (int): resampling factor (e.g., 2 for 2x up/down)
+        kernel (int): reassembly kernel size (e.g., 5 means 5x5 local neighborhood)
+        encoder_kernel (int): kernel size for kernel-prediction conv (e.g., 3)
+        comp (int): channel compression ratio for efficient kernel prediction
+    """
+    def __init__(
+        self,
+        channels: int,
+        mode: str = "up",
+        scale: int = 2,
+        kernel: int = 5,
+        encoder_kernel: int = 3,
+        comp: int = 4,
+    ):
+        super().__init__()
+        assert mode in ("up", "down")
+        assert scale >= 2, "scale must be >=2 for CARAFE++"
+        self.mode = mode
+        self.scale = int(scale)
+        self.kernel = int(kernel)  # Size of local reassembly kernel
+        self.pad = self.kernel // 2  # Padding to maintain spatial dimensions
+
+        # Compressed channel dimension for efficient kernel prediction
+        mid = max(8, channels // int(comp))
+
+        # ========== Kernel Prediction Network ==========
+        # Three-stage pipeline: compress -> encode -> predict
+        
+        # Stage 1: Channel compression (C -> mid channels)
+        # Reduces computational cost of kernel prediction
+        self.compress = nn.Conv2d(channels, mid, kernel_size=1, stride=1, padding=0, bias=True)
+        
+        # Stage 2: Content encoding
+        # For upsampling: encode at input resolution
+        # For downsampling: encode at output (downsampled) resolution
+        stride = 1 if mode == "up" else self.scale
+        self.encoder = nn.Conv2d(mid, mid, kernel_size=encoder_kernel, stride=stride,
+                                 padding=encoder_kernel // 2, bias=True)
+
+        # Stage 3: Kernel prediction
+        if mode == "up":
+            # Predict kernels for upsampling:
+            # - Output: scale^2 * kernel^2 channels (one kernel per HR pixel)
+            # - PixelShuffle rearranges to (kernel^2, H*scale, W*scale)
+            # - Each HR location gets its own kernel^2 weights
+            out_ch = (self.scale * self.scale) * (self.kernel * self.kernel)
+            self.predict = nn.Conv2d(mid, out_ch, kernel_size=1, stride=1, padding=0, bias=True)
+            self.ps = nn.PixelShuffle(self.scale)  # Rearrange to HR grid
+        else:
+            # Predict kernels for downsampling:
+            # - Output: kernel^2 channels (one kernel per LR pixel)
+            # - Directly at downsampled resolution
+            out_ch = (self.kernel * self.kernel)
+            self.predict = nn.Conv2d(mid, out_ch, kernel_size=1, stride=1, padding=0, bias=True)
+
+        # Activation function
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass: content-aware resampling.
+        
+        Input:  x -> (B, C, H, W)
+        Output: y -> (B, C, H*s, W*s) for 'up', or (B, C, H/s, W/s) for 'down'
+        
+        Process:
+        1. Generate position-specific reassembly kernels from content
+        2. Extract local neighborhoods from input features
+        3. Apply predicted kernels to reassemble features at target resolution
+        """
+        B, C, H, W = x.shape
+
+        # ========== Step 1: Kernel Prediction ==========
+        # Generate content-aware kernels for each output position
+        kp = self.act(self.compress(x))  # Compress channels
+        kp = self.act(self.encoder(kp))  # Encode content
+        # kp shape: (B, mid, H, W) for up, (B, mid, H/s, W/s) for down
+
+        if self.mode == "up":
+            # --- Upsampling Path ---
+            
+            # Predict kernels and rearrange to HR grid
+            logits = self.predict(kp)                         # (B, s^2*K^2, H, W)
+            kernels = self.ps(logits)                         # (B, K^2, H*s, W*s)
+            kernels = torch.softmax(kernels, dim=1)           # Normalize to sum=1
+            
+            # ========== Step 2: Extract Neighborhoods ==========
+            # Extract K×K neighborhoods around each LR pixel
+            neigh = F.unfold(x, kernel_size=self.kernel, padding=self.pad, stride=1)
+            # neigh: (B, C*K^2, H*W) - flattened neighborhoods
+            
+            neigh = neigh.view(B, C, self.kernel * self.kernel, H, W)
+            # neigh: (B, C, K^2, H, W) - structured neighborhoods
+            
+            # ========== Step 3: Broadcast to HR Grid ==========
+            # Repeat each LR neighborhood across its corresponding s×s HR cells
+            neigh = neigh.repeat_interleave(self.scale, dim=3)  # H -> H*s
+            neigh = neigh.repeat_interleave(self.scale, dim=4)  # W -> W*s
+            # neigh: (B, C, K^2, H*s, W*s)
+            
+            # ========== Step 4: Reassemble with Predicted Kernels ==========
+            # Weighted sum: each HR pixel uses its predicted kernel weights
+            out = (neigh * kernels.unsqueeze(1)).sum(dim=2)     # (B, C, H*s, W*s)
+            return out
+
+        # --- Downsampling Path ---
+        else:
+            # Predict kernels at LR resolution
+            logits = self.predict(kp)                                # (B, K^2, H/s, W/s)
+            kernels = torch.softmax(logits, dim=1)                   # Normalize
+            
+            # ========== Step 2: Extract Strided Neighborhoods ==========
+            # Extract K×K neighborhoods centered on LR grid (stride=scale)
+            neigh = F.unfold(x, kernel_size=self.kernel, padding=self.pad, stride=self.scale)
+            # neigh: (B, C*K^2, (H/s)*(W/s)) - neighborhoods at LR positions
+            
+            Hds = kp.shape[-2]  # Height at downsampled resolution
+            Wds = kp.shape[-1]  # Width at downsampled resolution
+            neigh = neigh.view(B, C, self.kernel * self.kernel, Hds, Wds)
+            # neigh: (B, C, K^2, H/s, W/s)
+            
+            # ========== Step 3: Reassemble with Predicted Kernels ==========
+            # Weighted sum: each LR pixel aggregates from its K×K HR neighborhood
+            out = (neigh * kernels.unsqueeze(1)).sum(dim=2)          # (B, C, H/s, W/s)
+            return out
+
+def build_upsampler(c: int, resample_cfg: Dict) -> nn.Module:
+    """
+    Factory function to build upsampler modules for top-down feature pyramid paths.
+    
+    Supports two upsampling strategies:
+    1. 'nearest': Simple nearest-neighbor interpolation (fast, no parameters)
+    2. 'carafepp': Content-aware learnable upsampling (better quality, more compute)
+    
+    Args:
+        c (int): Number of channels (input = output)
+        resample_cfg (Dict): Configuration dictionary with keys:
+            - up (str): Upsampler type - 'nearest' or 'carafepp'
+            - scale (int): Upsampling factor (default: 2)
+            - kernel (int): CARAFE++ reassembly kernel size (default: 5)
+            - encoder_kernel (int): CARAFE++ encoder kernel size (default: 3)
+            - comp (int): CARAFE++ compression ratio (default: 4)
+    
+    Returns:
+        nn.Module: Upsampler that takes (B, c, H, W) -> (B, c, H*scale, W*scale)
+    
+    Example:
+        # Use nearest-neighbor 2x upsampling
+        up = build_upsampler(256, {"up": "nearest", "scale": 2})
+        
+        # Use CARAFE++ 2x upsampling with custom kernel
+        up = build_upsampler(256, {"up": "carafepp", "scale": 2, "kernel": 5})
+    """
+    typ = (resample_cfg or {}).get("up", "nearest").lower()
+    s = (resample_cfg or {}).get("scale", 2)
+    
+    if typ == "nearest":
+        # Fast, parameter-free upsampling via nearest-neighbor interpolation
+        return nn.Upsample(scale_factor=s, mode="nearest")
+    
+    if typ == "carafepp":
+        # Content-aware learnable upsampling
+        k = resample_cfg.get("kernel", 5)           # Reassembly kernel size
+        ek = resample_cfg.get("encoder_kernel", 3)  # Encoder kernel size
+        comp = resample_cfg.get("comp", 4)          # Channel compression ratio
+        return CarafePPResample2d(c, mode="up", scale=s, kernel=k, encoder_kernel=ek, comp=comp)
+    
+    raise ValueError(f"Unknown upsampler: {typ}")
+
+
+def build_downsampler(c: int, resample_cfg: Dict, conv_cfg: Dict, dcn: bool) -> nn.Module:
+    """
+    Factory function to build downsampler modules for bottom-up feature pyramid paths.
+    
+    Supports two downsampling strategies:
+    1. 'conv': Strided convolution (standard approach, preserves local structure)
+    2. 'carafepp': Content-aware learnable downsampling (adaptive aggregation)
+    
+    Args:
+        c (int): Number of channels (input = output)
+        resample_cfg (Dict): Configuration dictionary with keys:
+            - down (str): Downsampler type - 'conv' or 'carafepp'
+            - scale (int): Downsampling factor (default: 2)
+            - kernel (int): CARAFE++ reassembly kernel size (default: 5)
+            - encoder_kernel (int): CARAFE++ encoder kernel size (default: 3)
+            - comp (int): CARAFE++ compression ratio (default: 4)
+        conv_cfg (Dict): Configuration for ConvPolicy when using 'conv' mode:
+            - groups (int): Convolution groups (default: 1)
+            - dilation (int): Dilation rate (default: 1)
+            - dcn (bool): Use deformable convolution (default: False)
+    
+    Returns:
+        nn.Module: Downsampler that takes (B, c, H, W) -> (B, c, H/scale, W/scale)
+    
+    Example:
+        # Use strided conv 2x downsampling
+        down = build_downsampler(256, {"down": "conv", "scale": 2}, {"groups": 1})
+        
+        # Use CARAFE++ 2x downsampling
+        down = build_downsampler(256, {"down": "carafepp", "scale": 2}, {})
+    """
+    typ = (resample_cfg or {}).get("down", "conv").lower()
+    s = (resample_cfg or {}).get("scale", 2)
+    
+    if typ == "conv":
+        # Standard strided convolution downsampling
+        # Uses 3x3 kernel with stride=scale to reduce spatial dimensions
+        # Mirrors existing stride-2 downsample pattern in the architecture
+        return ConvPolicy(c, c, k=3, s=s,
+                          groups=conv_cfg.get("groups", 1),
+                          dilation=conv_cfg.get("dilation", 1),
+                          dcn=dcn)
+    
+    if typ == "carafepp":
+        # Content-aware learnable downsampling
+        # Predicts position-specific kernels to aggregate HR features into LR
+        k = resample_cfg.get("kernel", 5)           # Reassembly kernel size
+        ek = resample_cfg.get("encoder_kernel", 3)  # Encoder kernel size
+        comp = resample_cfg.get("comp", 4)          # Channel compression ratio
+        return CarafePPResample2d(c, mode="down", scale=s, kernel=k, encoder_kernel=ek, comp=comp)
+    
+    raise ValueError(f"Unknown downsampler: {typ}")
+
 
 def build_attn(name: Optional[str], c: int) -> nn.Module:
     """
@@ -804,6 +1043,7 @@ class BaseNeck(nn.Module):
         # Store configuration dicts
         self.conv_cfg = cfg.get('conv_cfg', {})
         self.attn_cfg = cfg.get('attn_cfg', {})
+        self.resample_cfg = cfg.get('resample_cfg', {})
         
         # Build attention modules
         # Per-level attention: applied after channel alignment
@@ -926,6 +1166,9 @@ class FPN(BaseNeck):
         
         # 3x3 smoothing convolutions (applied after fusion to reduce aliasing)
         self.smooth = nn.ModuleList([smooth_3x3(self.out_channels, self.conv_cfg, dcn=self._dcn("smooth_td", i)) for i in range(L)])
+
+        # build the carafe upsampler
+        self.upsample = build_upsampler(self.out_channels, self.resample_cfg)
         
         # Fusion modules for combining lateral and top-down features
         # (Not needed for topmost level)
@@ -967,7 +1210,8 @@ class FPN(BaseNeck):
             li = self.laterals[i](xs[i])
             
             # Upsample coarser FPN feature to current resolution
-            up = self._resize_to(outs[i + 1], li)
+            up = self.upsample(outs[i + 1])
+            up = self._resize_to(up, li)
             
             # Fuse lateral and upsampled features
             fused = self._fusions[i]([li, up])
@@ -1017,8 +1261,12 @@ class PANet(BaseNeck):
         self.td_fpn = FPN(in_channels, out_channels, cfg)
 
         # Bottom-up path: stride-2 convolutions for downsampling
+        # self.down = nn.ModuleList([
+        #     ConvPolicy(self.out_channels, self.out_channels, k=3, s=2, dcn=self._dcn("down_bu", i))
+        #     for i in range(L - 1)
+        # ])
         self.down = nn.ModuleList([
-            ConvPolicy(self.out_channels, self.out_channels, k=3, s=2, dcn=self._dcn("down_bu", i))
+            build_downsampler(self.out_channels, self.resample_cfg, self.conv_cfg, dcn = self._dcn("down_bu", i))
             for i in range(L - 1)
         ])
         
@@ -1103,15 +1351,23 @@ class PAFPN(BaseNeck):
         L = len(self.in_channels)
 
         # Top-down path components
-        self.td_upsample = nn.ModuleList([nn.Upsample(scale_factor=2, mode='nearest') for _ in range(L - 1)])
+        # self.td_upsample = nn.ModuleList([nn.Upsample(scale_factor=2, mode='nearest') for _ in range(L - 1)])
+        self.td_upsample = nn.ModuleList([
+            build_upsampler(self.out_channels, self.resample_cfg)
+            for _ in range(L - 1)
+        ])
         self.td_fuse = nn.ModuleList([
             Fusion('concat', [self.out_channels, self.out_channels], self.out_channels, self.fusion_bins, self.fusion_fc_hidden, self.fusion_fc_channel) for _ in range(L - 1)
         ])
         self.td_smooth = nn.ModuleList([smooth_3x3(self.out_channels, self.conv_cfg, dcn=self._dcn("smooth_td", i)) for i in range(L - 1)])
 
         # Bottom-up path components
+        # self.bu_down = nn.ModuleList([
+        #     ConvPolicy(self.out_channels, self.out_channels, k=3, s=2, dcn=self._dcn("down_bu", i))
+        #     for i in range(L - 1)
+        # ])
         self.bu_down = nn.ModuleList([
-            ConvPolicy(self.out_channels, self.out_channels, k=3, s=2, dcn=self._dcn("down_bu", i))
+            build_downsampler(self.out_channels, self.resample_cfg, self.conv_cfg, dcn = self._dcn("down_bu", i))
             for i in range(L - 1)
         ])
         self.bu_fuse = nn.ModuleList([
