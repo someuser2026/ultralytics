@@ -2257,7 +2257,8 @@ class Timm(nn.Module):
         freeze: bool = False,
         pure_transformers: bool = True,
         dynamic_img_size: bool = False,
-        drop_path_rate: float = 0.15
+        drop_path_rate: float = 0.15,
+        dropout: float = 0.0
     ):
         """
         Load the model from timm with specified configuration.
@@ -2306,6 +2307,9 @@ class Timm(nn.Module):
                 if norm_layer is not None:
                     model_kwargs['norm_layer'] = norm_layer
                 
+                model_kwargs["drop_path_rate"] = drop_path_rate
+                model_kwargs["drop_rate"] = dropout
+                
                 self.m = timm.create_model(model, **model_kwargs)
                 
                 # Adapt the stem for different input channels
@@ -2325,6 +2329,9 @@ class Timm(nn.Module):
                 
                 if norm_layer is not None:
                     model_kwargs['norm_layer'] = norm_layer
+                
+                model_kwargs["drop_path_rate"] = drop_path_rate
+                model_kwargs["drop_rate"] = dropout
                 
                 self.m = timm.create_model(model, **model_kwargs)
                 
