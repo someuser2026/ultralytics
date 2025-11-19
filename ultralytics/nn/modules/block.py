@@ -2307,8 +2307,10 @@ class Timm(nn.Module):
                 if norm_layer is not None:
                     model_kwargs['norm_layer'] = norm_layer
                 
-                model_kwargs["drop_path_rate"] = drop_path_rate
-                model_kwargs["drop_rate"] = dropout
+                if drop_path_rate > 0.0:
+                    model_kwargs["drop_path_rate"] = drop_path_rate
+                if dropout > 0.0:
+                    model_kwargs["drop_rate"] = dropout
                 
                 self.m = timm.create_model(model, **model_kwargs)
                 
@@ -2330,8 +2332,10 @@ class Timm(nn.Module):
                 if norm_layer is not None:
                     model_kwargs['norm_layer'] = norm_layer
                 
-                model_kwargs["drop_path_rate"] = drop_path_rate
-                model_kwargs["drop_rate"] = dropout
+                if drop_path_rate > 0.0:
+                    model_kwargs["drop_path_rate"] = drop_path_rate
+                if dropout > 0.0:
+                    model_kwargs["drop_rate"] = dropout
                 
                 self.m = timm.create_model(model, **model_kwargs)
                 
