@@ -471,7 +471,9 @@ def on_train_end(trainer):
             best_model = trainer.model
         
         # prediction on val set
-        list(best_model.predict(val_dir, True, save_txt = True, project = trainer.args.project, name = os.path.join(trainer.args.name, "labels", "val")))
+        list(best_model.predict(val_dir, True, save_conf = True,
+            save_txt = True, conf = 0.01, project = trainer.args.project, name = os.path.join(trainer.args.name, "labels", "val")
+        ))
         labels_dir = Path(trainer.args.project) / trainer.args.name / "labels"
         val_labels = labels_dir / "val"
         _log_predictions(val_labels, trainer.args.name, "val")
@@ -510,7 +512,9 @@ def on_train_end(trainer):
                     LOGGER.info(f"Test evaluation complete. mAP50-95: {map_value:.4f}")
 
                 # store predictions on val and test set for downstream processing
-                list(best_model.predict(test_dir, True, save_txt = True, batch = 2, project = trainer.args.project, name = os.path.join(trainer.args.name, "labels", "test")))
+                list(best_model.predict(test_dir, True, conf = 0.01, save_conf = True,
+                    save_txt = True, batch = 2, project = trainer.args.project, name = os.path.join(trainer.args.name, "labels", "test")
+                ))
                 test_labels = labels_dir / "test"
                 if test_labels.exists():
                     _log_predictions(test_labels, trainer.args.name, "test")
