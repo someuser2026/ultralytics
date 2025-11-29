@@ -452,7 +452,7 @@ class DetectionModel(BaseModel):
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
             s = deepcopy(self.yaml["stride"])  # 2x min stride
-            ps = deepcopy(self.yaml["patch_size"], None)  # pathc_size for transform based models
+            ps = deepcopy(self.yaml.get("patch_size", None))  # pathc_size for transform based models
             # s = self.yaml.pop("stride")
             # s = 256
             m.inplace = self.inplace
