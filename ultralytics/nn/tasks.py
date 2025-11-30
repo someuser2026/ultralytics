@@ -470,15 +470,19 @@ class DetectionModel(BaseModel):
             print("Inside task.py 439")
             print("s:", s)
             print("m.stride:", m.stride)
-            print("-"*50)
             self.stride = m.stride
             if ps:
                 ps = int(ps)
                 max_stride_pos = torch.argmax(self.stride)
                 max_stride = int(self.stride[max_stride_pos].item())
-                new_max_stride = int((max_stride * ps) // (math.gcd(max_stride, ps)))
-                self.stride[max_stride_pos] = torch.Tensor(new_max_stride).to(self.stride.dtype)
+                new_max_stride = int(int(max_stride * ps) // (math.gcd(max_stride, ps)))
+                print("ps:", ps)
+                print("max_stride_pos:", max_stride_pos)
+                print("new_max_stride:", new_max_stride)
+                self.stride[max_stride_pos] = torch.Tensor([new_max_stride]).to(self.stride.dtype)
+                print("self.stride:", self.stride)
             self.model.train()  # Set model back to training(default) mode
+            print("-"*50)
             m.bias_init()  # only run once
         else:
             self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
