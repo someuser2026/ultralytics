@@ -352,7 +352,7 @@ def on_pretrain_routine_start(trainer):
         if 'model' in config and config['model']:
             config['model'] = os.path.basename(config['model'])
         
-        project_cleaned = "-".join(str(trainer.args.project).split("/")[-3:]) if trainer.args.project else "Ultralytics"
+        project_cleaned = "-".join(str(trainer.args.project).split("/")[-3:]).replace("yolo", "") if trainer.args.project else "Ultralytics"
         
         wb.init(
             project=project_cleaned,
