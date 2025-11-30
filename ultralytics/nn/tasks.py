@@ -452,7 +452,7 @@ class DetectionModel(BaseModel):
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
             s = deepcopy(self.yaml["stride"])  # 2x min stride
-            ps = deepcopy(self.yaml.get("patch_size", None))  # pathc_size for transform based models
+            ps = int(deepcopy(self.yaml.get("patch_size", None)))  # pathc_size for transform based models
             # s = self.yaml.pop("stride")
             # s = 256
             m.inplace = self.inplace
@@ -474,9 +474,9 @@ class DetectionModel(BaseModel):
             self.stride = m.stride
             if ps:
                 max_stride_pos = torch.argmax(self.stride)
-                max_stride = self.stride[max_stride_pos].item()
+                max_stride = int(self.stride[max_stride_pos].item())
                 new_max_stride = int((max_stride * ps) // (math.gcd(max_stride, ps)))
-                self.stride[max_stride_pos] = torch.Tensor(new_max_stride)
+                self.stride[max_stride_pos] = torch.Tensor(new_max_stride).to(self.stride.dtype)
             self.model.train()  # Set model back to training(default) mode
             m.bias_init()  # only run once
         else:
