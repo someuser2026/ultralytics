@@ -38,7 +38,8 @@ from .augment import (
     SteerableFilters,
     Gabor,
     DoG,
-    RidgeFilters
+    RidgeFilters,
+    AddWaterDepthIndices
 )
 from .base import BaseDataset
 from .converter import merge_multi_segment
@@ -251,6 +252,7 @@ class YOLODataset(BaseDataset):
                 Gabor(getattr(hyp, "gabor_p", False)),
                 DoG(getattr(hyp, "dog_p", False)),
                 RidgeFilters(getattr(hyp, "ridge_p", False)),
+                AddWaterDepthIndices(getattr(hyp, "water_depth_indices_p", False)),
             ])
         transforms.append(
             Format(

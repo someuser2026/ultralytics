@@ -3432,6 +3432,153 @@ class RidgeFilters:
         labels["img"] = _append_channels(img, [out])
         return labels
 
+class AddWaterDepthIndices:
+    """
+    Compute NDWI, automatically determine a water threshold using Otsu,
+    generate a water mask, compute depth-sensitive indices, and append
+    them as channels.
+    Outputs:
+        - NDWI normalized
+        - Water mask (binary)
+        - Blue/Green ratio (masked)
+        - Depth Proxy ln(B) - ln(G) (masked)
+    Attributes:
+        p (bool): Probability of applying the augmentation.
+        eps (float): Numerical stability constant.
+        clamp_min, clamp_max: Bounds for valid NDWI threshold.
+    """
+    def __init__(
+        self,
+        p: bool = False,
+        eps: float = 1e-6,
+        clamp_min: float = -0.05,
+        clamp_max: float = 0.10
+    ) -> None:
+        """
+        Initialize the AddWaterDepthIndices augmentation.
+
+        Args:
+            p (float): On/off flag for augmentation. Default: False (disabled).
+            eps (float): Epsilon for numerical stability. Default: 1e-6.
+            clamp_min (float): Minimum NDWI threshold bound. Default: -0.05.
+            clamp_max (float): Maximum NDWI threshold bound. Default: 0.10.
+        """
+        self.p = p
+        self.eps = eps
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+
+    def _compute_ndwi_threshold(self, ndwi: np.ndarray) -> float:
+        """
+        Compute robust NDWI threshold using Otsu on a normalized NDWI histogram,
+        convert back to NDWI scale, and clamp to a realistic range.
+        Args:
+            ndwi: float32 NDWI array.
+        Returns:
+            float NDWI threshold.
+        """
+        # Normalize NDWI to 0–255 for Otsu's method histogram analysis
+        ndwi_norm = cv2.normalize(ndwi, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        
+        # Apply Otsu's thresholding to automatically find optimal threshold value
+        # in [0, 255] space that minimizes within-class variance
+        otsu_val, _ = cv2.threshold(
+            ndwi_norm, 0, 255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        
+        # Convert Otsu threshold from normalized [0, 255] space back to actual NDWI value range
+        # Linear inverse mapping: [0, 255] → [ndwi_min, ndwi_max]
+        ndwi_min = float(ndwi.min())
+        ndwi_max = float(ndwi.max())
+        T = ndwi_min + (otsu_val / 255.0) * (ndwi_max - ndwi_min)
+        
+        # Clamp to physically meaningful NDWI range to prevent unrealistic thresholds
+        # Typical water NDWI ranges [0, 0.3]; land/vegetation typically ≤ 0
+        T = float(np.clip(T, self.clamp_min, self.clamp_max))
+        
+        return T
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Apply water depth indices augmentation to an image.
+
+        Args:
+            labels (dict): Dictionary containing image data with key 'img'. Expected shape: (H, W, 4)
+                with channels [B, G, R, NIR].
+
+        Returns:
+            dict: Updated labels dict with augmented image (H, W, 8) containing original RGB + NIR
+                plus 4 new channels: [NDWI_norm, water_mask, bg_ratio, depth_proxy].
+
+        Raises:
+            ValueError: If input image has fewer than 4 bands.
+        """
+        # Skip augmentation if disabled (p=False or p=0)
+        if not self.p:
+            return labels
+        
+        img = labels["img"]
+        
+        # Validate input has 4 bands (RGB + NIR)
+        if img.shape[2] < 4:
+            raise ValueError("AddWaterDepthIndices requires 4-band RGB+NIR input")
+        
+        # Extract individual bands and convert to float32 for numerical operations
+        B = img[..., 0].astype(np.float32)  # Blue
+        G = img[..., 1].astype(np.float32)  # Green
+        R = img[..., 2].astype(np.float32)  # Red
+        NIR = img[..., 3].astype(np.float32)  # Near-Infrared
+        
+        # --------------------------
+        # 1. Compute NDWI
+        # --------------------------
+        # NDWI = (G - NIR) / (G + NIR) detects water bodies based on spectral difference
+        # High values indicate water; negative/low values indicate vegetation or land
+        ndwi = (G - NIR) / (G + NIR + self.eps)
+        
+        # Normalize NDWI to [0, 255] for use as a channel and visualization
+        ndwi_norm = cv2.normalize(ndwi, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        
+        # --------------------------
+        # 2. Automatically compute threshold via Otsu
+        # --------------------------
+        # Compute adaptive threshold that best separates water from non-water in histogram
+        T = self._compute_ndwi_threshold(ndwi)
+        
+        # Binary water mask: pixels with NDWI > T are water (255), others are non-water (0)
+        water_mask = (ndwi > T).astype(np.uint8) * 255
+        
+        # Convert water mask to float [0.0, 1.0] for elementwise multiplication masking
+        water_mask_f = water_mask.astype(np.float32) / 255.0
+        
+        # --------------------------
+        # 3. Depth Indices
+        # --------------------------
+        # Blue/Green Ratio: B/G attenuates with water depth due to selective wavelength absorption
+        # Longer wavelengths (green) penetrate deeper, so ratio increases with depth
+        bg = B / (G + self.eps)
+        bg *= water_mask_f  # Mask to water pixels only (zero out land/vegetation)
+        bg_norm = cv2.normalize(bg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        
+        # Depth Proxy ln(B) - ln(G): log-ratio model for bathymetric depth estimation
+        # Based on Beer-Lambert law of light absorption in water
+        depth = np.log(B + self.eps) - np.log(G + self.eps)
+        depth *= water_mask_f  # Mask to water pixels only (zero out land/vegetation)
+        depth_norm = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        
+        # --------------------------
+        # 4. Append channels
+        # --------------------------
+        # Concatenate 4 new channels to original 4-band image, resulting in 8-band output
+        # New channels: [NDWI_norm, water_mask, bg_ratio, depth_proxy]
+        labels["img"] = _append_channels(
+            img,
+            [ndwi_norm, water_mask, bg_norm, depth_norm]
+        )
+        
+        return labels
+
 class Format:
     """
     A class for formatting image annotations for object detection, instance segmentation, and pose estimation tasks.
@@ -3980,6 +4127,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
             Gabor(getattr(hyp, "gabor_p", False)),
             DoG(getattr(hyp, "dog_p", False)),
             RidgeFilters(getattr(hyp, "ridge_p", False)),
+            AddWaterDepthIndices(getattr(hyp, "water_depth_indices_p", False)),
         ]
     )  # transforms
 

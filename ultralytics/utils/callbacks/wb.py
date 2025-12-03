@@ -536,7 +536,8 @@ def on_train_end(trainer):
         # Generate and log F2 visualization grids
         # Creates 4 grids: 2 showing best predictions, 2 showing worst predictions
         # Each grid contains 8 examples in 4×4 layout
-        _ux_build_and_log_f2_grids(trainer, per_grid=8)
+        # _ux_build_and_log_f2_grids(trainer, per_grid=8)
+        pass
     except Exception as e:
         # Log failures gracefully without interrupting training cleanup
         # from ultralytics.utils import LOGGER
