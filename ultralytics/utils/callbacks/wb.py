@@ -355,8 +355,8 @@ def on_pretrain_routine_start(trainer):
         # clean the project name for wandb
         proj_name_parts = str(trainer.args.project).split("/")
         req_parts = [p for p in proj_name_parts if "imgsz" in p]
-        req_parts = req_parts.extend(trainer.args.task)
-        req_parts = req_parts.extend(proj_name_parts[-1])
+        req_parts.extend(trainer.args.task)
+        req_parts.extend(proj_name_parts[-1])
         project_cleaned = "-".join(req_parts) if req_parts else "Ultralytics"
         project_cleaned = project_cleaned.replace("yolo", "")
         
