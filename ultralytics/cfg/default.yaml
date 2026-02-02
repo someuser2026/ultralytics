@@ -39,6 +39,12 @@ freeze: # (int | list, optional) freeze first N layers (int) or specific layer i
 unfreeze: # (int | list, optional) unfreeze first N layers (int) or specific layer indices (list)
 multi_scale: False # (bool) multiscale training by varying image size
 compile: False # (bool | str) enable torch.compile() backend='inductor'; True="default", False=off, or "default|reduce-overhead|max-autotune-no-cudagraphs"
+reset_args: True # (bool) reset args when loading a PyTorch model checkpoint
+reset_args_keys:
+  - imgsz
+  - data
+  - task
+  - single_cls
 
 # Segmentation
 overlap_mask: true # (bool) merge instance masks into one mask during training (segment only)

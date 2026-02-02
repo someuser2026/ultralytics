@@ -2175,8 +2175,8 @@ def parse_model(d, ch, verbose=True):
                     args[3] = True
             if m is A2C2f:
                 legacy = False
-                if scale in "lx":  # for L/X sizes
-                    args.extend((True, 1.2))
+                # if scale in "lx":  # for L/X sizes
+                #     args.extend((True, 1.2))
             if m is C2fCIB:
                 legacy = False
         elif m is AIFI:

@@ -1382,9 +1382,25 @@ class Metric(SimpleClass):
         """Return mean of results, mp, mr, map50, map."""
         return [self.mp, self.mr, self.map50, self.map]
 
-    def class_result(self, i: int) -> tuple[float, float, float, float]:
-        """Return class-aware result, p[i], r[i], ap50[i], ap[i]."""
-        return self.p[i], self.r[i], self.ap50[i], self.ap[i]
+    def class_result(self, i: int) -> tuple[float, ...]:
+        """Return class-aware result: p[i], r[i], ap50[i], ap[i], f1[i], f2[i], ap_small[i], ap_medium[i], ap_large[i]."""
+        def _at(arr, idx: int) -> float:
+            if hasattr(arr, "__len__") and len(arr) > idx:
+                val = arr[idx]
+                return float(val) if hasattr(val, "item") else val
+            return 0.0
+
+        return (
+            _at(self.p, i),
+            _at(self.r, i),
+            _at(self.ap50, i),
+            _at(self.ap, i),
+            _at(self.f1, i),
+            _at(self.f2, i),
+            _at(self.ap_small, i),
+            _at(self.ap_medium, i),
+            _at(self.ap_large, i),
+        )
 
     @property
     def maps(self) -> np.ndarray:

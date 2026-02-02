@@ -350,9 +350,15 @@ def on_pretrain_routine_start(trainer):
         
         # Shorten the 'model' path if it exists
         if 'model' in config and config['model']:
-            config['model'] = os.path.basename(config['model'])
+            config['model_short'] = os.path.basename(config['model'])
         
-        project_cleaned = "-".join(str(trainer.args.project).split("/")[-3:]).replace("yolo", "") if trainer.args.project else "Ultralytics"
+        # clean the project name for wandb
+        proj_name_parts = str(trainer.args.project).split("/")
+        req_parts = [p for p in proj_name_parts if "imgsz" in p]
+        req_parts = req_parts.extend(trainer.args.task)
+        req_parts = req_parts.extend(proj_name_parts[-1])
+        project_cleaned = "-".join(req_parts) if req_parts else "Ultralytics"
+        project_cleaned = project_cleaned.replace("yolo", "")
         
         wb.init(
             project=project_cleaned,

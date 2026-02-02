@@ -1058,6 +1058,14 @@ class Model(torch.nn.Module):
             {'imgsz': 640, 'data': 'coco.yaml', 'task': 'detect'}
         """
         include = {"imgsz", "data", "task", "single_cls"}  # only remember these arguments when loading a PyTorch model
+        if args.get("reset_args"):
+            include = args.get("reset_args_keys")
+            if include:
+                include = [k for k in include if k in args]
+            else:
+                include = {"imgsz", "data", "task", "single_cls"}
+        else:
+            include = args.keys()
         return {k: v for k, v in args.items() if k in include}
 
     # def __getattr__(self, attr):

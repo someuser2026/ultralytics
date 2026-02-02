@@ -412,6 +412,8 @@ def compute_channels(channels, hyp):
         orig_channels += 1
     if getattr(hyp, "gabor_p", False):
         orig_channels += 1
+    if getattr(hyp, "water_depth_indices_p", False):
+        orig_channels += 4
     return orig_channels
 
 
