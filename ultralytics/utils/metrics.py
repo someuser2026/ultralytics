@@ -1380,7 +1380,7 @@ class Metric(SimpleClass):
 
     def mean_results(self) -> List[float]:
         """Return mean of results, mp, mr, map50, map."""
-        return [self.mp, self.mr, self.map50, self.map]
+        return [self.mp, self.mr, self.map50, self.map, self.mf1, self.mf2, self.map_small, self.map_medium, self.map_large]
 
     def class_result(self, i: int) -> tuple[float, ...]:
         """Return class-aware result: p[i], r[i], ap50[i], ap[i], f1[i], f2[i], ap_small[i], ap_medium[i], ap_large[i]."""
@@ -1746,13 +1746,14 @@ class DetMetrics(SimpleClass, DataExportMixin):
 
     def mean_results(self) -> List[float]:
         """Calculate mean of detected objects & return precision, recall, mAP50, mAP50-95, and mF2."""
-        return self.box.mean_results() + [
-            self.box.mf1, self.box.mf2,
-            # self.box.mr_low_iou,  # ADD
-            self.box.map_small,   # ADD
-            self.box.map_medium,  # ADD
-            self.box.map_large    # ADD
-        ]
+        return self.box.mean_results()
+        # + [
+        #     self.box.mf1, self.box.mf2,
+        #     # self.box.mr_low_iou,  # ADD
+        #     self.box.map_small,   # ADD
+        #     self.box.map_medium,  # ADD
+        #     self.box.map_large    # ADD
+        # ]
 
     def class_result(self, i: int) -> tuple[float, float, float, float]:
         """Return the result of evaluating the performance of an object detection model on a specific class."""
@@ -2349,6 +2350,9 @@ class SegmentMetrics(DetMetrics):
             "metrics/mAP50-95(M)",
             "metrics/f1(M)",
             "metrics/f2(M)",
+            "metrics/mAP_small(M)",
+            "metrics/mAP_medium(M)",
+            "metrics/mAP_large(M)",
             "metrics/dice(M)",
             "metrics/mIoU(M)",
             "metrics/boundaryF1(M)",
@@ -2373,8 +2377,6 @@ class SegmentMetrics(DetMetrics):
             >>> print(f"Mean Dice: {results[-3]:.3f}, Mean IoU: {results[-2]:.3f}, Mean BF1: {results[-1]:.3f}")
         """
         return DetMetrics.mean_results(self) + self.seg.mean_results() + [
-            self.seg.mf1,
-            self.seg.mf2, 
             self.mdice, 
             self.miou, 
             self.mbf1,
@@ -2398,7 +2400,17 @@ class SegmentMetrics(DetMetrics):
             >>> cat_metrics = metrics.class_result(0)
             >>> print(f"Cat AP: {cat_metrics[2]:.3f}")
         """
-        return DetMetrics.class_result(self, i) + self.seg.class_result(i)
+        # compute class specific metrics
+        iou_inter = self._iou_inter[i]
+        iou_union = self._iou_union[i]
+        dice = (2 * iou_inter) / (iou_union + 1e-7) if iou_union > 0 else 0.0
+        iou = iou_inter / (iou_union + 1e-7) if iou_union > 0 else 0.0
+        return DetMetrics.class_result(self, i) + self.seg.class_result(i) + tuple([
+            dice,  # Placeholder for class-specific Dice (not computed per class)
+            iou,  # Placeholder for class-specific mIoU (not computed per class)
+            float('nan'),  # Placeholder for class-specific boundary F1 (not computed per class)
+            float('nan')   # Placeholder for class-specific boundary IoU (not computed per class)
+        ])
 
     @property
     def maps(self) -> np.ndarray:

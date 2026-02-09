@@ -93,18 +93,32 @@ class SegmentationValidator(DetectionValidator):
 
     def get_desc(self) -> str:
         """Return a formatted description of evaluation metrics."""
-        return ("%22s" + "%11s" * 10) % (
+        return ("%22s" + "%11s" * 24) % (
             "Class",
             "Images",
             "Instances",
             "Box(P",
             "R",
             "mAP50",
-            "mAP50-95)",
+            "mAP50-95",
+            "F1",
+            "F2",
+            "mAP_small",
+            "mAP_medium",
+            "mAP_large)",
             "Mask(P",
             "R",
             "mAP50",
-            "mAP50-95)",
+            "mAP50-95",
+            "F1",
+            "F2",
+            "mAP_small",
+            "mAP_medium",
+            "mAP_large",
+            "mdice",
+            "miou",
+            "mboundaryF1",
+            "mboundaryIoU)"
         )
 
     def postprocess(self, preds: list[torch.Tensor]) -> list[dict[str, torch.Tensor]]:
