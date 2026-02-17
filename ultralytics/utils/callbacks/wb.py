@@ -3,6 +3,7 @@
 import yaml
 from pathlib import Path
 import os
+import shutil
 from copy import deepcopy
 import numpy as np
 from PIL import Image
@@ -424,10 +425,32 @@ def _get_val_test_dir(data_spec) -> tuple[bool, Path, Path]:
     return False
 
 def _log_predictions(pred_dir, run_name, subset):
-    LOGGER.info(f"Logging test labels from {pred_dir} to wandb")
-    artifact = wb.Artifact(run_name + "_predictions_" + subset, type = "predictions_" + subset)
-    artifact.add_dir(str(pred_dir))
-    wb.log_artifact(artifact)
+    pred_dir = Path(pred_dir)
+    if not pred_dir.exists():
+        LOGGER.warning(f"Skipping W&B upload; labels directory does not exist: {pred_dir}")
+        return False
+
+    try:
+        LOGGER.info(f"Logging {subset} labels from {pred_dir} to wandb")
+        artifact = wb.Artifact(run_name + "_predictions_" + subset, type="predictions_" + subset)
+        artifact.add_dir(str(pred_dir))
+        logged_artifact = wb.log_artifact(artifact)
+
+        # Wait for upload completion when available so local cleanup only happens after a successful upload.
+        if hasattr(logged_artifact, "wait"):
+            logged_artifact.wait()
+
+        shutil.rmtree(pred_dir)
+        try:
+            pred_dir.parent.rmdir()  # remove parent labels dir if now empty
+        except OSError:
+            pass
+
+        LOGGER.info(f"Uploaded {subset} labels to wandb and removed local directory: {pred_dir}")
+        return True
+    except Exception as e:
+        LOGGER.warning(f"Failed to upload {subset} labels to wandb. Keeping local directory {pred_dir}. Error: {e}")
+        return False
 
 
 def on_train_end(trainer):
