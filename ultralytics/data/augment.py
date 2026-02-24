@@ -843,10 +843,12 @@ class Mosaic(BaseMixTransform):
         if not mosaic_labels:
             return {}
         cls = []
+        cls_probs = []
         instances = []
         imgsz = self.imgsz * 2  # mosaic imgsz
         for labels in mosaic_labels:
             cls.append(labels["cls"])
+            cls_probs.append(labels.get("cls_probs", np.ones((len(labels["cls"]), 1), dtype=np.float32)))
             instances.append(labels["instances"])
         # Final labels
         final_labels = {
@@ -854,12 +856,14 @@ class Mosaic(BaseMixTransform):
             "ori_shape": mosaic_labels[0]["ori_shape"],
             "resized_shape": (imgsz, imgsz),
             "cls": np.concatenate(cls, 0),
+            "cls_probs": np.concatenate(cls_probs, 0),
             "instances": Instances.concatenate(instances, axis=0),
             "mosaic_border": self.border,
         }
         final_labels["instances"].clip(imgsz, imgsz)
         good = final_labels["instances"].remove_zero_area_boxes()
         final_labels["cls"] = final_labels["cls"][good]
+        final_labels["cls_probs"] = final_labels["cls_probs"][good]
         if "texts" in mosaic_labels[0]:
             final_labels["texts"] = mosaic_labels[0]["texts"]
         return final_labels
@@ -925,9 +929,12 @@ class MixUp(BaseMixTransform):
         """
         r = np.random.beta(32.0, 32.0)  # mixup ratio, alpha=beta=32.0
         labels2 = labels["mix_labels"][0]
+        probs1 = labels.get("cls_probs", np.ones((len(labels["cls"]), 1), dtype=np.float32))
+        probs2 = labels2.get("cls_probs", np.ones((len(labels2["cls"]), 1), dtype=np.float32))
         labels["img"] = (labels["img"] * r + labels2["img"] * (1 - r)).astype(np.uint8)
         labels["instances"] = Instances.concatenate([labels["instances"], labels2["instances"]], axis=0)
         labels["cls"] = np.concatenate([labels["cls"], labels2["cls"]], 0)
+        labels["cls_probs"] = np.concatenate([probs1, probs2], 0)
         return labels
 
 
@@ -1045,6 +1052,9 @@ class CutMix(BaseMixTransform):
         instances2.add_padding(x1, y1)
 
         labels["cls"] = np.concatenate([labels["cls"], labels2["cls"][indexes2]], axis=0)
+        probs1 = labels.get("cls_probs", np.ones((len(labels["cls"]) - len(indexes2), 1), dtype=np.float32))
+        probs2 = labels2.get("cls_probs", np.ones((len(labels2["cls"]), 1), dtype=np.float32))
+        labels["cls_probs"] = np.concatenate([probs1, probs2[indexes2]], axis=0)
         labels["instances"] = Instances.concatenate([labels["instances"], instances2], axis=0)
         return labels
 
@@ -1330,6 +1340,7 @@ class RandomPerspective:
 
         img = labels["img"]
         cls = labels["cls"]
+        cls_probs = labels.get("cls_probs", np.ones((len(cls), 1), dtype=np.float32))
         instances = labels.pop("instances")
         # Make sure the coord formats are right
         instances.convert_bbox(format="xyxy")
@@ -1363,6 +1374,7 @@ class RandomPerspective:
         )
         labels["instances"] = new_instances[i]
         labels["cls"] = cls[i]
+        labels["cls_probs"] = cls_probs[i]
         labels["img"] = img
         labels["resized_shape"] = img.shape[:2]
         return labels
@@ -1848,6 +1860,7 @@ class CopyPaste(BaseMixTransform):
         if "mosaic_border" not in labels1:
             im = im.copy()  # avoid modifying original non-mosaic image
         cls = labels1["cls"]
+        cls_probs = labels1.get("cls_probs", np.ones((len(cls), 1), dtype=np.float32))
         h, w = im.shape[:2]
         instances = labels1.pop("instances")
         instances.convert_bbox(format="xyxy")
@@ -1865,6 +1878,11 @@ class CopyPaste(BaseMixTransform):
         indexes = indexes[sorted_idx]
         for j in indexes[: round(self.p * n)]:
             cls = np.concatenate((cls, labels2.get("cls", cls)[[j]]), axis=0)
+            probs2 = labels2.get(
+                "cls_probs",
+                np.ones((len(labels2.get("cls", cls)), 1), dtype=np.float32),
+            )
+            cls_probs = np.concatenate((cls_probs, probs2[[j]]), axis=0)
             instances = Instances.concatenate((instances, instances2[[j]]), axis=0)
             cv2.drawContours(im_new, instances2.segments[[j]].astype(np.int32), -1, (1, 1, 1), cv2.FILLED)
 
@@ -1876,6 +1894,7 @@ class CopyPaste(BaseMixTransform):
 
         labels1["img"] = im
         labels1["cls"] = cls
+        labels1["cls_probs"] = cls_probs
         labels1["instances"] = instances
         return labels1
 
@@ -2022,7 +2041,7 @@ class Albumentations:
             # Compose transforms
             self.contains_spatial = any(transform.__class__.__name__ in spatial_transforms for transform in T)
             self.transform = (
-                A.Compose(T, bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"]))
+                A.Compose(T, bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels", "cls_probs"]))
                 if self.contains_spatial
                 else A.Compose(T)
             )
@@ -2078,15 +2097,24 @@ class Albumentations:
 
         if self.contains_spatial:
             cls = labels["cls"]
+            cls_probs = labels.get("cls_probs", np.ones((len(cls), 1), dtype=np.float32))
             if len(cls):
                 labels["instances"].convert_bbox("xywh")
                 labels["instances"].normalize(*im.shape[:2][::-1])
                 bboxes = labels["instances"].bboxes
                 # TODO: add supports of segments and keypoints
-                new = self.transform(image=im, bboxes=bboxes, class_labels=cls)  # transformed
+                class_labels = np.asarray(cls).reshape(-1).tolist()
+                prob_labels = np.asarray(cls_probs).reshape(-1).tolist()
+                new = self.transform(
+                    image=im,
+                    bboxes=bboxes,
+                    class_labels=class_labels,
+                    cls_probs=prob_labels,
+                )  # transformed
                 if len(new["class_labels"]) > 0:  # skip update if no bbox in new im
                     labels["img"] = new["image"]
-                    labels["cls"] = np.array(new["class_labels"])
+                    labels["cls"] = np.asarray(new["class_labels"], dtype=np.float32).reshape(-1, 1)
+                    labels["cls_probs"] = np.asarray(new["cls_probs"], dtype=np.float32).reshape(-1, 1)
                     bboxes = np.array(new["bboxes"], dtype=np.float32)
                 labels["instances"].update(bboxes=bboxes)
         else:
@@ -3696,14 +3724,17 @@ class Format:
         img = labels.pop("img")
         h, w = img.shape[:2]
         cls = labels.pop("cls")
+        cls_probs = labels.pop("cls_probs", np.ones((len(cls), 1), dtype=np.float32))
         instances = labels.pop("instances")
         instances.convert_bbox(format=self.bbox_format)
         instances.denormalize(w, h)
         nl = len(instances)
+        if len(cls_probs) != nl:
+            cls_probs = np.ones((nl, 1), dtype=np.float32)
 
         if self.return_mask:
             if nl:
-                masks, instances, cls = self._format_segments(instances, cls, w, h)
+                masks, instances, cls, cls_probs = self._format_segments(instances, cls, cls_probs, w, h)
                 masks = torch.from_numpy(masks)
             else:
                 masks = torch.zeros(
@@ -3712,6 +3743,7 @@ class Format:
             labels["masks"] = masks
         labels["img"] = self._format_img(img)
         labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl, 1)
+        labels["cls_probs"] = torch.from_numpy(cls_probs) if nl else torch.zeros(nl, 1)
         labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((nl, 4))
         if self.return_keypoint:
             labels["keypoints"] = (
@@ -3765,8 +3797,8 @@ class Format:
         return img
 
     def _format_segments(
-        self, instances: Instances, cls: np.ndarray, w: int, h: int
-    ) -> tuple[np.ndarray, Instances, np.ndarray]:
+        self, instances: Instances, cls: np.ndarray, cls_probs: np.ndarray, w: int, h: int
+    ) -> tuple[np.ndarray, Instances, np.ndarray, np.ndarray]:
         """
         Convert polygon segments to bitmap masks.
 
@@ -3792,10 +3824,11 @@ class Format:
             masks = masks[None]  # (640, 640) -> (1, 640, 640)
             instances = instances[sorted_idx]
             cls = cls[sorted_idx]
+            cls_probs = cls_probs[sorted_idx]
         else:
             masks = polygons2masks((h, w), segments, color=1, downsample_ratio=self.mask_ratio)
 
-        return masks, instances, cls
+        return masks, instances, cls, cls_probs
 
 
 class LoadVisualPrompt:
@@ -4016,6 +4049,8 @@ class RandomLoadText:
             new_cls.append([label2ids[label]])
         labels["instances"] = labels["instances"][valid_idx]
         labels["cls"] = np.array(new_cls)
+        if "cls_probs" in labels:
+            labels["cls_probs"] = labels["cls_probs"][valid_idx]
 
         # Randomly select one prompt when there's more than one prompts
         texts = []

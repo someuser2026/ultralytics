@@ -451,7 +451,12 @@ class DetectionModel(BaseModel):
         # Build strides
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
-            s = deepcopy(self.yaml["stride"])  # 2x min stride
+            stride_cfg = deepcopy(self.yaml.get("stride", 256))
+            if isinstance(stride_cfg, (list, tuple)):
+                # Probe with a valid image size even when stride is provided as a pyramid list (e.g. [8, 16, 32]).
+                s = max(int(max(stride_cfg) * 2), 32)
+            else:
+                s = max(int(stride_cfg), 32)
             ps = deepcopy(self.yaml.get("patch_size", None))  # pathc_size for transform based models
             # s = self.yaml.pop("stride")
             # s = 256

@@ -410,6 +410,37 @@ class v8DetectionLoss:
             out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
         return out
 
+    @staticmethod
+    def _get_batch_cls_probs(batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Return per-target class probabilities with fallback to hard labels."""
+        cls = batch["cls"].view(-1, 1)
+        return batch.get("cls_probs", torch.ones_like(cls)).view(-1, 1).to(device=cls.device, dtype=cls.dtype)
+
+    @staticmethod
+    def _gather_assigned_cls_probs(
+        gt_probs: torch.Tensor,
+        target_gt_idx: torch.Tensor,
+        fg_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather per-anchor label probabilities for assigned ground truths."""
+        if gt_probs.numel() == 0 or gt_probs.shape[1] == 0:
+            return torch.zeros_like(target_gt_idx, dtype=gt_probs.dtype, device=target_gt_idx.device)
+        bs, n_max_boxes, _ = gt_probs.shape
+        batch_ind = torch.arange(bs, device=gt_probs.device)[:, None]
+        matched_probs = gt_probs.squeeze(-1)[batch_ind, target_gt_idx.clamp(0, n_max_boxes - 1)]
+        return torch.where(fg_mask.bool(), matched_probs, torch.zeros_like(matched_probs))
+
+    @staticmethod
+    def _scale_target_scores_with_probs(
+        target_scores: torch.Tensor,
+        gt_probs: torch.Tensor,
+        target_gt_idx: torch.Tensor,
+        fg_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Scale assigned target scores by ground-truth class probabilities."""
+        matched_probs = v8DetectionLoss._gather_assigned_cls_probs(gt_probs, target_gt_idx, fg_mask)
+        return target_scores * matched_probs.unsqueeze(-1).to(target_scores.dtype)
+
     def bbox_decode(self, anchor_points: torch.Tensor, pred_dist: torch.Tensor) -> torch.Tensor:
         """Decode predicted object bounding box coordinates from anchor points and distribution."""
         if self.use_dfl:
@@ -436,9 +467,11 @@ class v8DetectionLoss:
         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
 
         # Targets
-        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        cls_probs = self._get_batch_cls_probs(batch)
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"], cls_probs), 1)
         targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        gt_labels, gt_bboxes, gt_probs = targets.split((1, 4, 1), 2)  # cls, xyxy, prob
+        gt_probs = gt_probs.clamp_(0.0, 1.0)
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
         # Pboxes
@@ -446,7 +479,7 @@ class v8DetectionLoss:
         # dfl_conf = pred_distri.view(batch_size, -1, 4, self.reg_max).detach().softmax(-1)
         # dfl_conf = (dfl_conf.amax(-1).mean(-1) + dfl_conf.amax(-1).amin(-1)) / 2
 
-        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             # pred_scores.detach().sigmoid() * 0.8 + dfl_conf.unsqueeze(-1) * 0.2,
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
@@ -455,6 +488,7 @@ class v8DetectionLoss:
             gt_bboxes,
             mask_gt,
         )
+        target_scores = self._scale_target_scores_with_probs(target_scores, gt_probs, target_gt_idx, fg_mask)
 
         target_scores_sum = max(target_scores.sum(), 1)
 
@@ -777,9 +811,11 @@ class v8SegmentationLoss(v8DetectionLoss):
         # Targets
         try:
             batch_idx = batch["batch_idx"].view(-1, 1)
-            targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+            cls_probs = self._get_batch_cls_probs(batch)
+            targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"], cls_probs), 1)
             targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-            gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+            gt_labels, gt_bboxes, gt_probs = targets.split((1, 4, 1), 2)  # cls, xyxy, prob
+            gt_probs = gt_probs.clamp_(0.0, 1.0)
             mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
         except RuntimeError as e:
             raise TypeError(
@@ -801,6 +837,8 @@ class v8SegmentationLoss(v8DetectionLoss):
             gt_bboxes,
             mask_gt,
         )
+        target_scores = self._scale_target_scores_with_probs(target_scores, gt_probs, target_gt_idx, fg_mask)
+        assigned_probs = self._gather_assigned_cls_probs(gt_probs, target_gt_idx, fg_mask)
 
         target_scores_sum = max(target_scores.sum(), 1)
 
@@ -825,7 +863,16 @@ class v8SegmentationLoss(v8DetectionLoss):
                 masks = F.interpolate(masks[None], (mask_h, mask_w), mode="nearest")[0]
 
             loss[1] = self.calculate_segmentation_loss(
-                fg_mask, masks, target_gt_idx, target_bboxes, batch_idx, proto, pred_masks, imgsz, self.overlap
+                fg_mask,
+                masks,
+                target_gt_idx,
+                target_bboxes,
+                batch_idx,
+                proto,
+                pred_masks,
+                imgsz,
+                self.overlap,
+                fg_probs=assigned_probs,
             )
 
         # WARNING: lines below prevent Multi-GPU DDP 'unused gradient' PyTorch errors, do not remove
@@ -934,6 +981,7 @@ class v8SegmentationLoss(v8DetectionLoss):
         pred_masks: torch.Tensor,
         imgsz: torch.Tensor,
         overlap: bool,
+        fg_probs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Calculate the loss for instance segmentation.
@@ -948,6 +996,7 @@ class v8SegmentationLoss(v8DetectionLoss):
             pred_masks (torch.Tensor): Predicted masks for each anchor of shape (BS, N_anchors, 32).
             imgsz (torch.Tensor): Size of the input image as a tensor of shape (2), i.e., (H, W).
             overlap (bool): Whether the masks in `masks` tensor overlap.
+            fg_probs (torch.Tensor | None): Per-anchor soft-label probabilities for positive anchors.
 
         Returns:
             (torch.Tensor): The calculated loss for instance segmentation.
@@ -958,7 +1007,8 @@ class v8SegmentationLoss(v8DetectionLoss):
                 pred_mask = torch.einsum('in,nhw->ihw', pred, proto)  # (i, 32) @ (32, 160, 160) -> (i, 160, 160)
         """
         _, _, mask_h, mask_w = proto.shape
-        loss = 0
+        loss = proto.new_tensor(0.0)
+        normalizer = proto.new_tensor(0.0)
 
         # Normalize to 0-1
         target_bboxes_normalized = target_bboxes / imgsz[[1, 0, 1, 0]]
@@ -978,16 +1028,22 @@ class v8SegmentationLoss(v8DetectionLoss):
                     gt_mask = gt_mask.float()
                 else:
                     gt_mask = masks[batch_idx.view(-1) == i][mask_idx]
-                    
-                loss += self.single_mask_loss(
+
+                img_loss = self.single_mask_loss(
                     gt_mask, pred_masks_i[fg_mask_i], proto_i, mxyxy_i[fg_mask_i], marea_i[fg_mask_i]
                 )
+                if fg_probs is not None:
+                    img_weight = fg_probs[i][fg_mask_i].mean().clamp_min(0.0)
+                else:
+                    img_weight = img_loss.new_tensor(1.0)
+                loss += img_loss * img_weight
+                normalizer += fg_mask_i.sum() * img_weight
 
             # WARNING: lines below prevents Multi-GPU DDP 'unused gradient' PyTorch errors, do not remove
             else:
                 loss += (proto * 0).sum() + (pred_masks * 0).sum()  # inf sums may lead to nan loss
 
-        return loss / fg_mask.sum()
+        return loss / normalizer.clamp_min(1.0)
 
 
 class v8PoseLoss(v8DetectionLoss):
@@ -1023,9 +1079,11 @@ class v8PoseLoss(v8DetectionLoss):
         # Targets
         batch_size = pred_scores.shape[0]
         batch_idx = batch["batch_idx"].view(-1, 1)
-        targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        cls_probs = self._get_batch_cls_probs(batch)
+        targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"], cls_probs), 1)
         targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        gt_labels, gt_bboxes, gt_probs = targets.split((1, 4, 1), 2)  # cls, xyxy, prob
+        gt_probs = gt_probs.clamp_(0.0, 1.0)
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
         # Pboxes
@@ -1040,6 +1098,8 @@ class v8PoseLoss(v8DetectionLoss):
             gt_bboxes,
             mask_gt,
         )
+        target_scores = self._scale_target_scores_with_probs(target_scores, gt_probs, target_gt_idx, fg_mask)
+        assigned_probs = self._gather_assigned_cls_probs(gt_probs, target_gt_idx, fg_mask)
 
         target_scores_sum = max(target_scores.sum(), 1)
 
@@ -1060,6 +1120,9 @@ class v8PoseLoss(v8DetectionLoss):
             loss[1], loss[2] = self.calculate_keypoints_loss(
                 fg_mask, target_gt_idx, keypoints, batch_idx, stride_tensor, target_bboxes, pred_kpts
             )
+            kpt_weight = assigned_probs[fg_mask].mean().clamp_min(0.0)
+            loss[1] *= kpt_weight
+            loss[2] *= kpt_weight
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.pose  # pose gain
@@ -1174,16 +1237,16 @@ class v8OBBLoss(v8DetectionLoss):
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets for oriented bounding box detection."""
         if targets.shape[0] == 0:
-            out = torch.zeros(batch_size, 0, 6, device=self.device)
+            out = torch.zeros(batch_size, 0, targets.shape[1] - 1, device=self.device)
         else:
             i = targets[:, 0]  # image index
             _, counts = i.unique(return_counts=True)
             counts = counts.to(dtype=torch.int32)
-            out = torch.zeros(batch_size, counts.max(), 6, device=self.device)
+            out = torch.zeros(batch_size, counts.max(), targets.shape[1] - 1, device=self.device)
             for j in range(batch_size):
                 matches = i == j
                 if n := matches.sum():
-                    bboxes = targets[matches, 2:]
+                    bboxes = targets[matches, 2:].clone()
                     bboxes[..., :4].mul_(scale_tensor)
                     out[j, :n] = torch.cat([targets[matches, 1:2], bboxes], dim=-1)
         return out
@@ -1209,11 +1272,13 @@ class v8OBBLoss(v8DetectionLoss):
         # targets
         try:
             batch_idx = batch["batch_idx"].view(-1, 1)
-            targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"].view(-1, 5)), 1)
+            cls_probs = self._get_batch_cls_probs(batch)
+            targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"].view(-1, 5), cls_probs), 1)
             rw, rh = targets[:, 4] * imgsz[0].item(), targets[:, 5] * imgsz[1].item()
             targets = targets[(rw >= 2) & (rh >= 2)]  # filter rboxes of tiny size to stabilize training
             targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-            gt_labels, gt_bboxes = targets.split((1, 5), 2)  # cls, xywhr
+            gt_labels, gt_bboxes, gt_probs = targets.split((1, 5, 1), 2)  # cls, xywhr, prob
+            gt_probs = gt_probs.clamp_(0.0, 1.0)
             mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
         except RuntimeError as e:
             raise TypeError(
@@ -1230,7 +1295,7 @@ class v8OBBLoss(v8DetectionLoss):
         bboxes_for_assigner = pred_bboxes.clone().detach()
         # Only the first four elements need to be scaled
         bboxes_for_assigner[..., :4] *= stride_tensor
-        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             pred_scores.detach().sigmoid(),
             bboxes_for_assigner.type(gt_bboxes.dtype),
             anchor_points * stride_tensor,
@@ -1238,6 +1303,7 @@ class v8OBBLoss(v8DetectionLoss):
             gt_bboxes,
             mask_gt,
         )
+        target_scores = self._scale_target_scores_with_probs(target_scores, gt_probs, target_gt_idx, fg_mask)
 
         target_scores_sum = max(target_scores.sum(), 1)
 

@@ -182,6 +182,7 @@ def verify_image_label(args: tuple) -> list:
     im_file, lb_file, prefix, keypoint, num_cls, nkpt, ndim, single_cls = args
     # Number (missing, found, empty, corrupt), message, segments, keypoints
     nm, nf, ne, nc, msg, segments, keypoints = 0, 0, 0, 0, "", [], None
+    cls_probs = np.zeros((0, 1), dtype=np.float32)
     try:
         # Verify images
         im = Image.open(im_file)
@@ -203,8 +204,16 @@ def verify_image_label(args: tuple) -> list:
             with open(lb_file, encoding="utf-8") as f:
                 lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
                 if any(len(x) > 6 for x in lb) and (not keypoint):  # is segment
-                    classes = np.array([x[0] for x in lb], dtype=np.float32)
-                    segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]  # (cls, xy1...)
+                    classes, probs = [], []
+                    for x in lb:
+                        row = np.array(x, dtype=np.float32)
+                        has_prob = len(x) >= 8 and (len(x) - 2) % 2 == 0  # cls + (xy)*n + prob
+                        seg = row[1:-1] if has_prob else row[1:]
+                        classes.append(row[0])
+                        probs.append(row[-1] if has_prob else 1.0)
+                        segments.append(seg.reshape(-1, 2))  # (xy1...)
+                    classes = np.array(classes, dtype=np.float32)
+                    cls_probs = np.array(probs, dtype=np.float32).reshape(-1, 1)
                     lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
                 lb = np.array(lb, dtype=np.float32)
             if nl := len(lb):
@@ -212,11 +221,21 @@ def verify_image_label(args: tuple) -> list:
                     assert lb.shape[1] == (5 + nkpt * ndim), f"labels require {(5 + nkpt * ndim)} columns each"
                     points = lb[:, 5:].reshape(-1, ndim)[:, :2]
                 else:
+                    if lb.shape[1] == 6:  # optional soft-label probability for detect labels: cls xywh prob
+                        cls_probs = lb[:, 5:6]
+                        lb = lb[:, :5]
                     assert lb.shape[1] == 5, f"labels require 5 columns, {lb.shape[1]} columns detected"
+                    if len(cls_probs) != nl:
+                        cls_probs = np.ones((nl, 1), dtype=np.float32)
                     points = lb[:, 1:]
                 # Coordinate points check with 1% tolerance
                 assert points.max() <= 1.01, f"non-normalized or out of bounds coordinates {points[points > 1.01]}"
                 assert lb.min() >= -0.01, f"negative class labels or coordinate {lb[lb < -0.01]}"
+                if cls_probs.size:
+                    assert cls_probs.min() >= -0.01, f"negative label probability {cls_probs[cls_probs < -0.01]}"
+                    assert cls_probs.max() <= 1.01, (
+                        f"label probability out of bounds {cls_probs[cls_probs > 1.01]}"
+                    )
 
                 # All labels
                 max_cls = 0 if single_cls else lb[:, 0].max()  # max label count
@@ -224,29 +243,34 @@ def verify_image_label(args: tuple) -> list:
                     f"Label class {int(max_cls)} exceeds dataset class count {num_cls}. "
                     f"Possible class labels are 0-{num_cls - 1}"
                 )
-                _, i = np.unique(lb, axis=0, return_index=True)
+                dedupe = np.concatenate((lb, cls_probs), axis=1) if len(cls_probs) else lb
+                _, i = np.unique(dedupe, axis=0, return_index=True)
                 if len(i) < nl:  # duplicate row check
                     lb = lb[i]  # remove duplicates
+                    cls_probs = cls_probs[i]
                     if segments:
                         segments = [segments[x] for x in i]
                     msg = f"{prefix}{im_file}: {nl - len(i)} duplicate labels removed"
             else:
                 ne = 1  # label empty
                 lb = np.zeros((0, (5 + nkpt * ndim) if keypoint else 5), dtype=np.float32)
+                cls_probs = np.zeros((0, 1), dtype=np.float32)
         else:
             nm = 1  # label missing
             lb = np.zeros((0, (5 + nkpt * ndim) if keypoint else 5), dtype=np.float32)
+            cls_probs = np.zeros((0, 1), dtype=np.float32)
         if keypoint:
             keypoints = lb[:, 5:].reshape(-1, nkpt, ndim)
             if ndim == 2:
                 kpt_mask = np.where((keypoints[..., 0] < 0) | (keypoints[..., 1] < 0), 0.0, 1.0).astype(np.float32)
                 keypoints = np.concatenate([keypoints, kpt_mask[..., None]], axis=-1)  # (nl, nkpt, 3)
+            cls_probs = np.ones((lb.shape[0], 1), dtype=np.float32)
         lb = lb[:, :5]
-        return im_file, lb, shape, segments, keypoints, nm, nf, ne, nc, msg
+        return im_file, lb, shape, segments, keypoints, cls_probs, nm, nf, ne, nc, msg
     except Exception as e:
         nc = 1
         msg = f"{prefix}{im_file}: ignoring corrupt image/label: {e}"
-        return [None, None, None, None, None, nm, nf, ne, nc, msg]
+        return [None, None, None, None, None, None, nm, nf, ne, nc, msg]
 
 
 def visualize_image_annotations(image_path: str, txt_path: str, label_map: dict[int, str]):

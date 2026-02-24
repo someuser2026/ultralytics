@@ -55,7 +55,7 @@ from .utils import (
 )
 
 # Ultralytics dataset *.cache version, >= 1.0.0 for Ultralytics YOLO models
-DATASET_CACHE_VERSION = "1.0.3"
+DATASET_CACHE_VERSION = "1.0.4"
 
 
 class YOLODataset(BaseDataset):
@@ -136,7 +136,7 @@ class YOLODataset(BaseDataset):
                 ),
             )
             pbar = TQDM(results, desc=desc, total=total)
-            for im_file, lb, shape, segments, keypoint, nm_f, nf_f, ne_f, nc_f, msg in pbar:
+            for im_file, lb, shape, segments, keypoint, cls_probs, nm_f, nf_f, ne_f, nc_f, msg in pbar:
                 nm += nm_f
                 nf += nf_f
                 ne += ne_f
@@ -147,6 +147,7 @@ class YOLODataset(BaseDataset):
                             "im_file": im_file,
                             "shape": shape,
                             "cls": lb[:, 0:1],  # n, 1
+                            "cls_probs": cls_probs,  # n, 1
                             "bboxes": lb[:, 1:],  # n, 4
                             "segments": segments,
                             "keypoints": keypoint,
@@ -202,6 +203,9 @@ class YOLODataset(BaseDataset):
             raise RuntimeError(
                 f"No valid images found in {cache_path}. Images with incorrectly formatted labels are ignored. {HELP_URL}"
             )
+        for lb in labels:
+            if "cls_probs" not in lb:
+                lb["cls_probs"] = np.ones((len(lb["cls"]), 1), dtype=np.float32)
         self.im_files = [lb["im_file"] for lb in labels]  # update im_files
 
         # Check if the dataset is all boxes or all segments
@@ -301,6 +305,9 @@ class YOLODataset(BaseDataset):
         keypoints = label.pop("keypoints", None)
         bbox_format = label.pop("bbox_format")
         normalized = label.pop("normalized")
+        cls_probs = label.get("cls_probs")
+        if cls_probs is None or len(cls_probs) != len(bboxes):
+            label["cls_probs"] = np.ones((len(bboxes), 1), dtype=np.float32)
 
         # NOTE: do NOT resample oriented boxes
         segment_resamples = 100 if self.use_obb else 1000
@@ -336,7 +343,7 @@ class YOLODataset(BaseDataset):
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
-            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
+            if k in {"masks", "keypoints", "bboxes", "cls", "cls_probs", "segments", "obb"}:
                 value = torch.cat(value, 0)
             new_batch[k] = value
         new_batch["batch_idx"] = list(new_batch["batch_idx"])
@@ -610,6 +617,7 @@ class GroundingDataset(YOLODataset):
                     "im_file": im_file,
                     "shape": (h, w),
                     "cls": lb[:, 0:1],  # n, 1
+                    "cls_probs": np.ones((lb.shape[0], 1), dtype=np.float32),  # n, 1
                     "bboxes": lb[:, 1:],  # n, 4
                     "segments": segments,
                     "normalized": True,
@@ -637,6 +645,9 @@ class GroundingDataset(YOLODataset):
             cache, _ = self.cache_labels(cache_path), False  # run cache ops
         [cache.pop(k) for k in ("hash", "version")]  # remove items
         labels = cache["labels"]
+        for lb in labels:
+            if "cls_probs" not in lb:
+                lb["cls_probs"] = np.ones((len(lb["cls"]), 1), dtype=np.float32)
         self.verify_labels(labels)
         self.im_files = [str(label["im_file"]) for label in labels]
         if LOCAL_RANK in {-1, 0}:
