@@ -259,6 +259,167 @@ class BaseTrainer:
             world_size=self.world_size,
         )
 
+    @staticmethod
+    def _resolve_layer_indices(value):
+        """Normalize freeze-style args into a concrete list of outer model layer indices."""
+        if isinstance(value, int):
+            if value < 0:
+                raise ValueError(f"Layer counts must be >= 0, but received {value}.")
+            return list(range(value))
+        if isinstance(value, range):
+            return list(value)
+        if isinstance(value, (list, tuple)):
+            if not all(isinstance(x, int) for x in value):
+                raise TypeError(f"Layer index lists must contain only ints, but received {value!r}.")
+            return list(value)
+        if value in {None, False}:
+            return []
+        raise TypeError(f"Unsupported layer index spec {value!r}. Use an int, list[int], or tuple[int, ...].")
+
+    @staticmethod
+    def _has_layer_spec(value):
+        """Return True when a freeze-style arg contains an actionable value."""
+        return not (
+            value is None
+            or value is False
+            or value == []
+            or value == ()
+            or (isinstance(value, range) and len(value) == 0)
+        )
+
+    def _get_timm_backbone_layers(self):
+        """Return timm backbone entries as (outer_idx, outer_prefix, param_prefix, layer)."""
+        model = unwrap_model(self.model)
+        backbone_layers = getattr(model, "backbone_layers", [])
+        timm_layers = []
+        for idx, layer in enumerate(backbone_layers):
+            if layer.__class__.__name__ == "Timm" and hasattr(layer, "m"):
+                timm_layers.append((idx, f"model.{idx}.", f"model.{idx}.m.", layer))
+        return timm_layers
+
+    @staticmethod
+    def _get_timm_unfreeze_units(timm_layer):
+        """Return the timm backbone container name and units used for selective unfreezing."""
+        for attr in ("blocks", "stages", "layers"):
+            units = getattr(timm_layer.m, attr, None)
+            if isinstance(units, (nn.ModuleList, nn.Sequential, list, tuple)) and len(units):
+                return attr, list(units)
+        raise ValueError(
+            "Timm selective unfreezing requires the wrapped timm model to expose a non-empty "
+            "'blocks', 'stages', or 'layers' container."
+        )
+
+    def _resolve_timm_unfreeze_indices(self, spec, num_units, outer_idx, container_name):
+        """Resolve timm unfreeze config into specific inner block/stage indices."""
+        if isinstance(spec, int):
+            if spec < 0:
+                raise ValueError(f"'unfreeze' must be >= 0, but received {spec}.")
+            if spec == 0:
+                LOGGER.warning(
+                    f"'unfreeze=0' leaves timm backbone layer {outer_idx} fully frozen. No {container_name} will be unfrozen."
+                )
+                return []
+            if spec > num_units:
+                raise ValueError(
+                    f"'unfreeze={spec}' exceeds the {num_units} available timm {container_name} in backbone layer {outer_idx}."
+                )
+            return list(range(num_units - spec, num_units))
+
+        if isinstance(spec, range):
+            spec = list(spec)
+        if isinstance(spec, tuple):
+            spec = list(spec)
+        if isinstance(spec, list):
+            if not spec:
+                LOGGER.warning(
+                    f"'unfreeze=[]' leaves timm backbone layer {outer_idx} fully frozen. No {container_name} will be unfrozen."
+                )
+                return []
+            if not all(isinstance(i, int) for i in spec):
+                raise TypeError(f"'unfreeze' lists must contain only ints, but received {spec!r}.")
+            bad = sorted({i for i in spec if i < 0 or i >= num_units})
+            if bad:
+                raise ValueError(
+                    f"'unfreeze={spec}' contains invalid timm {container_name} indices {bad}. "
+                    f"Valid indices for backbone layer {outer_idx} are 0 to {num_units - 1}."
+                )
+            return sorted(set(spec))
+
+        raise TypeError(
+            f"'unfreeze' only supports int or list[int] for timm backbones, but received {spec!r}."
+        )
+
+    def _apply_timm_unfreeze(self, timm_layers):
+        """Selectively unfreeze the last few inner timm backbone units after the backbone has been frozen."""
+        unfreeze_spec = self.args.unfreeze
+        self._timm_partial_unfreeze = []
+        if not self._has_layer_spec(unfreeze_spec):
+            return []
+
+        if not timm_layers:
+            raise ValueError(
+                "'unfreeze' is only supported for models with a timm backbone. "
+                "Remove 'unfreeze' or switch to a timm-backed model."
+            )
+        if len(timm_layers) > 1:
+            raise ValueError(
+                f"'unfreeze' is ambiguous for models with multiple timm backbones ({len(timm_layers)} found). "
+                "Use a single timm backbone when applying selective unfreezing."
+            )
+
+        outer_idx, outer_prefix, param_prefix, timm_layer = timm_layers[0]
+        if not all(not p.requires_grad for p in timm_layer.m.parameters()):
+            raise ValueError(
+                f"'unfreeze' requires timm backbone layer {outer_idx} to be fully frozen first. "
+                "Freeze the full timm backbone through trainer 'freeze' before applying selective unfreeze."
+            )
+
+        container_name, units = self._get_timm_unfreeze_units(timm_layer)
+        selected = self._resolve_timm_unfreeze_indices(unfreeze_spec, len(units), outer_idx, container_name)
+        if not selected:
+            return []
+
+        for idx in selected:
+            for param in units[idx].parameters():
+                param.requires_grad = True
+
+        self._timm_partial_unfreeze.append(
+            {
+                "outer_idx": outer_idx,
+                "container_name": container_name,
+                "selected": set(selected),
+                "layer": timm_layer,
+            }
+        )
+
+        LOGGER.info(
+            f"Unfreezing timm backbone layer {outer_idx} {container_name} indices {selected} "
+            f"(outer prefix '{outer_prefix}')."
+        )
+        LOGGER.warning(
+            f"Timm backbone layer {outer_idx} is partially unfrozen. Trainer will restore train mode for the "
+            f"selected {container_name} each epoch and keep the still-frozen timm submodules in eval mode."
+        )
+        return [f"{param_prefix}{container_name}.{idx}." for idx in selected]
+
+    def _restore_timm_partial_train_modes(self):
+        """Override Timm.train() eval fallback for partially unfrozen timm backbones."""
+        for entry in getattr(self, "_timm_partial_unfreeze", []):
+            timm_layer = entry["layer"]
+            container_name = entry["container_name"]
+            selected = entry["selected"]
+            units = list(getattr(timm_layer.m, container_name))
+
+            # Re-enable train mode for the wrapped timm backbone, then selectively return frozen subtrees to eval.
+            timm_layer.m.train()
+            for name, child in timm_layer.m.named_children():
+                if name == container_name:
+                    for idx, unit in enumerate(units):
+                        if idx not in selected:
+                            unit.eval()
+                elif not any(param.requires_grad for param in child.parameters()):
+                    child.eval()
+
     def _setup_train(self):
         """Build dataloaders and optimizer on correct rank process."""
         ckpt = self.setup_model()
@@ -269,38 +430,42 @@ class BaseTrainer:
         self.model = attempt_compile(self.model, device=self.device, mode=self.args.compile)
 
         # Freeze layers
-        freeze_list = (
-            self.args.freeze
-            if isinstance(self.args.freeze, list)
-            else range(self.args.freeze)
-            if isinstance(self.args.freeze, int)
-            else []
-        )
-
-        # Unfreeze layers
-        unfreeze_list = (
-            self.args.unfreeze
-            if isinstance(self.args.unfreeze, list)
-            else range(self.args.unfreeze)
-            if isinstance(self.args.unfreeze, int)
-            else []
-        )
+        freeze_list = self._resolve_layer_indices(self.args.freeze)
+        timm_layers = self._get_timm_backbone_layers()
         always_freeze_names = [".dfl"]  # always freeze these layers
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
-        unfreeze_layer_names = [f"model.{x}." for x in unfreeze_list]
+        timm_param_prefixes = tuple(param_prefix for _, _, param_prefix, _ in timm_layers)
+        if timm_layers and (self._has_layer_spec(self.args.freeze) or self._has_layer_spec(self.args.unfreeze)):
+            LOGGER.warning(
+                "Timm backbone detected. Trainer freeze/unfreeze args are authoritative for timm trainability. "
+                "'freeze' still uses outer Ultralytics layer indices, while 'unfreeze' targets inner timm "
+                "blocks/stages/layers."
+            )
+
         self.freeze_layer_names = freeze_layer_names
-        self.unfreeze_layer_names = unfreeze_layer_names
+        self.unfreeze_layer_names = []
+        timm_reenabled = False
         for k, v in self.model.named_parameters():
             # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
-            if any(x in k for x in freeze_layer_names) and not any(x for x in k for x in unfreeze_layer_names):
+            if any(x in k for x in freeze_layer_names):
                 LOGGER.info(f"Freezing layer '{k}'")
                 v.requires_grad = False
+            elif timm_param_prefixes and k.startswith(timm_param_prefixes) and not v.requires_grad:
+                if not timm_reenabled:
+                    LOGGER.info(
+                        "Re-enabling pre-frozen timm backbone parameters so trainer freeze/unfreeze args remain "
+                        "the single source of truth."
+                    )
+                    timm_reenabled = True
+                v.requires_grad = True
             elif not v.requires_grad and v.dtype.is_floating_point:  # only floating point Tensor can require gradients
                 LOGGER.warning(
                     f"setting 'requires_grad=True' for frozen layer '{k}'. "
                     "See ultralytics.engine.trainer for customization of frozen layers."
                 )
                 v.requires_grad = True
+
+        self.unfreeze_layer_names = self._apply_timm_unfreeze(timm_layers)
 
         # Check AMP
         self.amp = torch.tensor(self.args.amp).to(self.device)  # True or False
@@ -584,9 +749,14 @@ class BaseTrainer:
     def _model_train(self):
         """Set model in training mode."""
         self.model.train()
+        self._restore_timm_partial_train_modes()
         # Freeze BN stat
         for n, m in self.model.named_modules():
-            if any(filter(lambda f: f in n, self.freeze_layer_names)) and isinstance(m, nn.BatchNorm2d):
+            if (
+                any(f in n for f in self.freeze_layer_names)
+                and not any(u in n for u in self.unfreeze_layer_names)
+                and isinstance(m, nn.BatchNorm2d)
+            ):
                 m.eval()
 
     def save_model(self):
