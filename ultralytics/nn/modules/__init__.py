@@ -134,6 +134,28 @@ from .neck import (
 
 from .rpn import AnchorGenerator, RPNHead
 
+try:
+    from .mamba_yolo import SimpleStem, VisionClueMerge, VSSBlock, XSSBlock
+    _MAMBA_IMPORT_ERROR = None
+except Exception as exc:
+    _MAMBA_IMPORT_ERROR = exc
+
+    def _missing_mamba_module(name):
+        class _MissingMambaModule:
+            def __init__(self, *args, **kwargs):
+                raise ImportError(
+                    f"{name} requires optional Mamba-YOLO dependencies. "
+                    "Install 'einops' and build the local selective_scan package first."
+                ) from _MAMBA_IMPORT_ERROR
+
+        _MissingMambaModule.__name__ = name
+        return _MissingMambaModule
+
+    SimpleStem = _missing_mamba_module("SimpleStem")
+    VisionClueMerge = _missing_mamba_module("VisionClueMerge")
+    VSSBlock = _missing_mamba_module("VSSBlock")
+    XSSBlock = _missing_mamba_module("XSSBlock")
+
 __all__ = (
     "Conv",
     "Conv2",
@@ -231,6 +253,10 @@ __all__ = (
     "ScaleEqualizingFPN",
     "RTDETROBBDecoder",
     "RTDETRSegmentDecoder",
+    "SimpleStem",
+    "VisionClueMerge",
+    "VSSBlock",
+    "XSSBlock",
     # "Mask2FormerHead",
     # "CascadeRCNNHead"
 )

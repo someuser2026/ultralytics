@@ -66,8 +66,12 @@ from ultralytics.nn.modules import (
     RTDETRDecoder,
     SCDown,
     Segment,
+    SimpleStem,
     TorchVision,
+    VisionClueMerge,
+    VSSBlock,
     WorldDetect,
+    XSSBlock,
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
@@ -2119,6 +2123,10 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             A2C2f,
             MaxViTBlock,
+            SimpleStem,
+            VisionClueMerge,
+            VSSBlock,
+            XSSBlock,
             # ConvNeXt-compatible modules
             # ConvNeXtStem,
             # ConvNeXtDownsample,
@@ -2142,6 +2150,7 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             C2PSA,
             A2C2f,
+            XSSBlock,
         }
     )
     necks = frozenset({
@@ -2356,10 +2365,16 @@ def guess_model_scale(model_path):
     Returns:
         (str): The size character of the model's scale (n, s, m, l, or x).
     """
-    try:
-        return re.search(r"yolo(e-)?[v]?\d+([nslmx])", Path(model_path).stem).group(2)  # noqa
-    except AttributeError:
-        return ""
+    stem = Path(model_path).stem
+    standard = re.search(r"yolo(e-)?[v]?\d+([nslmx])", stem)
+    if standard:
+        return standard.group(2)
+
+    mamba = re.search(r"mamba-yolo-([tbl])", stem, flags=re.IGNORECASE)
+    if mamba:
+        return mamba.group(1).upper()
+
+    return ""
 
 
 def guess_model_task(model):
