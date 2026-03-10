@@ -304,6 +304,12 @@ class BaseTrainer:
             ".lora_A" in name or ".lora_B" in name for name in weights.state_dict()
         )
 
+    def _get_timm_trainable_non_lora_parameter_names(self, timm_layer):
+        """Return trainable timm parameter names excluding LoRA adapter tensors."""
+        return [
+            name for name, param in timm_layer.m.named_parameters() if param.requires_grad and not self._is_lora_parameter_name(name)
+        ]
+
     def _get_timm_backbone_layers(self, model=None):
         """Return timm backbone entries as (outer_idx, outer_prefix, param_prefix, layer)."""
         model = unwrap_model(model if model is not None else self.model)
@@ -397,10 +403,14 @@ class BaseTrainer:
             )
 
         outer_idx, outer_prefix, param_prefix, timm_layer = timm_layers[0]
-        if not all(not p.requires_grad for p in timm_layer.m.parameters()):
+        trainable_non_lora = self._get_timm_trainable_non_lora_parameter_names(timm_layer)
+        if trainable_non_lora:
+            sample = ", ".join(trainable_non_lora[:3])
+            suffix = " ..." if len(trainable_non_lora) > 3 else ""
             raise ValueError(
                 f"'unfreeze' requires timm backbone layer {outer_idx} to be fully frozen first. "
-                "Freeze the full timm backbone through trainer 'freeze' before applying selective unfreeze."
+                "Freeze the full timm backbone through trainer 'freeze' before applying selective unfreeze. "
+                f"Found trainable non-LoRA timm parameters: {sample}{suffix}"
             )
 
         root_module, root_prefix, container_name, units = self._get_timm_unfreeze_context(timm_layer)
@@ -624,7 +634,7 @@ class BaseTrainer:
                 for name, param in timm_layer.m.named_parameters()
                 if not self._is_lora_parameter_name(name) and not self._is_lora_base_parameter_name(name)
             )
-            if non_lora_trainable:
+            if non_lora_trainable and not self._has_layer_spec(self.args.unfreeze):
                 LOGGER.warning(
                     f"LoRA adapters are active on timm backbone layer {outer_idx}, but non-LoRA timm parameters "
                     "remain trainable. Use trainer 'freeze' to freeze the full timm backbone for adapter-only "

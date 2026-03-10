@@ -43,10 +43,14 @@ class LoRALinear(nn.Module):
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
+    def lora_weight(self) -> torch.Tensor:
+        """Return the low-rank weight update in matrix form."""
+        return torch.matmul(self.lora_B, self.lora_A) * self.scaling
+
     @property
     def weight(self):
-        """Expose the wrapped linear weight for compatibility with existing code."""
-        return self.base_layer.weight
+        """Expose the effective weight so modules that read `.weight` still see the LoRA update."""
+        return self.base_layer.weight + self.lora_weight()
 
     @property
     def bias(self):
