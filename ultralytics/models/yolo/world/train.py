@@ -88,11 +88,8 @@ class WorldTrainer(DetectionTrainer):
             nc=min(self.data["nc"], 80),
             verbose=verbose and RANK == -1,
         )
-        if weights:
-            model.load(weights)
         self.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
-
-        return model
+        return self._finalize_model_build(model, weights)
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
         """

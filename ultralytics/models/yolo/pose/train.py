@@ -82,10 +82,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         model = PoseModel(
             cfg, nc=self.data["nc"], ch=self.data["channels"], data_kpt_shape=self.data["kpt_shape"], verbose=verbose
         )
-        if weights:
-            model.load(weights)
-
-        return model
+        return self._finalize_model_build(model, weights)
 
     def set_model_attributes(self):
         """Set keypoints shape attribute of PoseModel."""

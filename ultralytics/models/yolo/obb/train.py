@@ -69,10 +69,7 @@ class OBBTrainer(yolo.detect.DetectionTrainer):
             >>> model = trainer.get_model(cfg="yolo11n-obb.yaml", weights="yolo11n-obb.pt")
         """
         model = OBBModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
-        if weights:
-            model.load(weights)
-
-        return model
+        return self._finalize_model_build(model, weights)
 
     def get_validator(self):
         """Return an instance of OBBValidator for validation of YOLO model."""

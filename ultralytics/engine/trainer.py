@@ -287,9 +287,26 @@ class BaseTrainer:
             or (isinstance(value, range) and len(value) == 0)
         )
 
-    def _get_timm_backbone_layers(self):
+    @staticmethod
+    def _is_lora_parameter_name(name):
+        """Return True for trainable LoRA adapter parameters."""
+        return ".lora_A" in name or ".lora_B" in name
+
+    @staticmethod
+    def _is_lora_base_parameter_name(name):
+        """Return True for frozen base weights wrapped by a LoRA module."""
+        return ".base_layer.weight" in name or ".base_layer.bias" in name
+
+    @staticmethod
+    def _weights_have_lora(weights):
+        """Return True when an incoming checkpoint/model already contains LoRA parameters."""
+        return weights is not None and hasattr(weights, "state_dict") and any(
+            ".lora_A" in name or ".lora_B" in name for name in weights.state_dict()
+        )
+
+    def _get_timm_backbone_layers(self, model=None):
         """Return timm backbone entries as (outer_idx, outer_prefix, param_prefix, layer)."""
-        model = unwrap_model(self.model)
+        model = unwrap_model(model if model is not None else self.model)
         backbone_layers = getattr(model, "backbone_layers", [])
         timm_layers = []
         for idx, layer in enumerate(backbone_layers):
@@ -298,16 +315,29 @@ class BaseTrainer:
         return timm_layers
 
     @staticmethod
-    def _get_timm_unfreeze_units(timm_layer):
-        """Return the timm backbone container name and units used for selective unfreezing."""
-        for attr in ("blocks", "stages", "layers"):
-            units = getattr(timm_layer.m, attr, None)
-            if isinstance(units, (nn.ModuleList, nn.Sequential, list, tuple)) and len(units):
-                return attr, list(units)
+    def _get_timm_unfreeze_context(timm_layer):
+        """Return the inner timm module and container used for selective unfreezing/LoRA layer targeting."""
+        candidates = [("", timm_layer.m)]
+        for prefix in ("model", "body", "backbone", "module"):
+            child = getattr(timm_layer.m, prefix, None)
+            if isinstance(child, nn.Module):
+                candidates.append((f"{prefix}.", child))
+
+        for root_prefix, root_module in candidates:
+            for attr in ("blocks", "stages", "layers"):
+                units = getattr(root_module, attr, None)
+                if isinstance(units, (nn.ModuleList, nn.Sequential, list, tuple)) and len(units):
+                    return root_module, root_prefix, attr, list(units)
         raise ValueError(
             "Timm selective unfreezing requires the wrapped timm model to expose a non-empty "
             "'blocks', 'stages', or 'layers' container."
         )
+
+    @staticmethod
+    def _get_timm_unfreeze_units(timm_layer):
+        """Return the timm backbone container name and units used for selective unfreezing."""
+        _, _, container_name, units = BaseTrainer._get_timm_unfreeze_context(timm_layer)
+        return container_name, units
 
     def _resolve_timm_unfreeze_indices(self, spec, num_units, outer_idx, container_name):
         """Resolve timm unfreeze config into specific inner block/stage indices."""
@@ -352,7 +382,6 @@ class BaseTrainer:
     def _apply_timm_unfreeze(self, timm_layers):
         """Selectively unfreeze the last few inner timm backbone units after the backbone has been frozen."""
         unfreeze_spec = self.args.unfreeze
-        self._timm_partial_unfreeze = []
         if not self._has_layer_spec(unfreeze_spec):
             return []
 
@@ -374,7 +403,7 @@ class BaseTrainer:
                 "Freeze the full timm backbone through trainer 'freeze' before applying selective unfreeze."
             )
 
-        container_name, units = self._get_timm_unfreeze_units(timm_layer)
+        root_module, root_prefix, container_name, units = self._get_timm_unfreeze_context(timm_layer)
         selected = self._resolve_timm_unfreeze_indices(unfreeze_spec, len(units), outer_idx, container_name)
         if not selected:
             return []
@@ -383,13 +412,12 @@ class BaseTrainer:
             for param in units[idx].parameters():
                 param.requires_grad = True
 
-        self._timm_partial_unfreeze.append(
-            {
-                "outer_idx": outer_idx,
-                "container_name": container_name,
-                "selected": set(selected),
-                "layer": timm_layer,
-            }
+        self._register_timm_train_mode_override(
+            outer_idx=outer_idx,
+            timm_layer=timm_layer,
+            root_module=root_module,
+            container_name=container_name,
+            selected=selected,
         )
 
         LOGGER.info(
@@ -400,25 +428,245 @@ class BaseTrainer:
             f"Timm backbone layer {outer_idx} is partially unfrozen. Trainer will restore train mode for the "
             f"selected {container_name} each epoch and keep the still-frozen timm submodules in eval mode."
         )
-        return [f"{param_prefix}{container_name}.{idx}." for idx in selected]
+        return [f"{param_prefix}{root_prefix}{container_name}.{idx}." for idx in selected]
 
-    def _restore_timm_partial_train_modes(self):
-        """Override Timm.train() eval fallback for partially unfrozen timm backbones."""
-        for entry in getattr(self, "_timm_partial_unfreeze", []):
+    def _normalize_lora_targets(self):
+        """Normalize LoRA target names into a non-empty list of strings."""
+        targets = self.args.lora_targets
+        if isinstance(targets, str):
+            normalized = [x.strip() for x in targets.split(",") if x.strip()]
+        elif isinstance(targets, (list, tuple, set)):
+            normalized = [str(x).strip() for x in targets if str(x).strip()]
+        else:
+            raise TypeError(
+                f"'lora_targets' must be a comma-separated string or list[str], but received {targets!r}."
+            )
+        if not normalized:
+            raise ValueError("'lora_targets' must contain at least one target module name.")
+        return normalized
+
+    def _resolve_timm_lora_indices(self, spec, num_units, outer_idx, container_name):
+        """Resolve timm LoRA unit selection into concrete inner indices."""
+        if isinstance(spec, int):
+            if spec < 0:
+                raise ValueError(f"'lora_layers' must be >= 0, but received {spec}.")
+            if spec == 0:
+                raise ValueError(
+                    f"'lora_layers=0' would disable LoRA injection for timm backbone layer {outer_idx}. "
+                    "Set 'lora=False' instead."
+                )
+            if spec > num_units:
+                raise ValueError(
+                    f"'lora_layers={spec}' exceeds the {num_units} available timm {container_name} "
+                    f"in backbone layer {outer_idx}."
+                )
+            return list(range(num_units - spec, num_units))
+
+        if isinstance(spec, range):
+            spec = list(spec)
+        if isinstance(spec, tuple):
+            spec = list(spec)
+        if isinstance(spec, list):
+            if not spec:
+                raise ValueError("'lora_layers=[]' is empty. Set 'lora=False' or select at least one inner layer.")
+            if not all(isinstance(i, int) for i in spec):
+                raise TypeError(f"'lora_layers' lists must contain only ints, but received {spec!r}.")
+            bad = sorted({i for i in spec if i < 0 or i >= num_units})
+            if bad:
+                raise ValueError(
+                    f"'lora_layers={spec}' contains invalid timm {container_name} indices {bad}. "
+                    f"Valid indices for backbone layer {outer_idx} are 0 to {num_units - 1}."
+                )
+            return sorted(set(spec))
+
+        raise TypeError(
+            f"'lora_layers' only supports int or list[int] for timm backbones, but received {spec!r}."
+        )
+
+    def _register_timm_train_mode_override(self, outer_idx, timm_layer, root_module, container_name=None, selected=None):
+        """Merge train-mode overrides for timm backbones affected by selective unfreezing or LoRA."""
+        selected = None if selected is None else set(selected)
+        existing = self._timm_train_mode_overrides.get(outer_idx)
+        if existing is None:
+            self._timm_train_mode_overrides[outer_idx] = {
+                "layer": timm_layer,
+                "root_module": root_module,
+                "container_name": container_name,
+                "selected": selected,
+                "all_units": selected is None,
+            }
+            return
+
+        if container_name and existing["container_name"] and existing["container_name"] != container_name:
+            raise ValueError(
+                f"Conflicting timm train-mode overrides for backbone layer {outer_idx}: "
+                f"'{existing['container_name']}' vs '{container_name}'."
+            )
+
+        if container_name and existing["container_name"] is None:
+            existing["container_name"] = container_name
+        if root_module is not None:
+            existing["root_module"] = root_module
+        if selected is None or existing["all_units"]:
+            existing["all_units"] = True
+            existing["selected"] = None
+        else:
+            existing["selected"] = (existing["selected"] or set()) | selected
+
+    def _configure_timm_lora(self, model):
+        """Inject LoRA adapters into a single timm backbone before checkpoint weights are loaded."""
+        if not self.args.lora:
+            if self._has_layer_spec(self.args.lora_layers):
+                raise ValueError("'lora_layers' requires 'lora=True'.")
+            return model
+
+        timm_layers = self._get_timm_backbone_layers(model)
+        if not timm_layers:
+            raise ValueError(
+                "'lora=True' is only supported for models with a timm backbone. "
+                "Remove 'lora' or switch to a timm-backed model."
+            )
+        if len(timm_layers) > 1:
+            raise ValueError(
+                f"'lora=True' is ambiguous for models with multiple timm backbones ({len(timm_layers)} found). "
+                "Use a single timm backbone when applying LoRA."
+            )
+
+        rank = self.args.lora_rank
+        alpha = self.args.lora_alpha
+        dropout = self.args.lora_dropout
+        if not isinstance(rank, int) or rank <= 0:
+            raise ValueError(f"'lora_rank' must be a positive int, but received {rank!r}.")
+        if not isinstance(alpha, (int, float)) or alpha <= 0:
+            raise ValueError(f"'lora_alpha' must be > 0, but received {alpha!r}.")
+        if not isinstance(dropout, (int, float)) or not 0.0 <= dropout < 1.0:
+            raise ValueError(f"'lora_dropout' must satisfy 0 <= dropout < 1, but received {dropout!r}.")
+
+        outer_idx, _, _, timm_layer = timm_layers[0]
+        if getattr(timm_layer, "_ultralytics_lora", None):
+            return model
+
+        root_module, root_prefix, container_name_for_layers, units = None, "", None, None
+        try:
+            root_module, root_prefix, container_name_for_layers, units = self._get_timm_unfreeze_context(timm_layer)
+        except ValueError:
+            if self._has_layer_spec(self.args.lora_layers):
+                raise
+
+        container_name = None
+        selected = None
+        if self._has_layer_spec(self.args.lora_layers):
+            container_name = container_name_for_layers
+            selected = self._resolve_timm_lora_indices(self.args.lora_layers, len(units), outer_idx, container_name)
+
+        from ultralytics.nn.modules.lora import inject_lora_into_timm
+
+        targets = self._normalize_lora_targets()
+        summary = inject_lora_into_timm(
+            timm_layer,
+            rank=rank,
+            alpha=float(alpha),
+            dropout=float(dropout),
+            target_modules=targets,
+            container_name=container_name,
+            unit_indices=selected,
+            target_root=root_module,
+        )
+        if summary["num_matched"] == 0:
+            selection = (
+                f"{container_name} indices {selected}" if selected is not None else "the full wrapped timm backbone"
+            )
+            raise ValueError(
+                f"LoRA did not match any nn.Linear modules in timm backbone layer {outer_idx} for targets "
+                f"{targets} within {selection}."
+            )
+
+        timm_layer._ultralytics_lora = {
+            "outer_idx": outer_idx,
+            "container_name": container_name,
+            "selected": None if selected is None else set(selected),
+            "targets": targets,
+            "num_matched": summary["num_matched"],
+            "trainable_params": summary["trainable_params"],
+        }
+        model._ultralytics_lora_configured = True
+
+        selection = (
+            f"{container_name} indices {selected}" if selected is not None else "all matching inner linear modules"
+        )
+        LOGGER.info(
+            f"Injected LoRA into timm backbone layer {outer_idx}: matched {summary['num_matched']} linear modules "
+            f"({summary['trainable_params']:,} trainable params) for targets {targets} across {selection}."
+        )
+        LOGGER.warning(
+            f"Timm backbone layer {outer_idx} contains LoRA adapters. Trainer will restore timm train mode each epoch "
+            "so the wrapped backbone does not stay stuck in eval due to frozen base parameters."
+        )
+        return model
+
+    def _sync_timm_lora_train_mode_overrides(self, timm_layers):
+        """Register train-mode overrides for timm backbones that contain LoRA adapters."""
+        for outer_idx, _, _, timm_layer in timm_layers:
+            meta = getattr(timm_layer, "_ultralytics_lora", None)
+            if not meta:
+                continue
+
+            self._register_timm_train_mode_override(
+                outer_idx=outer_idx,
+                timm_layer=timm_layer,
+                root_module=self._get_timm_unfreeze_context(timm_layer)[0] if meta.get("container_name") else timm_layer.m,
+                container_name=meta.get("container_name"),
+                selected=meta.get("selected"),
+            )
+
+            non_lora_trainable = any(
+                param.requires_grad
+                for name, param in timm_layer.m.named_parameters()
+                if not self._is_lora_parameter_name(name) and not self._is_lora_base_parameter_name(name)
+            )
+            if non_lora_trainable:
+                LOGGER.warning(
+                    f"LoRA adapters are active on timm backbone layer {outer_idx}, but non-LoRA timm parameters "
+                    "remain trainable. Use trainer 'freeze' to freeze the full timm backbone for adapter-only "
+                    "fine-tuning."
+                )
+
+    def _restore_timm_train_modes(self):
+        """Override Timm.train() eval fallback for timm backbones with partial unfreeze and/or LoRA adapters."""
+        for entry in getattr(self, "_timm_train_mode_overrides", {}).values():
             timm_layer = entry["layer"]
+            root_module = entry["root_module"]
             container_name = entry["container_name"]
-            selected = entry["selected"]
-            units = list(getattr(timm_layer.m, container_name))
 
             # Re-enable train mode for the wrapped timm backbone, then selectively return frozen subtrees to eval.
             timm_layer.m.train()
-            for name, child in timm_layer.m.named_children():
-                if name == container_name:
-                    for idx, unit in enumerate(units):
-                        if idx not in selected:
+            for name, child in root_module.named_children():
+                if container_name and name == container_name:
+                    units = list(getattr(root_module, container_name))
+                    for unit in units:
+                        if not any(param.requires_grad for param in unit.parameters()):
                             unit.eval()
                 elif not any(param.requires_grad for param in child.parameters()):
                     child.eval()
+
+    def _finalize_model_build(self, model, weights=None):
+        """Apply model-level adapter configuration before loading checkpoint weights."""
+        if not self.args.lora and self._has_layer_spec(self.args.lora_layers):
+            raise ValueError("'lora_layers' requires 'lora=True'.")
+
+        weights_have_lora = self._weights_have_lora(weights)
+        if weights_have_lora and not self.args.lora:
+            raise ValueError(
+                "Checkpoint weights contain LoRA parameters, but 'lora=False'. "
+                "Enable 'lora=True' to resume or fine-tune this checkpoint."
+            )
+
+        if self.args.lora and not getattr(model, "_ultralytics_lora_configured", False):
+            self._configure_timm_lora(model)
+
+        if weights is not None:
+            model.load(weights)
+        return model
 
     def _setup_train(self):
         """Build dataloaders and optimizer on correct rank process."""
@@ -435,6 +683,7 @@ class BaseTrainer:
         always_freeze_names = [".dfl"]  # always freeze these layers
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
         timm_param_prefixes = tuple(param_prefix for _, _, param_prefix, _ in timm_layers)
+        self._timm_train_mode_overrides = {}
         if timm_layers and (self._has_layer_spec(self.args.freeze) or self._has_layer_spec(self.args.unfreeze)):
             LOGGER.warning(
                 "Timm backbone detected. Trainer freeze/unfreeze args are authoritative for timm trainability. "
@@ -448,9 +697,14 @@ class BaseTrainer:
         for k, v in self.model.named_parameters():
             # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
             if any(x in k for x in freeze_layer_names):
-                LOGGER.info(f"Freezing layer '{k}'")
-                v.requires_grad = False
+                if self._is_lora_parameter_name(k):
+                    v.requires_grad = True
+                else:
+                    LOGGER.info(f"Freezing layer '{k}'")
+                    v.requires_grad = False
             elif timm_param_prefixes and k.startswith(timm_param_prefixes) and not v.requires_grad:
+                if self._is_lora_base_parameter_name(k):
+                    continue
                 if not timm_reenabled:
                     LOGGER.info(
                         "Re-enabling pre-frozen timm backbone parameters so trainer freeze/unfreeze args remain "
@@ -459,6 +713,8 @@ class BaseTrainer:
                     timm_reenabled = True
                 v.requires_grad = True
             elif not v.requires_grad and v.dtype.is_floating_point:  # only floating point Tensor can require gradients
+                if self._is_lora_base_parameter_name(k):
+                    continue
                 LOGGER.warning(
                     f"setting 'requires_grad=True' for frozen layer '{k}'. "
                     "See ultralytics.engine.trainer for customization of frozen layers."
@@ -466,6 +722,7 @@ class BaseTrainer:
                 v.requires_grad = True
 
         self.unfreeze_layer_names = self._apply_timm_unfreeze(timm_layers)
+        self._sync_timm_lora_train_mode_overrides(timm_layers)
 
         # Check AMP
         self.amp = torch.tensor(self.args.amp).to(self.device)  # True or False
@@ -749,7 +1006,7 @@ class BaseTrainer:
     def _model_train(self):
         """Set model in training mode."""
         self.model.train()
-        self._restore_timm_partial_train_modes()
+        self._restore_timm_train_modes()
         # Freeze BN stat
         for n, m in self.model.named_modules():
             if (
@@ -851,6 +1108,7 @@ class BaseTrainer:
             (dict): Optional checkpoint to resume training from.
         """
         if isinstance(self.model, torch.nn.Module):  # if model is loaded beforehand. No setup needed
+            self.model = self._finalize_model_build(self.model)
             return
 
         cfg, weights = self.model, None
@@ -1093,14 +1351,23 @@ class BaseTrainer:
 
         for module_name, module in model.named_modules():
             for param_name, param in module.named_parameters(recurse=False):
+                if not param.requires_grad:
+                    continue
                 fullname = f"{module_name}.{param_name}" if module_name else param_name
                 if "bias" in fullname:  # bias (no decay)
                     g[2].append(param)
-                elif isinstance(module, bn) or "logit_scale" in fullname:  # weight (no decay)
+                elif (
+                    isinstance(module, bn)
+                    or "logit_scale" in fullname
+                    or param_name.startswith("lora_")
+                ):  # weight (no decay)
                     # ContrastiveHead and BNContrastiveHead included here with 'logit_scale'
                     g[1].append(param)
                 else:  # weight (with decay)
                     g[0].append(param)
+
+        if not any(g):
+            raise ValueError("No trainable parameters remain after freeze/LoRA configuration. Adjust your training args.")
 
         optimizers = {"Adam", "Adamax", "AdamW", "NAdam", "RAdam", "RMSProp", "SGD", "auto"}
         name = {x.lower(): x for x in optimizers}.get(name.lower())

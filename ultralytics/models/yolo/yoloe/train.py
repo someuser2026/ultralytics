@@ -75,10 +75,7 @@ class YOLOETrainer(DetectionTrainer):
             nc=min(self.data["nc"], 80),
             verbose=verbose and RANK == -1,
         )
-        if weights:
-            model.load(weights)
-
-        return model
+        return self._finalize_model_build(model, weights)
 
     def get_validator(self):
         """Return a YOLOEDetectValidator for YOLOE model validation."""
@@ -140,8 +137,7 @@ class YOLOEPETrainer(DetectionTrainer):
         del model.model[-1].savpe
 
         assert weights is not None, "Pretrained weights must be provided for linear probing."
-        if weights:
-            model.load(weights)
+        model = self._finalize_model_build(model, weights)
 
         model.eval()
         names = list(self.data["names"].values())

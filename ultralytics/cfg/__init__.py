@@ -161,6 +161,7 @@ CFG_FLOAT_KEYS = frozenset(
         "seg_w_lovasz",
         "seg_w_dice",
         "seg_w_bce",
+        "lora_alpha",
     }
 )
 CFG_FRACTION_KEYS = frozenset(
@@ -188,6 +189,7 @@ CFG_FRACTION_KEYS = frozenset(
         "conf",
         "iou",
         "fraction",
+        "lora_dropout",
     }
 )
 CFG_INT_KEYS = frozenset(
@@ -203,6 +205,7 @@ CFG_INT_KEYS = frozenset(
         "line_width",
         "nbs",
         "save_period",
+        "lora_rank",
     }
 )
 CFG_BOOL_KEYS = frozenset(
@@ -241,6 +244,7 @@ CFG_BOOL_KEYS = frozenset(
         "profile",
         "multi_scale",
         "seg_use_mixed_loss",
+        "lora",
     }
 )
 

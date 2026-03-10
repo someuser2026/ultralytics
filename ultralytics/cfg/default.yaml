@@ -37,6 +37,14 @@ fraction: 1.0 # (float) fraction of training dataset to use (1.0 = all)
 profile: False # (bool) profile ONNX/TensorRT speeds during training for loggers
 freeze: # (int | list, optional) freeze first N layers (int) or specific layer indices (list)
 unfreeze: # (int | list, optional) timm only: unfreeze last N inner blocks/stages (int) or specific inner indices (list) after the full timm backbone is frozen
+lora: False # (bool) timm only: inject LoRA adapters into matching linear layers inside the wrapped timm backbone
+lora_rank: 8 # (int) LoRA rank for timm-backed adapters
+lora_alpha: 16 # (float) LoRA scaling alpha
+lora_dropout: 0.0 # (float) dropout applied to the LoRA input path
+lora_layers: # (int | list, optional) timm only: apply LoRA to the last N inner blocks/stages or to specific inner indices; default is all matching linear layers
+lora_targets: # (list[str] | str) timm only: exact leaf names or dotted suffixes for linear modules to adapt
+  - attn.qkv
+  - attn.proj
 multi_scale: False # (bool) multiscale training by varying image size
 compile: False # (bool | str) enable torch.compile() backend='inductor'; True="default", False=off, or "default|reduce-overhead|max-autotune-no-cudagraphs"
 reset_args: True # (bool) reset args when loading a PyTorch model checkpoint

@@ -55,9 +55,7 @@ class RTDETRTrainer(DetectionTrainer):
             (RTDETRDetectionModel): Initialized model.
         """
         model = RTDETRDetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
-        if weights:
-            model.load(weights)
-        return model
+        return self._finalize_model_build(model, weights)
 
     def build_dataset(self, img_path: str, mode: str = "val", batch: int | None = None):
         """
@@ -131,9 +129,7 @@ class RTDETRSegmentTrainer(RTDETRTrainer):
         model = RTDETRSegmentModel(
             cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1
         )
-        if weights:
-            model.load(weights)
-        return model
+        return self._finalize_model_build(model, weights)
 
     def get_validator(self):
         """Return a RTDETRSegmentValidator suitable for RT-DETR segmentation model validation."""
@@ -182,9 +178,7 @@ class RTDETROBBTrainer(RTDETRTrainer):
         model = RTDETROBBModel(
             cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1
         )
-        if weights:
-            model.load(weights)
-        return model
+        return self._finalize_model_build(model, weights)
 
     def get_validator(self):
         """Return a RTDETROBBValidator suitable for RT-DETR OBB model validation."""
