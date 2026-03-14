@@ -1318,7 +1318,8 @@ class RTDETRSegmentDecoder(RTDETRDecoder):
         embed, refer_bbox, enc_bboxes, enc_scores = self._get_decoder_input(feats, shapes, dn_embed, dn_bbox)
 
         # Encoder mask predictions - use same top-k selection as encoder scores
-        enc_features = self.enc_output(feats)  # (bs, h*w, hd)
+        _, valid_mask = self._generate_anchors(shapes, dtype=feats.dtype, device=feats.device)
+        enc_features = self.enc_output(valid_mask * feats)  # (bs, h*w, hd)
         enc_mask_coeffs_full = self.enc_mask_head(enc_features)  # (bs, h*w, nm)
         # Get top-k indices from encoder scores (from _get_decoder_input)
         enc_outputs_scores_full = self.enc_score_head(enc_features)
@@ -1389,7 +1390,7 @@ class RTDETRSegmentDecoder(RTDETRDecoder):
 
         # (bs, 300, 4+nc+nm)
         y = torch.cat((dec_bboxes_eval, dec_scores_eval.sigmoid(), dec_masks_eval), -1)
-        return y if self.export else (y, x)
+        return (y, protos) if self.export else (y, x)
 
 
 
@@ -1471,8 +1472,8 @@ class RTDETROBBDecoder(RTDETRDecoder):
         self.dec_bbox_head = nn.ModuleList([MLP(hd, hd, 5, num_layers=3) for _ in range(ndl)])
 
         self.query_pos_head = MLP(5, 2 * hd, hd, num_layers=2)
-        self.decoder_layer = DeformableTransformerDecoderLayer(hd, nh, d_ffn, dropout, act, self.nl, ndp, use_obb=True)
-        self.decoder = DeformableTransformerDecoder(hd, self.decoder_layer, ndl, eval_idx)
+        decoder_layer = DeformableTransformerDecoderLayer(hd, nh, d_ffn, dropout, act, self.nl, ndp, use_obb=True)
+        self.decoder = DeformableTransformerDecoder(hd, decoder_layer, ndl, eval_idx)
 
         # Re-initialize bbox head parameters
         constant_(self.enc_bbox_head.layers[-1].weight, 0.0)
@@ -1518,16 +1519,18 @@ class RTDETROBBDecoder(RTDETRDecoder):
         top_k_features = features[batch_ind, topk_ind].view(bs, self.num_queries, -1)
         top_k_anchors = anchors[:, topk_ind].view(bs, self.num_queries, -1)  # (bs, nq, 4)
 
-        # Dynamic anchors + static content - encoder bbox head outputs 5D, so we pad anchors with 0 angle
+        # Dynamic anchors + static content - use a zero-angle prior in normalized angle space.
         enc_bbox_pred = self.enc_bbox_head(top_k_features)  # (bs, nq, 5)
-        top_k_anchors_5d = torch.cat([top_k_anchors, torch.zeros_like(top_k_anchors[:, :, :1])], dim=-1)  # (bs, nq, 5)
+        zero_angle = torch.full_like(top_k_anchors[:, :, :1], math.log(0.25 / 0.75))
+        top_k_anchors_5d = torch.cat([top_k_anchors, zero_angle], dim=-1)  # (bs, nq, 5)
         refer_bbox = enc_bbox_pred + top_k_anchors_5d
 
         enc_bboxes = refer_bbox.sigmoid()
         if dn_bbox is not None:
             # dn_bbox may be 4D or 5D - pad if needed
             if dn_bbox.shape[-1] == 4:
-                dn_bbox_5d = torch.cat([dn_bbox, torch.zeros_like(dn_bbox[:, :, :1])], dim=-1)
+                dn_zero_angle = torch.full_like(dn_bbox[:, :, :1], math.log(0.25 / 0.75))
+                dn_bbox_5d = torch.cat([dn_bbox, dn_zero_angle], dim=-1)
                 refer_bbox = torch.cat([dn_bbox_5d, refer_bbox], 1)
             else:
                 refer_bbox = torch.cat([dn_bbox, refer_bbox], 1)
@@ -1587,36 +1590,23 @@ class RTDETROBBDecoder(RTDETRDecoder):
             attn_mask=attn_mask,
         )
 
-        # Regularize angles: apply sigmoid and map to [-pi/4, 3pi/4]
+        # Regularize normalized angles to [-pi/4, 3pi/4].
         def regularize_angle(angle_tensor):
-            """Regularize angle from sigmoid output [0, 1] to [-pi/4, 3pi/4]."""
-            return (angle_tensor.sigmoid() - 0.25) * math.pi
+            """Regularize normalized angle from [0, 1] to [-pi/4, 3pi/4]."""
+            return (angle_tensor - 0.25) * math.pi
 
-        # Regularize encoder bboxes
         if enc_bboxes.shape[-1] == 5:
-            enc_bboxes_xywh = enc_bboxes[..., :4].sigmoid()
-            enc_bboxes_angle = regularize_angle(enc_bboxes[..., 4:5])
-            enc_bboxes = torch.cat([enc_bboxes_xywh, enc_bboxes_angle], dim=-1)
+            enc_bboxes = torch.cat([enc_bboxes[..., :4], regularize_angle(enc_bboxes[..., 4:5])], dim=-1)
 
-        # Regularize decoder bboxes
         if dec_bboxes.shape[-1] == 5:
-            # Handle stacked decoder outputs
-            if dec_bboxes.ndim == 4:  # (ndl, bs, nq, 5)
-                dec_bboxes_xywh = dec_bboxes[..., :4].sigmoid()
-                dec_bboxes_angle = regularize_angle(dec_bboxes[..., 4:5])
-                dec_bboxes = torch.cat([dec_bboxes_xywh, dec_bboxes_angle], dim=-1)
-            else:
-                dec_bboxes_xywh = dec_bboxes[..., :4].sigmoid()
-                dec_bboxes_angle = regularize_angle(dec_bboxes[..., 4:5])
-                dec_bboxes = torch.cat([dec_bboxes_xywh, dec_bboxes_angle], dim=-1)
+            dec_bboxes = torch.cat([dec_bboxes[..., :4], regularize_angle(dec_bboxes[..., 4:5])], dim=-1)
 
         x = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta
         if self.training:
             return x
         # (bs, 300, 5+nc)
-        eval_idx = self.decoder.eval_idx if self.decoder.eval_idx >= 0 else len(self.decoder.layers) + self.decoder.eval_idx
-        dec_bboxes_eval = dec_bboxes[eval_idx].squeeze(0) if dec_bboxes.ndim > 3 else dec_bboxes
-        dec_scores_eval = dec_scores[eval_idx].squeeze(0) if dec_scores.ndim > 3 else dec_scores
+        dec_bboxes_eval = dec_bboxes.squeeze(0)
+        dec_scores_eval = dec_scores.squeeze(0)
         y = torch.cat((dec_bboxes_eval, dec_scores_eval.sigmoid()), -1)
         return y if self.export else (y, x)
 

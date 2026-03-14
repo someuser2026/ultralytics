@@ -1,0 +1,31 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# LEGNet-small detection model with P3/8 - P5/32 outputs
+
+nc: 80 # number of classes
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, LWEGNet, [64, [1, 4, 4, 2], 2.0, 0.1]] # 0 -> [P2, P3, P4, P5]
+  - [0, 1, Index, [1]] # 1-P3/8
+  - [0, 1, Index, [2]] # 2-P4/16
+  - [0, 1, Index, [3]] # 3-P5/32
+
+head:
+  - [3, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 2], 1, Concat, [1]] # cat backbone P4
+  - [-1, 2, C3k2, [256, False]] # 6
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 1], 1, Concat, [1]] # cat backbone P3
+  - [-1, 2, C3k2, [128, False]] # 9 (P3/8-small)
+
+  - [-1, 1, Conv, [128, 3, 2]]
+  - [[-1, 6], 1, Concat, [1]] # cat head P4
+  - [-1, 2, C3k2, [256, False]] # 12 (P4/16-medium)
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 3], 1, Concat, [1]] # cat head P5
+  - [-1, 2, C3k2, [512, True]] # 15 (P5/32-large)
+
+  - [[9, 12, 15], 1, Detect, [nc]] # Detect(P3, P4, P5)

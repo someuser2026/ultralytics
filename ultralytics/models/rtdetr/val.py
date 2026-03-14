@@ -10,12 +10,25 @@ import torch
 from ultralytics.data import YOLODataset
 from ultralytics.data.augment import Compose, Format, v8_transforms
 from ultralytics.models.yolo.detect import DetectionValidator
+from ultralytics.models.yolo.obb.val import OBBValidator
+from ultralytics.models.yolo.segment.val import SegmentationValidator
 from ultralytics.utils import colorstr, ops
 from ultralytics.utils.metrics import SegmentMetrics, OBBMetrics
 from ultralytics.utils.nms import TorchNMS
 import numpy as np
 
 __all__ = ("RTDETRValidator", "RTDETRSegmentValidator", "RTDETROBBValidator")  # tuple or list
+
+
+def _rtdetr_head(model):
+    """Return the RT-DETR head module through optional backend/model wrappers."""
+    module = model
+    for _ in range(2):
+        candidate = getattr(module, "model", None)
+        if candidate is None:
+            break
+        module = candidate
+    return module[-1] if hasattr(module, "__getitem__") else None
 
 
 class RTDETRDataset(YOLODataset):
@@ -158,6 +171,7 @@ class RTDETRValidator(DetectionValidator):
             cache=self.args.cache or None,
             prefix=colorstr(f"{mode}: "),
             data=self.data,
+            task=self.args.task,
         )
 
     def postprocess(
@@ -186,10 +200,9 @@ class RTDETRValidator(DetectionValidator):
         for i, bbox in enumerate(bboxes):  # (300, 4)
             bbox = ops.xywh2xyxy(bbox)
             score, cls = scores[i].max(-1)  # (300, )
-            pred = torch.cat([bbox, score[..., None], cls[..., None]], dim=-1)  # filter
-            # Sort by confidence to correctly get internal metrics
-            pred = pred[score.argsort(descending=True)]
-            outputs[i] = pred[score > self.args.conf]
+            keep = score > self.args.conf
+            pred = torch.cat([bbox, score[..., None], cls[..., None]], dim=-1)[keep]
+            outputs[i] = pred[pred[:, 4].argsort(descending=True)]
 
         return [{"bboxes": x[:, :4], "conf": x[:, 4], "cls": x[:, 5]} for x in outputs]
 
@@ -222,7 +235,7 @@ class RTDETRValidator(DetectionValidator):
             )
 
 
-class RTDETRSegmentValidator(RTDETRValidator):
+class RTDETRSegmentValidator(SegmentationValidator, RTDETRValidator):
     """
     RTDETRSegmentValidator extends RTDETRValidator to provide validation capabilities for RT-DETR segmentation models.
 
@@ -246,35 +259,6 @@ class RTDETRSegmentValidator(RTDETRValidator):
         >>> validator = RTDETRSegmentValidator(args=args)
         >>> validator()
     """
-
-    def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None) -> None:
-        """
-        Initialize RTDETRSegmentValidator and set task to 'segment', metrics to SegmentMetrics.
-
-        Args:
-            dataloader (torch.utils.data.DataLoader, optional): Dataloader to use for validation.
-            save_dir (Path, optional): Directory to save results.
-            args (namespace, optional): Arguments for the validator.
-            _callbacks (list, optional): List of callback functions.
-        """
-        super().__init__(dataloader, save_dir, args, _callbacks)
-        self.args.task = "segment"
-        self.metrics = SegmentMetrics(fitness_weights=getattr(self.args, "fitness_weights", None))
-
-    def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
-        """
-        Preprocess batch of images for RT-DETR segmentation validation.
-
-        Args:
-            batch (dict[str, Any]): Batch containing images and annotations.
-
-        Returns:
-            (dict[str, Any]): Preprocessed batch.
-        """
-        batch = super().preprocess(batch)
-        if "masks" in batch:
-            batch["masks"] = batch["masks"].float()
-        return batch
 
     def postprocess(
         self, preds: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor]
@@ -305,42 +289,40 @@ class RTDETRSegmentValidator(RTDETRValidator):
             protos = None
 
         bs, _, nd = preds[0].shape
-        # Extract dimensions
-        nm = 32  # default number of masks
-        if hasattr(self.model, "model") and hasattr(self.model.model[-1], "nm"):
-            nm = self.model.model[-1].nm
+        nm = 32
+        head = _rtdetr_head(self.model)
+        if head is not None and hasattr(head, "nm"):
+            nm = head.nm
         nc = len(self.model.names) if hasattr(self.model, "names") else nd - 4 - nm
+        imgsz = self._last_imgsz
+        scale = torch.tensor([imgsz[1], imgsz[0], imgsz[1], imgsz[0]], device=preds[0].device, dtype=preds[0].dtype)
 
-        bboxes = preds[0][..., :4] * self.args.imgsz
+        bboxes = preds[0][..., :4] * scale
         scores = preds[0][..., 4 : 4 + nc]
         mask_coeffs = preds[0][..., 4 + nc :]
-
-        outputs = [torch.zeros((0, 7 + nm), device=bboxes.device)] * bs
+        results = []
         for i in range(bs):
             bbox = ops.xywh2xyxy(bboxes[i])
             score, cls = scores[i].max(-1)
             pred = torch.cat([bbox, score[..., None], cls[..., None], mask_coeffs[i]], dim=-1)
-            pred = pred[score.argsort(descending=True)]
-            outputs[i] = pred[score > self.args.conf]
-
-        # Process masks with protos if available
-        results = []
-        for i, pred in enumerate(outputs):
-            result = {"bboxes": pred[:, :4], "conf": pred[:, 4], "cls": pred[:, 5]}
-            if protos is not None and pred.shape[0] > 0:
-                # Process masks similar to SegmentationValidator
-                masks = ops.process_mask(
-                    protos[i : i + 1], pred[:, 6:], pred[:, :4], (self.args.imgsz, self.args.imgsz), upsample=True
+            pred = pred[score > self.args.conf]
+            pred = pred[pred[:, 4].argsort(descending=True)]
+            proto_i = None if protos is None else (protos if protos.ndim == 3 else protos[i])
+            masks = (
+                self.process(proto_i, pred[:, 6:], pred[:, :4], shape=imgsz)
+                if protos is not None and pred.shape[0]
+                else torch.zeros(
+                    (0, *(imgsz if self.process is ops.process_mask_native or proto_i is None else proto_i.shape[1:])),
+                    dtype=torch.uint8,
+                    device=pred.device,
                 )
-                result["masks"] = masks
-            else:
-                result["masks"] = None
-            results.append(result)
+            )
+            results.append({"bboxes": pred[:, :4], "conf": pred[:, 4], "cls": pred[:, 5], "masks": masks})
 
         return results
 
 
-class RTDETROBBValidator(RTDETRValidator):
+class RTDETROBBValidator(OBBValidator, RTDETRValidator):
     """
     RTDETROBBValidator extends RTDETRValidator to provide validation capabilities for RT-DETR OBB models.
 
@@ -366,63 +348,6 @@ class RTDETROBBValidator(RTDETRValidator):
         >>> validator()
     """
 
-    def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None) -> None:
-        """
-        Initialize RTDETROBBValidator and set task to 'obb', metrics to OBBMetrics.
-
-        Args:
-            dataloader (torch.utils.data.DataLoader, optional): Dataloader to use for validation.
-            save_dir (Path, optional): Directory to save results.
-            args (namespace, optional): Arguments for the validator.
-            _callbacks (list, optional): List of callback functions.
-        """
-        super().__init__(dataloader, save_dir, args, _callbacks)
-        self.args.task = "obb"
-        self.metrics = OBBMetrics(fitness_weights=getattr(self.args, "fitness_weights", None))
-
-    def init_metrics(self, model: torch.nn.Module) -> None:
-        """
-        Initialize evaluation metrics for RT-DETR OBB validation.
-
-        Args:
-            model (torch.nn.Module): Model to validate.
-        """
-        super().init_metrics(model)
-        val = self.data.get(self.args.split, "")  # validation path
-        self.is_dota = isinstance(val, str) and "DOTA" in val  # check if dataset is DOTA format
-        if hasattr(self, "confusion_matrix"):
-            self.confusion_matrix.task = "obb"  # set confusion matrix task to 'obb'
-
-    def _process_batch(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> dict[str, np.ndarray]:
-        """
-        Compute the correct prediction matrix for a batch of OBB detections and ground truth boxes.
-
-        Args:
-            preds (dict[str, torch.Tensor]): Prediction dictionary containing 'cls' and 'bboxes' keys with detected
-                class labels and rotated bounding boxes (5D).
-            batch (dict[str, torch.Tensor]): Batch dictionary containing 'cls' and 'bboxes' keys with ground truth
-                class labels and rotated bounding boxes (5D).
-
-        Returns:
-            (dict[str, np.ndarray]): Dictionary containing 'tp' key with the correct prediction matrix.
-        """
-        from ultralytics.utils.metrics import batch_probiou
-
-        if batch["cls"].shape[0] == 0 or preds["cls"].shape[0] == 0:
-            return {
-                "tp": np.zeros((preds["cls"].shape[0], self.niou), dtype=bool),
-                "matched_gt_idx": np.full(preds["cls"].shape[0], -1, dtype=np.int32),
-            }
-        iou = batch_probiou(batch["bboxes"], preds["bboxes"])
-        tp, matched_gt_idx = self.match_predictions(
-            preds["cls"], batch["cls"], iou, return_matched_indices=True
-        )
-
-        return {
-            "tp": tp.cpu().numpy(),
-            "matched_gt_idx": matched_gt_idx,
-        }
-
     def postprocess(
         self, preds: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor]
     ) -> list[dict[str, torch.Tensor]]:
@@ -443,13 +368,17 @@ class RTDETROBBValidator(RTDETRValidator):
             preds = [preds, None]
 
         bs, _, nd = preds[0].shape
-        rboxes = preds[0][..., :5] * self.args.imgsz
+        imgsz = self.args.imgsz if isinstance(self.args.imgsz, (tuple, list)) else (self.args.imgsz, self.args.imgsz)
+        scale = torch.tensor([imgsz[1], imgsz[0], imgsz[1], imgsz[0]], device=preds[0].device, dtype=preds[0].dtype)
+        rboxes = preds[0][..., :5].clone()
+        rboxes[..., :4] *= scale
         scores = preds[0][..., 5:]
         outputs = [torch.zeros((0, 7), device=rboxes.device)] * bs
         for i in range(bs):
             score, cls = scores[i].max(-1)
-            pred = torch.cat([rboxes[i], score[..., None], cls[..., None]], dim=-1)
-            pred = pred[score.argsort(descending=True)]
-            outputs[i] = pred[score > self.args.conf]
+            pred_rboxes = ops.regularize_rboxes(rboxes[i])
+            pred = torch.cat([pred_rboxes, score[..., None], cls[..., None]], dim=-1)
+            pred = pred[score > self.args.conf]
+            outputs[i] = pred[pred[:, 5].argsort(descending=True)]
 
         return [{"bboxes": x[:, :5], "conf": x[:, 5], "cls": x[:, 6]} for x in outputs]

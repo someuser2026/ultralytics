@@ -1,0 +1,15 @@
+data: /Users/manishagupta/Desktop/PhD/Code/data_processed/Global/Annotated/variants/obb/planet_full_c224_ov35_kf20_all_soft_n10_seed0/data.yaml
+epochs: 1
+imgsz: 224
+batch: 2
+workers: 0
+device: cpu
+project: /Users/manishagupta/Desktop/PhD/orig_paper_code/ultralytics/runs/legnet_smoke
+name: obb_smoke
+exist_ok: true
+plots: false
+cache: false
+pretrained: false
+amp: false
+save: true
+seed: 0

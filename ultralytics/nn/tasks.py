@@ -94,6 +94,7 @@ from ultralytics.nn.modules import (
     BiFPN,
     RTDETROBBDecoder,
     RTDETRSegmentDecoder,
+    LWEGNet,
     # Mask2FormerHead,
     # CascadeRCNNHead,
 )
@@ -1046,13 +1047,14 @@ class RTDETRDetectionModel(DetectionModel):
             nc (int, optional): Number of classes.
             verbose (bool): Print additional information during initialization.
         """
+        self.task = getattr(self, "task", "detect")
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
     def init_criterion(self):
         """Initialize the loss criterion for the RTDETRDetectionModel."""
         # from ultralytics.utils.loss import RTDETRDetectionLoss
 
-        return RTDETRDetectionLoss(nc=self.nc, use_vfl=True)
+        return RTDETRDetectionLoss(nc=self.yaml["nc"], use_vfl=True)
 
     def loss(self, batch, preds=None):
         """
@@ -1171,32 +1173,31 @@ class RTDETRSegmentModel(RTDETRDetectionModel):
             nm (int): Number of masks.
             npr (int): Number of prototypes.
         """
+        self.task = "segment"
         self.nm = nm
         self.npr = npr
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
     def init_criterion(self):
         """Initialize the loss criterion for the RTDETRSegmentModel."""
-        # from ultralytics.utils.loss import RTDETRSegmentLoss
-
-        # Initialize with model args if available, otherwise use defaults
         model_args = getattr(self, "args", None)
+        get_arg = model_args.get if isinstance(model_args, dict) else lambda k, d=None: getattr(model_args, k, d)
+        imgsz = get_arg("imgsz", 640) if model_args else 640
+        if isinstance(imgsz, (tuple, list)):
+            imgsz = imgsz[0]
         return RTDETRSegmentLoss(
-            nc=self.nc,
+            nc=self.yaml["nc"],
             use_vfl=True,
-            use_mixed_loss=bool(getattr(model_args, "seg_use_mixed_loss", False)) if model_args else False,
-            use_soft_ignore_band=bool(getattr(model_args, "use_soft_ignore_band", False)) if model_args else False,
-            ignore_band_width=float(getattr(model_args, "ignore_band_width", 10.0)) if model_args else 10.0,
-            soft_ignore_transition_ratio=float(getattr(model_args, "soft_ignore_transition_ratio", 0.5))
-            if model_args
-            else 0.5,
-            tile_size=int(getattr(model_args, "imgsz", 640)) if model_args else 640,
-            use_ultrafast_ignore=bool(getattr(model_args, "use_ultrafast_ignore_band", False))
-            if model_args
-            else False,
-            seg_w_lovasz=float(getattr(model_args, "seg_w_lovasz", 1.0)) if model_args else 1.0,
-            seg_w_dice=float(getattr(model_args, "seg_w_dice", 0.3)) if model_args else 0.3,
-            seg_w_bce=float(getattr(model_args, "seg_w_bce", 0.2)) if model_args else 0.2,
+            overlap_mask=bool(get_arg("overlap_mask", True)) if model_args else True,
+            use_mixed_loss=bool(get_arg("seg_use_mixed_loss", False)) if model_args else False,
+            use_soft_ignore_band=bool(get_arg("use_soft_ignore_band", False)) if model_args else False,
+            ignore_band_width=float(get_arg("ignore_band_width", 10.0)) if model_args else 10.0,
+            soft_ignore_transition_ratio=float(get_arg("soft_ignore_transition_ratio", 0.5)) if model_args else 0.5,
+            tile_size=int(imgsz),
+            use_ultrafast_ignore=bool(get_arg("use_ultrafast_ignore_band", False)) if model_args else False,
+            seg_w_lovasz=float(get_arg("seg_w_lovasz", 1.0)) if model_args else 1.0,
+            seg_w_dice=float(get_arg("seg_w_dice", 0.3)) if model_args else 0.3,
+            seg_w_bce=float(get_arg("seg_w_bce", 0.2)) if model_args else 0.2,
         )
 
     def loss(self, batch, preds=None):
@@ -1267,11 +1268,9 @@ class RTDETRSegmentModel(RTDETRDetectionModel):
         )
 
         # Return main losses - include mask loss if available
-        loss_keys = ["loss_giou", "loss_class", "loss_bbox"]
-        if "loss_mask" in loss:
-            loss_keys.append("loss_mask")
+        loss_keys = ["loss_giou", "loss_class", "loss_bbox", "loss_mask"]
         return sum(loss.values()), torch.as_tensor(
-            [loss[k].detach() for k in loss_keys if k in loss], device=img.device
+            [loss.get(k, torch.tensor(0.0, device=img.device)).detach() for k in loss_keys], device=img.device
         )
 
 
@@ -1305,13 +1304,14 @@ class RTDETROBBModel(RTDETRDetectionModel):
             nc (int, optional): Number of classes.
             verbose (bool): Print additional information during initialization.
         """
+        self.task = "obb"
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
     def init_criterion(self):
         """Initialize the loss criterion for the RTDETROBBModel."""
         # from ultralytics.utils.loss import RTDETROBBLoss
 
-        return RTDETROBBLoss(nc=self.nc, use_vfl=True)
+        return RTDETROBBLoss(nc=self.yaml["nc"], use_vfl=True)
 
     def loss(self, batch, preds=None):
         """
@@ -1340,7 +1340,7 @@ class RTDETROBBModel(RTDETRDetectionModel):
         }
 
         if preds is None:
-            preds = self.predict(img, batch=targets)
+            preds = self.predict(img, batch={**targets, "bboxes": targets["bboxes"][..., :4]})
         dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = preds if self.training else preds[1]
         if dn_meta is None:
             dn_bboxes, dn_scores = None, None
@@ -2284,6 +2284,13 @@ def parse_model(d, ch, verbose=True):
                 # Standard handling for constant drop_path
                 args = [c1, c2, *args[1:]]
                 m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)
+        elif m is LWEGNet:
+            if n != 1:
+                raise ValueError("LWEGNet must be declared with repeats=1 in model YAML.")
+            c1 = ch[f]
+            args = [c1, *args]
+            m_ = m(*args)
+            c2 = m_.channels
         elif m is Timm:
             c1 = ch[f]
             args[2] = c1
@@ -2303,7 +2310,7 @@ def parse_model(d, ch, verbose=True):
             c2 = ch[f]
 
         # Fixed: Move this outside ConvNeXtBlock handling and fix the condition
-        if m not in frozenset({ConvNeXtBlock, Timm}):
+        if m not in frozenset({ConvNeXtBlock, LWEGNet, Timm}):
             # if m in {Segment, YOLOESegment}:
             #     print("[DEBUG] Segment sources f =", f)
             #     print("[DEBUG] Segment in-channels =", [ch[u] for u in f], flush=True)
@@ -2393,14 +2400,14 @@ def guess_model_task(model):
         m = cfg["head"][-1][-2].lower()  # output module name
         if m in {"classify", "classifier", "cls", "fc"}:
             return "classify"
-        if "detect" in m:
-            return "detect"
         if "segment" in m:
             return "segment"
+        if "obb" in m:
+            return "obb"
+        if "detect" in m or m == "rtdetrdecoder":
+            return "detect"
         if m == "pose":
             return "pose"
-        if m == "obb":
-            return "obb"
 
     # Guess from model cfg
     if isinstance(model, dict):
@@ -2417,12 +2424,18 @@ def guess_model_task(model):
         for m in model.modules():
             if isinstance(m, (Segment, YOLOESegment)):
                 return "segment"
+            elif isinstance(m, RTDETRSegmentDecoder):
+                return "segment"
             elif isinstance(m, Classify):
                 return "classify"
             elif isinstance(m, Pose):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
+            elif isinstance(m, RTDETROBBDecoder):
+                return "obb"
+            elif isinstance(m, RTDETRDecoder):
+                return "detect"
             elif isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect)):
                 return "detect"
 

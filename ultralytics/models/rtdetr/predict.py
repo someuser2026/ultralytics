@@ -8,6 +8,17 @@ from ultralytics.engine.results import Results
 from ultralytics.utils import ops, DEFAULT_CFG
 
 
+def _rtdetr_head(model):
+    """Return the RT-DETR head module through optional backend/model wrappers."""
+    module = model
+    for _ in range(2):
+        candidate = getattr(module, "model", None)
+        if candidate is None:
+            break
+        module = candidate
+    return module[-1] if hasattr(module, "__getitem__") else None
+
+
 class RTDETRPredictor(BasePredictor):
     """
     RT-DETR (Real-Time Detection Transformer) Predictor extending the BasePredictor class for making predictions.
@@ -143,7 +154,8 @@ class RTDETRSegmentPredictor(RTDETRPredictor):
 
         nd = preds[0].shape[-1]
         # Split: bboxes (4), scores (nc), masks (nm)
-        nm = getattr(self.model.model[-1], "nm", 32) if hasattr(self.model, "model") else 32
+        head = _rtdetr_head(self.model)
+        nm = getattr(head, "nm", 32)
         nc = len(self.model.names) if hasattr(self.model, "names") else nd - 4 - nm
         bboxes = preds[0][..., :4]
         scores = preds[0][..., 4 : 4 + nc]
@@ -164,21 +176,25 @@ class RTDETRSegmentPredictor(RTDETRPredictor):
             pred = torch.cat([bbox, max_score, cls, mask_coeff], dim=-1)[idx]  # filter
             pred = pred[pred[:, 4].argsort(descending=True)][: self.args.max_det]
             oh, ow = orig_img.shape[:2]
-            pred[:, [0, 2]] *= ow  # scale x coordinates to original width
-            pred[:, [1, 3]] *= oh  # scale y coordinates to original height
 
             # Process masks
             masks = None
             if protos is not None and pred.shape[0] > 0:
+                proto_i = protos if protos.ndim == 3 else protos[len(results)]
+                input_boxes = pred[:, :4].clone()
+                input_boxes[:, [0, 2]] *= img.shape[3]
+                input_boxes[:, [1, 3]] *= img.shape[2]
                 if self.args.retina_masks:
-                    masks = ops.process_mask_native(
-                        protos, pred[:, 6:], pred[:, :4], orig_img.shape[:2]
-                    )  # HWC
+                    pred[:, [0, 2]] *= ow
+                    pred[:, [1, 3]] *= oh
+                    masks = ops.process_mask_native(proto_i, pred[:, 6:], pred[:, :4], orig_img.shape[:2])
                 else:
-                    masks = ops.process_mask(
-                        protos, pred[:, 6:], pred[:, :4], img.shape[2:], upsample=True
-                    )  # HWC
-                    pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
+                    masks = ops.process_mask(proto_i, pred[:, 6:], input_boxes, img.shape[2:], upsample=True)
+                    pred[:, [0, 2]] *= ow
+                    pred[:, [1, 3]] *= oh
+            else:
+                pred[:, [0, 2]] *= ow
+                pred[:, [1, 3]] *= oh
 
             if masks is not None:
                 keep = masks.sum((-2, -1)) > 0  # only keep predictions with masks
@@ -247,9 +263,8 @@ class RTDETROBBPredictor(RTDETRPredictor):
             # Regularize and scale rboxes
             rboxes_reg = ops.regularize_rboxes(torch.cat([rbox[:, :4], rbox[:, -1:]], dim=-1))
             oh, ow = orig_img.shape[:2]
-            rboxes_reg[:, :4] = ops.scale_boxes(
-                img.shape[2:], rboxes_reg[:, :4], orig_img.shape, xywh=True
-            )
+            rboxes_reg[:, [0, 2]] *= ow
+            rboxes_reg[:, [1, 3]] *= oh
 
             # Combine rbox, score, and class
             pred = torch.cat([rboxes_reg, max_score, cls], dim=-1)[idx]  # filter

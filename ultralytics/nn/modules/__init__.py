@@ -128,6 +128,7 @@ from .neck import (
     RecursiveFPN,
     ScaleEqualizingFPN,
 )
+from .legnet import LWEGNet
 # from .mask2formerhead import (
 #     Mask2FormerHead
 # )
@@ -251,6 +252,7 @@ __all__ = (
     "RecursiveFPN",
     "RepFPN",
     "ScaleEqualizingFPN",
+    "LWEGNet",
     "RTDETROBBDecoder",
     "RTDETRSegmentDecoder",
     "SimpleStem",

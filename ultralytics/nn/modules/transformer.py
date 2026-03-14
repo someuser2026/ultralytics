@@ -778,6 +778,12 @@ class MultiScaleOrientedDeformableAttention(nn.Module):
         assert C == self.d_model
         assert sum(s[0] * s[1] for s in value_shapes) == len_v
         assert refer_bbox.shape[-1] == 5, "refer_bbox must be (cx, cy, w, h, theta)"
+        if refer_bbox.shape[2] == 1:
+            refer_bbox = refer_bbox.expand(-1, -1, self.n_levels, -1)
+        elif refer_bbox.shape[2] != self.n_levels:
+            raise ValueError(
+                f"Expected refer_bbox to have 1 or {self.n_levels} feature levels, but got {refer_bbox.shape[2]}."
+            )
 
         # Project values
         value = self.value_proj(value)
@@ -804,8 +810,7 @@ class MultiScaleOrientedDeformableAttention(nn.Module):
         cy = refer_bbox[..., 1]
         bw = refer_bbox[..., 2]
         bh = refer_bbox[..., 3]
-        theta_deg = refer_bbox[..., 4]
-        theta = torch.deg2rad(theta_deg)  # (bs, len_q, n_levels)
+        theta = (refer_bbox[..., 4] - 0.25) * math.pi  # normalized angle -> radians
 
         # Compute Gaussian parameters per level (Eq. 7, 8)
         BQL = bs * len_q * self.n_levels
@@ -841,7 +846,7 @@ class MultiScaleOrientedDeformableAttention(nn.Module):
         R = R[:, :, None, :, :, :]  # (bs, len_q, 1, n_levels, 2, 2)
         
         # Rotate: (bs, len_q, n_heads, n_levels, n_points, 2) @ (bs, len_q, 1, n_levels, 2, 2)
-        offsets_rotated = torch.einsum('bqhlpd,bqlij->bqhlpi', offsets_local, R.transpose(-2, -1))
+        offsets_rotated = torch.einsum("bqhlpd,bqhlij->bqhlpi", offsets_local, R.transpose(-2, -1))
         # offsets_rotated = torch.matmul(
         #     offsets_local.unsqueeze(-2),  # (bs, len_q, n_heads, n_levels, n_points, 1, 2)
         #     R.transpose(-2, -1)  # (bs, len_q, 1, n_levels, 2, 2)

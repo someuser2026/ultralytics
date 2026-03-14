@@ -77,7 +77,7 @@ from ultralytics.data.dataset import YOLODataset
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.nn.autobackend import check_class_names, default_class_names
 from ultralytics.nn.modules import C2f, Classify, Detect, RTDETRDecoder
-from ultralytics.nn.tasks import ClassificationModel, DetectionModel, SegmentationModel, WorldModel
+from ultralytics.nn.tasks import ClassificationModel, DetectionModel, WorldModel
 from ultralytics.utils import (
     ARM64,
     DEFAULT_CFG,
@@ -622,17 +622,18 @@ class Exporter:
             assert TORCH_1_13, f"'nms=True' ONNX export requires torch>=1.13 (found torch=={TORCH_VERSION})"
 
         f = str(self.file.with_suffix(".onnx"))
-        output_names = ["output0", "output1"] if isinstance(self.model, SegmentationModel) else ["output0"]
+        is_rtdetr = isinstance(self.model.model[-1], RTDETRDecoder)
+        output_names = ["output0", "output1"] if self.model.task == "segment" else ["output0"]
         dynamic = self.args.dynamic
         if dynamic:
             dynamic = {"images": {0: "batch", 2: "height", 3: "width"}}  # shape(1,3,640,640)
-            if isinstance(self.model, SegmentationModel):
-                dynamic["output0"] = {0: "batch", 2: "anchors"}  # shape(1, 116, 8400)
+            if self.model.task == "segment":
+                dynamic["output0"] = {0: "batch", 1 if is_rtdetr else 2: "anchors"}
                 dynamic["output1"] = {0: "batch", 2: "mask_height", 3: "mask_width"}  # shape(1,32,160,160)
             elif isinstance(self.model, DetectionModel):
-                dynamic["output0"] = {0: "batch", 2: "anchors"}  # shape(1, 84, 8400)
+                dynamic["output0"] = {0: "batch", 1 if is_rtdetr else 2: "anchors"}
             if self.args.nms:  # only batch size is dynamic with NMS
-                dynamic["output0"].pop(2)
+                dynamic["output0"].pop(1 if is_rtdetr else 2)
         if self.args.nms and self.model.task == "obb":
             self.args.opset = opset  # for NMSModel
 
@@ -1431,7 +1432,8 @@ class NMSModel(torch.nn.Module):
         pred = preds[0] if isinstance(preds, tuple) else preds
         kwargs = dict(device=pred.device, dtype=pred.dtype)
         bs = pred.shape[0]
-        pred = pred.transpose(-1, -2)  # shape(1,84,6300) to shape(1,6300,84)
+        if pred.shape[-1] > pred.shape[-2]:
+            pred = pred.transpose(-1, -2)  # shape(1,84,6300) -> shape(1,6300,84)
         extra_shape = pred.shape[-1] - (4 + len(self.model.names))  # extras from Segment, OBB, Pose
         if self.args.dynamic and self.args.batch > 1:  # batch size needs to always be same due to loop unroll
             pad = torch.zeros(torch.max(torch.tensor(self.args.batch - bs), torch.tensor(0)), *pred.shape[1:], **kwargs)

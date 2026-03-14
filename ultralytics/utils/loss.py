@@ -1884,6 +1884,7 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
         gamma: float = 1.5,
         alpha: float = 0.25,
         # Mask loss parameters (similar to v8SegmentationLoss)
+        overlap_mask: bool = True,
         use_mixed_loss: bool = False,
         use_soft_ignore_band: bool = False,
         ignore_band_width: float = 10.0,
@@ -1933,6 +1934,7 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
             alpha=alpha,
         )
 
+        self.overlap_mask = overlap_mask
         self.use_mixed_loss = use_mixed_loss
         self.use_soft_ignore_band = use_soft_ignore_band
         self.ignore_band_width = ignore_band_width
@@ -1954,7 +1956,10 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
         mask_coeffs: torch.Tensor,  # (bs, nq, nm) or (ndl, bs, nq, nm)
         protos: torch.Tensor,  # (bs, nm, H, W)
         gt_masks: torch.Tensor,  # (N, H, W) or list of (H, W) per image
-        match_indices: list[tuple],
+        gt_bboxes: torch.Tensor,  # (N, 4) normalized xywh
+        match_indices: list[tuple] | list[list[tuple]],
+        gt_groups: list[int],
+        batch_idx: torch.Tensor,
         imgsz: torch.Tensor,  # (2,) [h, w]
         postfix: str = "",
     ) -> dict[str, torch.Tensor]:
@@ -1965,7 +1970,7 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
             mask_coeffs (torch.Tensor): Mask coefficients, shape (bs, nq, nm) or (ndl, bs, nq, nm).
             protos (torch.Tensor): Prototypes, shape (bs, nm, H, W).
             gt_masks (torch.Tensor): Ground truth masks, shape (N, H, W) where N is total GTs across batch.
-            match_indices (list[tuple]): List of (src_idx, dst_idx) tuples per image.
+            match_indices (list[tuple] | list[list[tuple]]): Per-image matches for one layer or per-layer matches.
             imgsz (torch.Tensor): Image size [h, w].
             postfix (str): Postfix for loss names.
 
@@ -1978,11 +1983,15 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
         # Handle multi-layer mask_coeffs (from auxiliary losses)
         if mask_coeffs.dim() == 4:
             # For auxiliary losses, process each layer
+            if match_indices and isinstance(match_indices[0], list):
+                match_indices_per_layer = match_indices
+            else:
+                match_indices_per_layer = [match_indices] * mask_coeffs.shape[0]
             total_mask_loss = 0.0
             total_dice_loss = 0.0
-            for layer_coeffs in mask_coeffs:
+            for layer_coeffs, layer_match_indices in zip(mask_coeffs, match_indices_per_layer):
                 layer_loss = self._get_loss_mask_single_layer(
-                    layer_coeffs, protos, gt_masks, match_indices, imgsz
+                    layer_coeffs, protos, gt_masks, gt_bboxes, layer_match_indices, gt_groups, batch_idx, imgsz
                 )
                 total_mask_loss += layer_loss["mask"]
                 total_dice_loss += layer_loss.get("dice", 0.0)
@@ -1993,7 +2002,9 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
             }
         else:
             # Single layer
-            loss_dict = self._get_loss_mask_single_layer(mask_coeffs, protos, gt_masks, match_indices, imgsz)
+            loss_dict = self._get_loss_mask_single_layer(
+                mask_coeffs, protos, gt_masks, gt_bboxes, match_indices, gt_groups, batch_idx, imgsz
+            )
             return {
                 name_mask: loss_dict["mask"] * self.loss_gain.get("mask", 1.0),
                 name_dice: loss_dict.get("dice", 0.0) * self.loss_gain.get("dice", 1.0),
@@ -2004,45 +2015,60 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
         mask_coeffs: torch.Tensor,  # (bs, nq, nm)
         protos: torch.Tensor,       # (bs, nm, H, W)
         gt_masks: torch.Tensor,     # (N_total, H, W) flattened across batch
+        gt_bboxes: torch.Tensor,    # (N_total, 4) normalized xywh
         match_indices: list[tuple],
+        gt_groups: list[int],
+        batch_idx: torch.Tensor,
         imgsz: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Compute mask loss for a single layer using per-image matching."""
         bs, nq, nm = mask_coeffs.shape
         _, _, proto_h, proto_w = protos.shape
-
-        # Flatten matcher indices into (batch_idx, src_idx) and global gt_idx
-        idx, gt_idx = self._get_index(match_indices)
-        batch_idx, src_idx = idx  # each element corresponds to one matched pair
-
-        if gt_masks.numel() == 0 or gt_idx.numel() == 0:
+        if gt_masks.numel() == 0 or sum(len(src) for src, _ in match_indices) == 0:
             return {
                 "mask": torch.tensor(0.0, device=self.device),
                 "dice": torch.tensor(0.0, device=self.device),
             }
 
+        gt_offsets = torch.as_tensor([0, *gt_groups[:-1]], device=mask_coeffs.device, dtype=torch.long).cumsum_(0)
         per_img_mask_losses: list[torch.Tensor] = []
         per_img_dice_losses: list[torch.Tensor] = []
 
         for b in range(bs):
-            sel = (batch_idx == b)
-            if not sel.any():
+            q_idx_b, gt_idx_b = match_indices[b]
+            q_idx_b = q_idx_b.to(mask_coeffs.device)
+            gt_idx_b = gt_idx_b.to(mask_coeffs.device)
+            if q_idx_b.numel() == 0:
                 continue
 
-            # Query indices and GT indices for image b
-            q_idx_b = src_idx[sel]    # (n_b,)
-            gt_idx_b = gt_idx[sel]    # (n_b,) indices into flattened GT
-
             # (n_b, nm), (nm, H, W)
-            coeffs_b = mask_coeffs[b, q_idx_b]         # (n_b, nm)
-            protos_b = protos[b]                       # (nm, H, W)
-            gt_masks_b = gt_masks[gt_idx_b]           # (n_b, H, W)
+            coeffs_b = mask_coeffs[b, q_idx_b]  # (n_b, nm)
+            protos_b = protos[b]  # (nm, H, W)
+
+            if self.overlap_mask:
+                masks_i = gt_masks[b]
+                if masks_i.ndim == 3 and masks_i.shape[0] == 1:
+                    masks_i = masks_i[0]
+                local_gt_idx = gt_idx_b - gt_offsets[b]
+                gt_masks_b = (masks_i == (local_gt_idx + 1).view(-1, 1, 1)).float()
+            else:
+                gt_masks_b = gt_masks[gt_idx_b]
+            gt_boxes_b = gt_bboxes[gt_idx_b]
 
             if coeffs_b.numel() == 0 or gt_masks_b.numel() == 0:
                 continue
 
+            if gt_masks_b.shape[-2:] != (proto_h, proto_w):
+                gt_masks_b = F.interpolate(gt_masks_b.unsqueeze(1), (proto_h, proto_w), mode="nearest").squeeze(1)
+
             # Predicted masks for image b
             pred_masks_b = torch.einsum("in,nhw->ihw", coeffs_b, protos_b)  # (n_b, H, W)
+
+            # Convert matched GT boxes from normalized xywh to mask-space xyxy for cropping-based losses.
+            xyxy_b = xywh2xyxy(gt_boxes_b.clone())
+            xyxy_b[:, [0, 2]] *= proto_w
+            xyxy_b[:, [1, 3]] *= proto_h
+            area_b = gt_boxes_b[:, 2:].prod(1).clamp_min(1e-6)
 
             # Optional soft-ignore weights (per image)
             weight_map_b = None
@@ -2062,16 +2088,11 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
 
             # --- MixedMaskLoss branch -------------------------------------------------
             if self.use_mixed_loss and hasattr(self, "mixed_mask_loss"):
-                # NOTE: still using full-image crop; xyxy/area are placeholders
-                n_b = pred_masks_b.shape[0]
-                xyxy = torch.zeros(n_b, 4, device=pred_masks_b.device)
-                area = gt_masks_b.float().sum(dim=(1, 2)).clamp_min(1.0)
-
                 mask_loss_b = self.mixed_mask_loss(
                     logits=pred_masks_b,
                     targets=gt_masks_b.float(),
-                    xyxy=xyxy,
-                    area=area,
+                    xyxy=xyxy_b,
+                    area=area_b,
                     crop_mask_fn=crop_mask,
                     weight_map=weight_map_b,
                 )
@@ -2140,7 +2161,9 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
             (dict[str, torch.Tensor]): Loss dictionary including mask losses.
         """
         pred_bboxes, pred_scores = preds
-        total_loss = super().forward(preds, batch, dn_bboxes=dn_bboxes, dn_scores=dn_scores, dn_meta=dn_meta)
+        total_loss = RTDETRDetectionLoss.forward(
+            self, preds, batch, dn_bboxes=dn_bboxes, dn_scores=dn_scores, dn_meta=dn_meta
+        )
 
         # Compute mask loss if masks are provided
         if masks is not None and "masks" in batch:
@@ -2151,43 +2174,42 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
             # Get match indices from the main loss computation
             # For encoder
             enc_mask_coeffs_expanded = enc_mask_coeffs.unsqueeze(0)  # (1, bs, nq, nm)
-            enc_match_indices = self._get_match_indices_for_layer(pred_bboxes[-1], pred_scores[-1], batch)
+            main_match_indices = self._get_match_indices_for_layer(pred_bboxes[-1], pred_scores[-1], batch)
 
             # For decoder layers
             dec_mask_coeffs_all = torch.cat([enc_mask_coeffs_expanded, dec_mask_coeffs], dim=0)  # (ndl+1, bs, nq, nm)
 
             # Compute mask loss for main prediction (last layer)
             main_mask_loss = self._get_loss_mask(
-                dec_mask_coeffs_all[-1:], protos, gt_masks, enc_match_indices, imgsz
+                dec_mask_coeffs_all[-1:],
+                protos,
+                gt_masks,
+                batch["bboxes"],
+                main_match_indices,
+                batch["gt_groups"],
+                batch["batch_idx"],
+                imgsz,
             )
             total_loss.update(main_mask_loss)
 
             # Compute auxiliary mask losses if enabled
             if self.aux_loss and dec_mask_coeffs.shape[0] > 0:
-                aux_match_indices = self._get_match_indices_for_layer(pred_bboxes[-2], pred_scores[-2], batch)
+                aux_match_indices = [
+                    self._get_match_indices_for_layer(aux_bboxes, aux_scores, batch)
+                    for aux_bboxes, aux_scores in zip(pred_bboxes[:-1], pred_scores[:-1])
+                ]
                 aux_mask_loss = self._get_loss_mask(
-                    dec_mask_coeffs_all[:-1], protos, gt_masks, aux_match_indices, imgsz, postfix="_aux"
+                    dec_mask_coeffs_all[:-1],
+                    protos,
+                    gt_masks,
+                    batch["bboxes"],
+                    aux_match_indices,
+                    batch["gt_groups"],
+                    batch["batch_idx"],
+                    imgsz,
+                    postfix="_aux",
                 )
                 total_loss.update(aux_mask_loss)
-
-        # Handle denoising losses
-        if dn_meta is not None:
-            dn_pos_idx, dn_num_group = dn_meta["dn_pos_idx"], dn_meta["dn_num_group"]
-            assert len(batch["gt_groups"]) == len(dn_pos_idx)
-
-            match_indices = self.get_dn_match_indices(dn_pos_idx, dn_num_group, batch["gt_groups"])
-            dn_loss = super().forward(dn_bboxes, dn_scores, batch, match_indices=match_indices)
-            total_loss.update(dn_loss)
-
-            # Denoising mask loss if provided
-            if dn_mask_coeffs is not None and "masks" in batch:
-                # Use first image's proto for simplicity
-                dn_match_indices = self.get_dn_match_indices(dn_pos_idx, dn_num_group, batch["gt_groups"])
-                # Note: dn_mask_coeffs shape and protos handling need proper implementation
-                # Placeholder for now
-                pass
-        else:
-            total_loss.update({f"{k}_dn": torch.tensor(0.0, device=self.device) for k in total_loss.keys()})
 
         return total_loss
 
@@ -2207,6 +2229,40 @@ class RTDETROBBLoss(RTDETRDetectionLoss):
 
     This class uses probiou instead of bbox_iou for GIoU computation on 5D rotated bounding boxes (x, y, w, h, angle).
     """
+
+    def _get_loss(
+        self,
+        pred_bboxes: torch.Tensor,
+        pred_scores: torch.Tensor,
+        gt_bboxes: torch.Tensor,
+        gt_cls: torch.Tensor,
+        gt_groups: list[int],
+        masks: torch.Tensor | None = None,
+        gt_mask: torch.Tensor | None = None,
+        postfix: str = "",
+        match_indices: list[tuple] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Calculate rotated-box losses for a single prediction layer."""
+        if match_indices is None:
+            match_indices = self.matcher(
+                pred_bboxes, pred_scores, gt_bboxes, gt_cls, gt_groups, masks=masks, gt_mask=gt_mask
+            )
+
+        idx, gt_idx = self._get_index(match_indices)
+        pred_bboxes, gt_bboxes = pred_bboxes[idx], gt_bboxes[gt_idx]
+
+        bs, nq = pred_scores.shape[:2]
+        targets = torch.full((bs, nq), self.nc, device=pred_scores.device, dtype=gt_cls.dtype)
+        targets[idx] = gt_cls[gt_idx]
+
+        gt_scores = torch.zeros([bs, nq], device=pred_scores.device)
+        if len(gt_bboxes):
+            gt_scores[idx] = probiou(pred_bboxes.detach(), gt_bboxes).squeeze(-1)
+
+        return {
+            **self._get_loss_class(pred_scores, targets, gt_scores, len(gt_bboxes), postfix),
+            **self._get_loss_bbox(pred_bboxes, gt_bboxes, postfix),
+        }
 
     def _get_loss_bbox(
         self, pred_bboxes: torch.Tensor, gt_bboxes: torch.Tensor, postfix: str = ""

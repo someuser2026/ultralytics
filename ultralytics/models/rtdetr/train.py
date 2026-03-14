@@ -81,6 +81,7 @@ class RTDETRTrainer(DetectionTrainer):
             prefix=colorstr(f"{mode}: "),
             classes=self.args.classes,
             data=self.data,
+            task=self.args.task,
             fraction=self.args.fraction if mode == "train" else 1.0,
         )
 
@@ -135,7 +136,7 @@ class RTDETRSegmentTrainer(RTDETRTrainer):
         """Return a RTDETRSegmentValidator suitable for RT-DETR segmentation model validation."""
         from .val import RTDETRSegmentValidator
 
-        self.loss_names = "giou_loss", "cls_loss", "l1_loss"
+        self.loss_names = "giou_loss", "cls_loss", "l1_loss", "mask_loss"
         return RTDETRSegmentValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args))
 
 

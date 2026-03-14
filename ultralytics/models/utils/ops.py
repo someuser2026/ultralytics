@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
-from ultralytics.utils.metrics import bbox_iou
+from ultralytics.utils.metrics import batch_probiou, bbox_iou, probiou
 from ultralytics.utils.ops import xywh2xyxy, xyxy2xywh
 
 
@@ -118,7 +118,12 @@ class HungarianMatcher(nn.Module):
         # Flatten to compute cost matrices in batch format
         pred_scores = pred_scores.detach().view(-1, nc)
         pred_scores = F.sigmoid(pred_scores) if self.use_fl else F.softmax(pred_scores, dim=-1)
-        pred_bboxes = pred_bboxes.detach().view(-1, 4)
+        box_dim = pred_bboxes.shape[-1]
+        pred_bboxes = pred_bboxes.detach().view(-1, box_dim)
+        gt_dim = gt_bboxes.shape[-1] if gt_bboxes.numel() else box_dim
+        use_obb = box_dim >= 5 and gt_dim >= 5
+        pred_bbox_cost = pred_bboxes[..., :4]
+        gt_bbox_cost = gt_bboxes[..., :4]
 
         # Compute classification cost
         pred_scores = pred_scores[:, gt_cls]
@@ -130,10 +135,15 @@ class HungarianMatcher(nn.Module):
             cost_class = -pred_scores
 
         # Compute L1 cost between boxes
-        cost_bbox = (pred_bboxes.unsqueeze(1) - gt_bboxes.unsqueeze(0)).abs().sum(-1)  # (bs*num_queries, num_gt)
+        cost_bbox = (pred_bbox_cost.unsqueeze(1) - gt_bbox_cost.unsqueeze(0)).abs().sum(-1)  # (bs*num_queries, num_gt)
 
         # Compute GIoU cost between boxes, (bs*num_queries, num_gt)
-        cost_giou = 1.0 - bbox_iou(pred_bboxes.unsqueeze(1), gt_bboxes.unsqueeze(0), xywh=True, GIoU=True).squeeze(-1)
+        if use_obb:
+            cost_giou = 1.0 - batch_probiou(gt_bboxes, pred_bboxes).transpose(0, 1)
+        else:
+            cost_giou = 1.0 - bbox_iou(
+                pred_bboxes.unsqueeze(1), gt_bboxes.unsqueeze(0), xywh=True, GIoU=True
+            ).squeeze(-1)
 
         # Combine costs into final cost matrix
         C = (

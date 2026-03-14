@@ -38,7 +38,7 @@ class RTDETR(Model):
         >>> results = model("image.jpg")
     """
 
-    def __init__(self, model: str = "rtdetr-l.pt", task: str = "detect") -> None:
+    def __init__(self, model: str = "rtdetr-l.pt", task: str | None = None) -> None:
         """
         Initialize the RT-DETR model with the given pre-trained model file.
 
