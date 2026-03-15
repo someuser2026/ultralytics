@@ -1,0 +1,335 @@
+RIP DETECTION DIAGNOSTIC EXPERIMENT PLAN
+FOR RFCOS + LEGNET + MMROTATE STYLE SETUP
+
+This document specializes the general OBB diagnosis framework for the current
+rip-current project. It is stricter than a ranked idea list: every change must
+be tied to one failure mode, one measurement plan, and one keep/reject gate.
+
+
+1. CURRENT EVIDENCE AND WORKING ASSUMPTIONS
+
+Current evidence:
+- RFCOS is the best-performing family so far
+- YOLO is the weakest family so far
+- LEGNet improves the current branch
+- major false positives occur away from shore, inland, or in estuary-like areas
+- some obvious middle rips are missed in clustered scenes
+- some smaller overlapping rips are missed when a larger dark region is present
+
+Working assumptions:
+- false negatives are currently more costly than a moderate increase in review load
+- physical plausibility matters, not just benchmark overlap
+- context and post-processing are likely bigger bottlenecks than broad backbone search
+
+
+2. FIX THE TARGET BEFORE RUNNING MORE EXPERIMENTS
+
+2.1 Operational objective
+Primary goal:
+- detect true rip currents in shoreline-adjacent water with high recall and controlled false alarms
+
+Recommended default primary metric if nothing better has already been frozen:
+- raw recall at a fixed false-positives-per-image operating point
+
+Recommended secondary metrics:
+- raw AP50 or mAP50
+- filtered precision and recall after shoreline/water rules
+- hard-case recall on clustered and overlapping rip subsets
+
+2.2 Non-negotiable reporting rule
+For every experiment, always report both:
+
+A. raw detector performance
+- before shoreline or water filtering
+- before any application-specific rejection rule
+
+B. filtered system performance
+- after shoreline or water filtering
+- after any deployment-style rejection rule
+
+Never report filtered gains alone. A filter can improve the system while hiding a
+weak detector. The raw and filtered views must stay separate.
+
+2.3 Stage reporting rule
+For clustered misses and overlap cases, always measure the object at four stages:
+- pre-NMS candidate present or absent
+- post-NMS present or absent
+- post-tile-merge present or absent
+- final filtered output present or absent
+
+This localizes whether the failure is feature/context, ranking, suppression, or filtering.
+
+2.4 Promotion rule
+Use one seed for quick screening only.
+Before a change becomes part of the main branch, repeat it on at least two seeds
+or two equivalent reruns and confirm that the targeted slice still improves.
+
+
+3. MANDATORY SLICE METRICS
+
+Do not compare runs using only global mAP.
+Every run must include slice metrics for:
+
+3.1 Context slices
+- shoreline distance bands
+- water vs land vs estuary-like regions
+- site or beach location
+
+3.2 Scene-structure slices
+- isolated rip vs clustered rip
+- overlap with neighboring rip candidates
+- local density or nearest-neighbor distance
+
+3.3 Crop and tiling slices
+- distance to tile border
+- single-tile vs multi-tile visibility
+- disagreement across overlapping tiles
+
+3.4 Geometry slices
+- object size
+- aspect ratio
+- angle range if angle is meaningful in the labels
+
+3.5 Hard-case buckets
+- inland or non-water false positives
+- missed middle-rip cases in clusters
+- smaller overlapping rips missed near larger dark regions
+
+
+4. FIX THE ERROR TAXONOMY FOR THIS PROJECT
+
+Track each failure under one of these groups:
+
+4.1 Physically implausible false positive
+Definition:
+- prediction is visually rip-like but appears outside valid shoreline-adjacent water context
+
+Likely layers:
+- context and feature understanding
+- score calibration
+- final filtering
+
+4.2 Clustered middle-rip miss
+Definition:
+- an obvious rip between neighboring structures is missed in a dense scene
+
+Likely layers:
+- assignment and supervision
+- score ranking
+- NMS or merge suppression
+- crop context deficiency
+
+4.3 Small-overlap miss near larger dark region
+Definition:
+- a smaller true rip disappears when a larger nearby region is also present
+
+Likely layers:
+- nearby-instance competition
+- suppression and tile merge
+- geometry quality for elongated or thin structures
+
+4.4 Geometry-survives-but-box-is-poor
+Definition:
+- the region is semantically correct but the oriented box is unstable or low-overlap
+
+Likely layers:
+- angle formulation
+- rotated regression loss
+- box representation limits
+
+
+5. REQUIRED LOGS AND ROOT-CAUSE TABLE
+
+Keep three logs:
+- experiment log: config, seed, schedule, threshold, metrics
+- diagnosis log: failure examples, slice, stage where failure appeared
+- decision log: why a branch was kept or rejected
+
+Maintain one root-cause table with this schema:
+| Issue | Example IDs | Slice | Stage | Likely layer | Hypothesis | Test | Success criterion | Status |
+
+Stage must use one of:
+- pre-NMS
+- post-NMS
+- post-merge
+- filtered output
+
+
+6. PRE-EXPERIMENT CHECKS THAT MUST HAPPEN ONCE
+
+Do these before the next model-changing run:
+
+6.1 Label audit
+- confirm the rip definition is stable
+- confirm overlap policy for neighboring or nested rips
+- confirm angle convention and box extent are consistent
+- review at least the current hard-case buckets, not just random samples
+
+6.2 Slice setup
+- freeze shoreline-distance bins
+- freeze the hard-case example list
+- freeze the evaluation threshold or operating point used for raw recall reporting
+
+6.3 Error review set
+- build a compact review set for the recurring failure groups
+- use the same examples every time unless there is a clear reason to refresh it
+
+
+7. GATED RUN ORDER FOR THE NEXT 5 EXPERIMENT BLOCKS
+
+Run these in order. Do not skip the gate at the end of each block.
+
+7.1 Experiment block 1: pre-NMS, post-NMS, and merge audit
+Hypothesis:
+- some middle-rip misses and small-overlap misses are caused by suppression or merge logic, not by feature extraction
+
+What to do:
+- inspect raw predictions on the hard-case set
+- mark whether each missed object exists pre-NMS, post-NMS, and post-merge
+- compare clustered scenes separately from isolated scenes
+
+Keep this diagnosis if:
+- it clearly localizes each failure group to a stage
+
+Decision gate:
+- if missed objects exist pre-NMS and vanish later, prioritize suppression and merge tuning next
+- if they do not exist pre-NMS, prioritize context, crop, or assignment changes next
+
+
+7.2 Experiment block 2: context-aware filter baseline
+Hypothesis:
+- the current system can remove many inland and estuary-like false positives with explicit shoreline or water constraints
+
+What to do:
+- apply shoreline-distance and water-region rejection rules only at inference time
+- report raw detector metrics and filtered system metrics separately
+- measure which false-positive slices drop and which true positives are lost
+
+Keep this change only if:
+- filtered non-water false positives drop materially
+- targeted recall loss is acceptable on shoreline-adjacent water slices
+
+Reject this as a detector conclusion if:
+- raw detector quality did not improve and the gain comes only from post-filtering
+
+
+7.3 Experiment block 3: larger-context crop with center-only supervision
+Hypothesis:
+- 448x448 tiles remove shoreline geometry and neighboring surf-zone structure needed to separate valid from invalid contexts
+
+What to do:
+- extract a larger crop for context
+- compute detection loss only on the central region
+- keep overlap at inference and measure post-merge behavior separately
+
+Targeted slices:
+- shoreline-distance bands
+- clustered middle-rip subset
+- tile-border subset
+
+Keep this change only if:
+- raw recall improves on the targeted slices
+- inland or estuary-like raw false positives do not worsen materially
+
+Reject it if:
+- gains appear only after filtering
+- merge instability increases enough to offset the raw detector gain
+
+
+7.4 Experiment block 4: focused RFCOS supervision and ranking sweep
+Hypothesis:
+- the current RFCOS configuration under-assigns or under-ranks nearby rips in dense scenes
+
+Sweep priority:
+- center_sampling
+- center_sample_radius
+- centerness_on_reg
+- norm_on_bbox
+- separate_angle
+
+What to do:
+- run a small controlled sweep, changing only one or two coupled knobs at a time
+- keep training schedule, data split, and evaluation threshold fixed
+- compare clustered and overlap slices before looking at global scores
+
+Keep a configuration only if:
+- clustered middle-rip recall or small-overlap recall improves
+- the gain survives a repeat run
+
+Reject it if:
+- global metrics move slightly but the targeted slices do not improve
+
+
+7.5 Experiment block 5: model-integrated context upgrade
+Hypothesis:
+- even after larger crops, the detector still needs explicit water or shoreline cues inside the model to suppress physically implausible raw detections
+
+Practical order inside this block:
+1. add a water-mask input channel
+2. only if needed, add an auxiliary water/land segmentation head sharing the backbone
+
+What to do:
+- compare against the best configuration from blocks 3 and 4
+- judge improvement using raw detector slices first, then filtered system slices
+
+Keep this change only if:
+- raw inland or estuary-like false positives drop
+- shoreline-adjacent water recall does not regress materially
+
+Reject it if:
+- the improvement appears only after the external filter
+- added complexity does not change the raw failure profile
+
+
+8. DECISION GATE AFTER EVERY BLOCK
+
+After each experiment block, answer all five questions:
+
+Gate 1
+- did the exact targeted failure slice improve?
+
+Gate 2
+- did another important slice regress?
+
+Gate 3
+- does the mechanism match what is visible in the outputs?
+
+Gate 4
+- is the gain stable enough to trust?
+
+Gate 5
+- is the added complexity justified by the gain?
+
+If the answers are mostly no, reject the branch quickly.
+
+
+9. WHAT IS QUEUED AFTER THE FIRST 5 BLOCKS
+
+Do not prioritize these before the first five blocks unless the diagnostics force it.
+
+9.1 Geometry branch
+Use this next only if the region is right but OBB quality remains weak:
+- angle-stable heads such as CSLRFCOSHead
+- IoU-aligned rotated losses such as KFIoU
+
+9.2 Backup detector family
+Use this only if RFCOS saturates after the context, suppression, and supervision work:
+- R3Det
+- S2A-Net
+- other refined single-stage OBB detectors
+
+9.3 Still not a priority
+- broad backbone search
+- broad architecture shopping
+- complexity additions without a diagnosed bottleneck
+
+
+10. COMPACT OPERATIONAL LOOP FOR THIS PROJECT
+
+1. update the root-cause table
+2. run one hypothesis-driven block
+3. report raw and filtered metrics separately
+4. review mandatory slices
+5. inspect hard-case examples at each stage
+6. apply the five decision gates
+7. keep only changes that improve the targeted failure mode
