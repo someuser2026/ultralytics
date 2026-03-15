@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ultralytics.utils.metrics import OKS_SIGMA
-from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
+from ultralytics.utils.ops import crop_mask, regularize_rboxes, xywhr2xyxyxyxy, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
 
@@ -349,6 +349,86 @@ class RotatedBboxLoss(BboxLoss):
             loss_dfl = torch.tensor(0.0).to(pred_dist.device)
 
         return loss_iou, loss_dfl
+
+
+def _cross2d(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Compute 2D cross products."""
+    return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+
+
+def _points_in_rboxes(points: torch.Tensor, rboxes: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """Check whether points lie inside rotated boxes of matching batch length."""
+    ctr = rboxes[:, None, :2]
+    wh = rboxes[:, None, 2:4].clamp_min(eps)
+    angle = rboxes[:, None, 4:5]
+    offset = points - ctr
+    cos_a, sin_a = torch.cos(angle), torch.sin(angle)
+    local_x = offset[..., 0:1] * cos_a + offset[..., 1:2] * sin_a
+    local_y = -offset[..., 0:1] * sin_a + offset[..., 1:2] * cos_a
+    return (
+        (local_x.abs() <= wh[..., 0:1] / 2 + eps) &
+        (local_y.abs() <= wh[..., 1:2] / 2 + eps)
+    ).squeeze(-1)
+
+
+def _segment_intersections(poly1: torch.Tensor, poly2: torch.Tensor, eps: float = 1e-7) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return all pairwise edge intersections for two quadrilaterals."""
+    p1 = poly1
+    p2 = torch.roll(poly1, shifts=-1, dims=1)
+    q1 = poly2
+    q2 = torch.roll(poly2, shifts=-1, dims=1)
+
+    p1 = p1[:, :, None, :]
+    p2 = p2[:, :, None, :]
+    q1 = q1[:, None, :, :]
+    q2 = q2[:, None, :, :]
+
+    r = p2 - p1
+    s = q2 - q1
+    qp = q1 - p1
+    denom = _cross2d(r, s)
+    safe_denom = torch.where(denom.abs() < eps, torch.ones_like(denom), denom)
+    t = _cross2d(qp, s) / safe_denom
+    u = _cross2d(qp, r) / safe_denom
+    valid = (denom.abs() > eps) & (t >= -eps) & (t <= 1 + eps) & (u >= -eps) & (u <= 1 + eps)
+    intersections = p1 + t.unsqueeze(-1) * r
+    return intersections.reshape(intersections.shape[0], -1, 2), valid.reshape(valid.shape[0], -1)
+
+
+def rotated_box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """Compute differentiable IoU for elementwise rotated box pairs."""
+    if boxes1.shape != boxes2.shape:
+        raise ValueError(f"rotated_box_iou expects matching shapes, got {boxes1.shape} and {boxes2.shape}.")
+    if boxes1.numel() == 0:
+        return boxes1.new_zeros((0,))
+
+    corners1 = xywhr2xyxyxyxy(boxes1)
+    corners2 = xywhr2xyxyxyxy(boxes2)
+    inside1 = _points_in_rboxes(corners1, boxes2, eps=eps)
+    inside2 = _points_in_rboxes(corners2, boxes1, eps=eps)
+    intersections, inter_mask = _segment_intersections(corners1, corners2, eps=eps)
+
+    candidates = torch.cat((corners1, corners2, intersections), dim=1)
+    valid_mask = torch.cat((inside1, inside2, inter_mask), dim=1)
+    valid_count = valid_mask.sum(dim=1)
+
+    centroid = (candidates * valid_mask.unsqueeze(-1)).sum(dim=1) / valid_count.clamp_min(1).unsqueeze(-1)
+    angles = torch.atan2(candidates[..., 1] - centroid[:, None, 1], candidates[..., 0] - centroid[:, None, 0])
+    angles = angles.masked_fill(~valid_mask, float("inf"))
+    sort_idx = angles.argsort(dim=1)
+    sorted_pts = candidates.gather(1, sort_idx.unsqueeze(-1).expand(-1, -1, 2))
+    sorted_mask = valid_mask.gather(1, sort_idx)
+
+    first_valid = sorted_pts[:, :1]
+    sorted_pts = torch.where(sorted_mask.unsqueeze(-1), sorted_pts, first_valid.expand_as(sorted_pts))
+    rolled = torch.roll(sorted_pts, shifts=-1, dims=1)
+    inter_area = 0.5 * (_cross2d(sorted_pts, rolled).sum(dim=1)).abs()
+    inter_area = torch.where(valid_count >= 3, inter_area, inter_area.new_zeros(inter_area.shape))
+
+    area1 = boxes1[:, 2].clamp_min(0) * boxes1[:, 3].clamp_min(0)
+    area2 = boxes2[:, 2].clamp_min(0) * boxes2[:, 3].clamp_min(0)
+    union = (area1 + area2 - inter_area).clamp_min(eps)
+    return (inter_area / union).clamp_(0.0, 1.0)
 
 
 class KeypointLoss(nn.Module):
@@ -1346,6 +1426,286 @@ class v8OBBLoss(v8DetectionLoss):
         return torch.cat((dist2rbox(pred_dist, pred_angle, anchor_points), pred_angle), dim=-1)
 
 
+class RotatedFCOSLoss:
+    """Loss for MMRotate-style Rotated FCOS heads."""
+
+    def __init__(self, model):
+        device = next(model.parameters()).device
+        m = model.model[-1]
+        self.device = device
+        self.hyp = model.args
+        self.nc = m.nc
+        self.stride = m.stride
+        self.regress_ranges = m.regress_ranges
+        self.center_sampling = m.center_sampling
+        self.center_sample_radius = m.center_sample_radius
+        self.norm_on_bbox = m.norm_on_bbox
+        self.bbox_loss_type = m.bbox_loss_type
+        self.angle_mode = getattr(m, "angle_mode", getattr(model, "yaml", {}).get("angle_mode", "oc"))
+        if self.bbox_loss_type not in {"probiou", "rotated_iou"}:
+            raise ValueError(
+                f"Unsupported RotatedFCOS bbox_loss_type={self.bbox_loss_type!r}. "
+                "Expected 'probiou' or 'rotated_iou'."
+            )
+
+        self.loss_cls = FocalLoss(gamma=2.0, alpha=0.25)
+        self.loss_centerness = nn.BCEWithLogitsLoss(reduction="sum")
+
+    @staticmethod
+    def _get_batch_cls_probs(batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Return per-target class probabilities with fallback to hard labels."""
+        cls = batch["cls"].view(-1, 1)
+        return batch.get("cls_probs", torch.ones_like(cls)).view(-1, 1).to(device=cls.device, dtype=cls.dtype)
+
+    def preprocess(
+        self, targets: torch.Tensor, batch_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pack flat targets into padded per-image tensors."""
+        if targets.shape[0] == 0:
+            zeros = torch.zeros(batch_size, 0, device=self.device)
+            return zeros.long().unsqueeze(-1), zeros.new_zeros((batch_size, 0, 5)), zeros.unsqueeze(-1), zeros.bool().unsqueeze(-1)
+
+        image_indices = targets[:, 0].long()
+        _, counts = image_indices.unique(return_counts=True)
+        max_count = int(counts.max())
+        gt_labels = torch.zeros(batch_size, max_count, 1, device=self.device, dtype=torch.long)
+        gt_bboxes = torch.zeros(batch_size, max_count, 5, device=self.device, dtype=targets.dtype)
+        gt_probs = torch.zeros(batch_size, max_count, 1, device=self.device, dtype=targets.dtype)
+        mask_gt = torch.zeros(batch_size, max_count, 1, device=self.device, dtype=torch.bool)
+
+        for i in range(batch_size):
+            matches = image_indices == i
+            if n := int(matches.sum()):
+                gt_labels[i, :n, 0] = targets[matches, 1].long()
+                gt_bboxes[i, :n] = regularize_rboxes(targets[matches, 2:7], angle_mode=self.angle_mode)
+                gt_probs[i, :n, 0] = targets[matches, 7]
+                mask_gt[i, :n, 0] = True
+
+        return gt_labels, gt_bboxes, gt_probs, mask_gt
+
+    @staticmethod
+    def centerness_target(pos_bbox_targets: torch.Tensor) -> torch.Tensor:
+        """Compute FCOS centerness targets from ltrb distances."""
+        left_right = pos_bbox_targets[:, [0, 2]]
+        top_bottom = pos_bbox_targets[:, [1, 3]]
+        if left_right.numel() == 0:
+            return left_right.new_zeros((0,))
+        centerness = (
+            left_right.min(dim=-1).values / left_right.max(dim=-1).values.clamp_min(1e-7)
+        ) * (
+            top_bottom.min(dim=-1).values / top_bottom.max(dim=-1).values.clamp_min(1e-7)
+        )
+        return centerness.clamp_min(0).sqrt()
+
+    def _get_target_single(
+        self,
+        gt_bboxes: torch.Tensor,
+        gt_labels: torch.Tensor,
+        gt_probs: torch.Tensor,
+        points: torch.Tensor,
+        regress_ranges: torch.Tensor,
+        point_strides: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Assign FCOS targets for a single image."""
+        num_points = points.size(0)
+        labels = gt_labels.new_full((num_points,), self.nc)
+        bbox_targets = gt_bboxes.new_zeros((num_points, 4))
+        angle_targets = gt_bboxes.new_zeros((num_points, 1))
+        prob_targets = gt_bboxes.new_zeros((num_points, 1))
+        num_gts = gt_labels.numel()
+        if num_gts == 0:
+            return labels, bbox_targets, angle_targets, prob_targets
+
+        areas = (gt_bboxes[:, 2] * gt_bboxes[:, 3])[None].repeat(num_points, 1)
+        regress_ranges = regress_ranges[:, None, :].expand(num_points, num_gts, 2)
+        points = points[:, None, :].expand(num_points, num_gts, 2)
+        gt_bboxes = gt_bboxes[None].expand(num_points, num_gts, 5)
+
+        gt_ctr = gt_bboxes[..., :2]
+        gt_wh = gt_bboxes[..., 2:4]
+        gt_angle = gt_bboxes[..., 4:5]
+        offset = points - gt_ctr
+        cos_angle, sin_angle = torch.cos(gt_angle), torch.sin(gt_angle)
+        offset_x = offset[..., 0:1] * cos_angle + offset[..., 1:2] * sin_angle
+        offset_y = -offset[..., 0:1] * sin_angle + offset[..., 1:2] * cos_angle
+
+        left = gt_wh[..., 0:1] / 2 + offset_x
+        right = gt_wh[..., 0:1] / 2 - offset_x
+        top = gt_wh[..., 1:2] / 2 + offset_y
+        bottom = gt_wh[..., 1:2] / 2 - offset_y
+        all_bbox_targets = torch.cat((left, top, right, bottom), dim=-1)
+
+        inside_gt_bbox_mask = all_bbox_targets.min(dim=-1).values > 0
+        if self.center_sampling:
+            radius = point_strides[:, None, 0].expand(num_points, num_gts) * self.center_sample_radius
+            inside_center = (offset_x.squeeze(-1).abs() < radius) & (offset_y.squeeze(-1).abs() < radius)
+            inside_gt_bbox_mask &= inside_center
+
+        max_regress_distance = all_bbox_targets.max(dim=-1).values
+        inside_regress_range = (
+            (max_regress_distance >= regress_ranges[..., 0]) &
+            (max_regress_distance <= regress_ranges[..., 1])
+        )
+
+        inf = torch.full_like(areas, float("inf"))
+        areas = torch.where(inside_gt_bbox_mask & inside_regress_range, areas, inf)
+        min_area, min_inds = areas.min(dim=1)
+        pos_mask = min_area.isfinite()
+        if not pos_mask.any():
+            return labels, bbox_targets, angle_targets, prob_targets
+
+        point_ids = torch.arange(num_points, device=points.device)
+        bbox_targets = all_bbox_targets[point_ids, min_inds]
+        angle_targets = gt_bboxes[point_ids, min_inds, 4:5]
+        labels[pos_mask] = gt_labels[min_inds[pos_mask]]
+        prob_targets[pos_mask, 0] = gt_probs[min_inds[pos_mask], 0]
+        bbox_targets = torch.where(pos_mask[:, None], bbox_targets, bbox_targets.new_zeros(bbox_targets.shape))
+        angle_targets = torch.where(pos_mask[:, None], angle_targets, angle_targets.new_zeros(angle_targets.shape))
+        if self.norm_on_bbox:
+            bbox_targets = bbox_targets / point_strides
+        return labels, bbox_targets, angle_targets, prob_targets
+
+    def get_targets(
+        self,
+        points: torch.Tensor,
+        regress_ranges: torch.Tensor,
+        point_strides: torch.Tensor,
+        gt_bboxes: torch.Tensor,
+        gt_labels: torch.Tensor,
+        gt_probs: torch.Tensor,
+        mask_gt: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Assign FCOS targets for a batch."""
+        bs = gt_labels.shape[0]
+        labels, bbox_targets, angle_targets, prob_targets = [], [], [], []
+        for i in range(bs):
+            valid = mask_gt[i, :, 0]
+            results = self._get_target_single(
+                gt_bboxes[i, valid],
+                gt_labels[i, valid, 0],
+                gt_probs[i, valid],
+                points,
+                regress_ranges,
+                point_strides,
+            )
+            labels.append(results[0])
+            bbox_targets.append(results[1])
+            angle_targets.append(results[2])
+            prob_targets.append(results[3])
+        return (
+            torch.stack(labels, 0),
+            torch.stack(bbox_targets, 0),
+            torch.stack(angle_targets, 0),
+            torch.stack(prob_targets, 0),
+        )
+
+    def _bbox_loss(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """Compute bbox regression loss using the selected rotated-box objective."""
+        if self.bbox_loss_type == "probiou":
+            loss = 1.0 - probiou(pred_boxes, target_boxes)
+        else:
+            loss = -torch.log(rotated_box_iou(pred_boxes, target_boxes).clamp_min(1e-7))
+        return (loss * weights).sum() / weights.sum().clamp_min(1e-6)
+
+    def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute Rotated FCOS classification, bbox, and centerness losses."""
+        loss = torch.zeros(3, device=self.device)
+        cls_scores, bbox_preds, angle_preds, centernesses = preds if len(preds) == 4 else preds[1]
+        batch_size = cls_scores[0].shape[0]
+        dtype = cls_scores[0].dtype
+
+        flatten_cls_scores = torch.cat(
+            [x.permute(0, 2, 3, 1).reshape(batch_size, -1, self.nc) for x in cls_scores], dim=1
+        )
+        flatten_bbox_preds = torch.cat(
+            [x.permute(0, 2, 3, 1).reshape(batch_size, -1, 4) for x in bbox_preds], dim=1
+        )
+        flatten_angle_preds = torch.cat(
+            [x.permute(0, 2, 3, 1).reshape(batch_size, -1, 1) for x in angle_preds], dim=1
+        )
+        flatten_centerness = torch.cat(
+            [x.permute(0, 2, 3, 1).reshape(batch_size, -1) for x in centernesses], dim=1
+        )
+
+        imgsz = torch.tensor(cls_scores[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
+        anchor_points, stride_tensor = make_anchors(cls_scores, self.stride, 0.5)
+        pixel_points = anchor_points * stride_tensor
+
+        expanded_regress_ranges = [
+            pixel_points.new_tensor(self.regress_ranges[i])[None].expand(x.shape[2] * x.shape[3], 2)
+            for i, x in enumerate(cls_scores)
+        ]
+        concat_regress_ranges = torch.cat(expanded_regress_ranges, dim=0)
+
+        try:
+            batch_idx = batch["batch_idx"].view(-1, 1)
+            cls_probs = self._get_batch_cls_probs(batch)
+            targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"].view(-1, 5), cls_probs), dim=1)
+            if targets.numel():
+                targets[:, 2:6] *= imgsz[[1, 0, 1, 0]]
+                widths, heights = targets[:, 4], targets[:, 5]
+                targets = targets[(widths >= 2) & (heights >= 2)]
+            gt_labels, gt_bboxes, gt_probs, mask_gt = self.preprocess(targets, batch_size)
+        except RuntimeError as e:
+            raise TypeError(
+                "ERROR ❌ OBB dataset incorrectly formatted or not a OBB dataset.\n"
+                "This error can occur when incorrectly training a Rotated FCOS OBB model on a detect dataset.\n"
+                "Verify your dataset is a correctly formatted OBB dataset.\n"
+                "See https://docs.ultralytics.com/datasets/obb/ for help."
+            ) from e
+
+        target_labels, target_bboxes, target_angles, target_probs = self.get_targets(
+            pixel_points,
+            concat_regress_ranges,
+            stride_tensor,
+            gt_bboxes,
+            gt_labels,
+            gt_probs,
+            mask_gt,
+        )
+
+        fg_mask = target_labels != self.nc
+        num_pos = fg_mask.sum().clamp(min=1).float()
+
+        target_scores = flatten_cls_scores.new_zeros((batch_size, flatten_cls_scores.shape[1], self.nc))
+        if fg_mask.any():
+            batch_inds, point_inds = fg_mask.nonzero(as_tuple=True)
+            target_scores[batch_inds, point_inds, target_labels[fg_mask]] = target_probs[fg_mask, 0].to(dtype)
+        loss[1] = self.loss_cls(flatten_cls_scores.reshape(-1, self.nc), target_scores.reshape(-1, self.nc)) / num_pos
+
+        if fg_mask.any():
+            pos_bbox_preds = flatten_bbox_preds[fg_mask]
+            pos_angle_preds = flatten_angle_preds[fg_mask]
+            pos_centerness = flatten_centerness[fg_mask]
+            pos_bbox_targets = target_bboxes[fg_mask]
+            pos_angle_targets = target_angles[fg_mask]
+            pos_centerness_targets = self.centerness_target(pos_bbox_targets).to(dtype)
+
+            pos_points = pixel_points.unsqueeze(0).expand(batch_size, -1, 2)[fg_mask]
+            pos_strides = stride_tensor.unsqueeze(0).expand(batch_size, -1, 1)[fg_mask]
+            if self.norm_on_bbox:
+                pos_bbox_preds = pos_bbox_preds * pos_strides
+                pos_bbox_targets = pos_bbox_targets * pos_strides
+
+            pred_boxes = torch.cat((dist2rbox(pos_bbox_preds, pos_angle_preds, pos_points, dim=-1), pos_angle_preds), dim=-1)
+            target_boxes = torch.cat(
+                (dist2rbox(pos_bbox_targets, pos_angle_targets, pos_points, dim=-1), pos_angle_targets), dim=-1
+            )
+            pred_boxes = regularize_rboxes(pred_boxes, angle_mode=self.angle_mode)
+            target_boxes = regularize_rboxes(target_boxes, angle_mode=self.angle_mode)
+
+            centerness_weights = pos_centerness_targets.clamp_min(1e-7)
+            loss[0] = self._bbox_loss(pred_boxes, target_boxes, centerness_weights)
+            loss[2] = self.loss_centerness(pos_centerness, pos_centerness_targets) / num_pos
+        else:
+            loss[0] += (flatten_bbox_preds * 0).sum() + (flatten_angle_preds * 0).sum()
+            loss[2] += (flatten_centerness * 0).sum()
+
+        loss[0] *= self.hyp.box
+        loss[1] *= self.hyp.cls
+        return loss * batch_size, loss.detach()
+
+
 class E2EDetectLoss:
     """Criterion class for computing training losses for end-to-end detection."""
 
@@ -1428,9 +1788,6 @@ class TVPSegmentLoss(TVPDetectLoss):
 
 # ==================== RT-DETR Losses ====================
 
-from ultralytics.models.utils.ops import HungarianMatcher
-
-
 class DETRLoss(nn.Module):
     """
     DETR (DEtection TRansformer) Loss class for calculating various loss components.
@@ -1482,6 +1839,7 @@ class DETRLoss(nn.Module):
             alpha (float): The balancing factor used to address class imbalance.
         """
         super().__init__()
+        from ultralytics.models.utils.ops import HungarianMatcher
 
         if loss_gain is None:
             loss_gain = {"class": 1, "bbox": 5, "giou": 2, "no_object": 0.1, "mask": 1, "dice": 1}

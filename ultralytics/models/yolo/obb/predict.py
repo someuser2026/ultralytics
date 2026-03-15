@@ -44,6 +44,18 @@ class OBBPredictor(DetectionPredictor):
         super().__init__(cfg, overrides, _callbacks)
         self.args.task = "obb"
 
+    def _angle_mode(self) -> str:
+        """Return the active OBB angle convention."""
+        model = getattr(self, "model", None)
+        model_yaml = getattr(model, "yaml", None)
+        if isinstance(model_yaml, dict):
+            return model_yaml.get("angle_mode", getattr(self.args, "angle_mode", "oc"))
+        wrapped = getattr(model, "model", None)
+        wrapped_yaml = getattr(wrapped, "yaml", None)
+        if isinstance(wrapped_yaml, dict):
+            return wrapped_yaml.get("angle_mode", getattr(self.args, "angle_mode", "oc"))
+        return getattr(self.args, "angle_mode", "oc")
+
     def construct_result(self, pred, img, orig_img, img_path):
         """
         Construct the result object from the prediction.
@@ -59,7 +71,7 @@ class OBBPredictor(DetectionPredictor):
             (Results): The result object containing the original image, image path, class names, and oriented bounding
                 boxes.
         """
-        rboxes = ops.regularize_rboxes(torch.cat([pred[:, :4], pred[:, -1:]], dim=-1))
+        rboxes = ops.regularize_rboxes(torch.cat([pred[:, :4], pred[:, -1:]], dim=-1), angle_mode=self._angle_mode())
         rboxes[:, :4] = ops.scale_boxes(img.shape[2:], rboxes[:, :4], orig_img.shape, xywh=True)
         obb = torch.cat([rboxes, pred[:, 4:6]], dim=-1)
         return Results(orig_img, path=img_path, names=self.model.names, obb=obb)

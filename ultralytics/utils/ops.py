@@ -395,17 +395,42 @@ def ltwh2xywh(x):
     return y
 
 
-def xyxyxyxy2xywhr(x):
+def _validate_angle_mode(angle_mode: str) -> str:
+    """Validate rotated-box angle convention."""
+    if angle_mode not in {"oc", "le90"}:
+        raise ValueError(f"Unsupported angle_mode={angle_mode!r}. Expected 'oc' or 'le90'.")
+    return angle_mode
+
+
+def _regularize_rboxes_np(rboxes: np.ndarray, angle_mode: str = "oc") -> np.ndarray:
+    """Regularize rotated boxes using NumPy tensors."""
+    angle_mode = _validate_angle_mode(angle_mode)
+    x, y, w, h, t = np.moveaxis(rboxes, -1, 0)
+    if angle_mode == "oc":
+        swap = np.remainder(t, math.pi) >= math.pi / 2
+        w_, h_ = np.where(swap, h, w), np.where(swap, w, h)
+        t_ = np.remainder(t, math.pi / 2)
+    else:
+        swap = h > w
+        w_, h_ = np.where(swap, h, w), np.where(swap, w, h)
+        t_ = np.where(swap, t + math.pi / 2, t)
+        t_ = (t_ + math.pi / 2) % math.pi - math.pi / 2
+    return np.stack((x, y, w_, h_, t_), axis=-1)
+
+
+def xyxyxyxy2xywhr(x, angle_mode: str = "oc"):
     """
     Convert batched Oriented Bounding Boxes (OBB) from [xy1, xy2, xy3, xy4] to [xywh, rotation] format.
 
     Args:
         x (np.ndarray | torch.Tensor): Input box corners with shape (N, 8) in [xy1, xy2, xy3, xy4] format.
+        angle_mode (str): Angle convention. Supported values are `oc` and `le90`.
 
     Returns:
         (np.ndarray | torch.Tensor): Converted data in [cx, cy, w, h, rotation] format with shape (N, 5).
-            Rotation values are in radians from 0 to pi/2.
+            Rotation values are in radians in the requested angle convention.
     """
+    angle_mode = _validate_angle_mode(angle_mode)
     is_torch = isinstance(x, torch.Tensor)
     points = x.cpu().numpy() if is_torch else x
     points = points.reshape(len(x), -1, 2)
@@ -415,7 +440,11 @@ def xyxyxyxy2xywhr(x):
         # especially some objects are cut off by augmentations in dataloader.
         (cx, cy), (w, h), angle = cv2.minAreaRect(pts)
         rboxes.append([cx, cy, w, h, angle / 180 * np.pi])
-    return torch.tensor(rboxes, device=x.device, dtype=x.dtype) if is_torch else np.asarray(rboxes)
+    if is_torch:
+        rboxes = torch.tensor(rboxes, device=x.device, dtype=x.dtype)
+        return rboxes if angle_mode == "oc" else regularize_rboxes(rboxes, angle_mode=angle_mode)
+    rboxes = np.asarray(rboxes, dtype=points.dtype)
+    return rboxes if angle_mode == "oc" else _regularize_rboxes_np(rboxes, angle_mode=angle_mode)
 
 
 def xywhr2xyxyxyxy(x):
@@ -639,23 +668,32 @@ def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None, normalize: bool
     return coords
 
 
-def regularize_rboxes(rboxes):
+def regularize_rboxes(rboxes, angle_mode: str = "oc"):
     """
-    Regularize rotated bounding boxes to range [0, pi/2].
+    Regularize rotated bounding boxes in the requested angle convention.
 
     Args:
-        rboxes (torch.Tensor): Input rotated boxes with shape (N, 5) in xywhr format.
+        rboxes (torch.Tensor | np.ndarray): Input rotated boxes with shape (..., 5) in xywhr format.
+        angle_mode (str): Angle convention. Supported values are `oc` and `le90`.
 
     Returns:
-        (torch.Tensor): Regularized rotated boxes.
+        (torch.Tensor | np.ndarray): Regularized rotated boxes.
     """
+    angle_mode = _validate_angle_mode(angle_mode)
+    if isinstance(rboxes, np.ndarray):
+        return _regularize_rboxes_np(rboxes, angle_mode=angle_mode)
+
     x, y, w, h, t = rboxes.unbind(dim=-1)
-    # Swap edge if t >= pi/2 while not being symmetrically opposite
-    swap = t % math.pi >= math.pi / 2
-    w_ = torch.where(swap, h, w)
-    h_ = torch.where(swap, w, h)
-    t = t % (math.pi / 2)
-    return torch.stack([x, y, w_, h_, t], dim=-1)  # regularized boxes
+    if angle_mode == "oc":
+        swap = t % math.pi >= math.pi / 2
+        w_, h_ = torch.where(swap, h, w), torch.where(swap, w, h)
+        t_ = t % (math.pi / 2)
+    else:
+        swap = h > w
+        w_, h_ = torch.where(swap, h, w), torch.where(swap, w, h)
+        t_ = torch.where(swap, t + math.pi / 2, t)
+        t_ = (t_ + math.pi / 2) % math.pi - math.pi / 2
+    return torch.stack([x, y, w_, h_, t_], dim=-1)
 
 
 def masks2segments(masks, strategy: str = "all"):

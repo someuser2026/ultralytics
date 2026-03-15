@@ -67,6 +67,15 @@ class OBBValidator(DetectionValidator):
         Args:
             model (torch.nn.Module): Model to validate.
         """
+        model_yaml = getattr(model, "yaml", None)
+        wrapped = getattr(model, "model", None)
+        wrapped_yaml = getattr(wrapped, "yaml", None)
+        if isinstance(model_yaml, dict):
+            self.args.angle_mode = model_yaml.get("angle_mode", getattr(self.args, "angle_mode", "oc"))
+        elif isinstance(wrapped_yaml, dict):
+            self.args.angle_mode = wrapped_yaml.get("angle_mode", getattr(self.args, "angle_mode", "oc"))
+        else:
+            self.args.angle_mode = getattr(self.args, "angle_mode", "oc")
         super().init_metrics(model)
         val = self.data.get(self.args.split, "")  # validation path
         self.is_dota = isinstance(val, str) and "DOTA" in val  # check if dataset is DOTA format

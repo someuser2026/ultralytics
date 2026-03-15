@@ -15,6 +15,7 @@ from torchvision.ops import box_iou, nms
 
 
 from ultralytics.utils import NOT_MACOS14
+from ultralytics.utils.ops import regularize_rboxes
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
@@ -26,7 +27,31 @@ from .utils import bias_init_with_prob, inverse_sigmoid, linear_init
 # from .roi_heads import MaskHead, TwoFCBBoxHead, decode_boxes, encode_boxes, roi_align_pyramid
 # from .rpn import AnchorGenerator, RPNConfig, RPNHead, rpn_inference_single_image
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "RTDETRSegmentDecoder", "RTDETROBBDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment", "Mask2FormerHead" #, "CascadeRCNNHead"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RotatedFCOS", "RTDETRDecoder", "RTDETRSegmentDecoder", "RTDETROBBDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment", "Mask2FormerHead" #, "CascadeRCNNHead"
+
+
+class LearnableScale(nn.Module):
+    """A lightweight learnable scalar multiplier."""
+
+    def __init__(self, init_value: float = 1.0):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(float(init_value)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.scale
+
+
+class FCOSConvModule(nn.Module):
+    """Conv-GN-ReLU block used by the Rotated FCOS towers."""
+
+    def __init__(self, c1: int, c2: int):
+        super().__init__()
+        self.conv = nn.Conv2d(c1, c2, 3, padding=1)
+        self.norm = nn.GroupNorm(32, c2)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.norm(self.conv(x)))
 
 
 class Detect(nn.Module):
@@ -355,6 +380,140 @@ class OBB(Detect):
     def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
         """Decode rotated bounding boxes."""
         return dist2rbox(bboxes, self.angle, anchors, dim=1)
+
+
+class RotatedFCOS(Detect):
+    """MMRotate-style Rotated FCOS head for OBB detection."""
+
+    def __init__(self, nc: int = 80, cfg: dict | None = None, ch: tuple = ()):
+        nn.Module.__init__(self)
+        cfg = cfg or {}
+        if not ch:
+            raise ValueError("RotatedFCOS requires at least one input feature map.")
+        if len(set(ch)) != 1:
+            raise ValueError(f"RotatedFCOS expects equal input channels per level, received {tuple(ch)}.")
+
+        self.nc = nc
+        self.nl = len(ch)
+        self.no = nc + 5
+        self.reg_max = 1
+        self.stride = torch.tensor(cfg.get("strides", [8, 16, 32, 64, 128]), dtype=torch.float)
+        if len(self.stride) != self.nl:
+            raise ValueError(f"RotatedFCOS strides length {len(self.stride)} must match number of levels {self.nl}.")
+        self.anchors = torch.empty(0)
+        self.strides = torch.empty(0)
+        self.shape = None
+        self.xyxy = False
+        self.max_det = 300
+        self.dynamic = False
+        self.export = False
+        self.format = None
+        self.end2end = False
+        self.legacy = False
+
+        self.feat_channels = int(cfg.get("feat_channels", 256))
+        self.stacked_convs = int(cfg.get("stacked_convs", 4))
+        self.regress_ranges = tuple(tuple(r) for r in cfg.get(
+            "regress_ranges",
+            [(-1, 64), (64, 128), (128, 256), (256, 512), (512, 1e8)],
+        ))
+        self.center_sampling = bool(cfg.get("center_sampling", False))
+        self.center_sample_radius = float(cfg.get("center_sample_radius", 1.5))
+        self.norm_on_bbox = bool(cfg.get("norm_on_bbox", False))
+        self.centerness_on_reg = bool(cfg.get("centerness_on_reg", False))
+        self.scale_angle = bool(cfg.get("scale_angle", True))
+        self.bbox_loss_type = str(cfg.get("bbox_loss_type", "probiou"))
+        self.angle_mode = str(cfg.get("angle_mode", "oc"))
+
+        c1 = ch[0]
+        self.cls_convs = nn.ModuleList(
+            FCOSConvModule(c1 if i == 0 else self.feat_channels, self.feat_channels) for i in range(self.stacked_convs)
+        )
+        self.reg_convs = nn.ModuleList(
+            FCOSConvModule(c1 if i == 0 else self.feat_channels, self.feat_channels) for i in range(self.stacked_convs)
+        )
+        self.conv_cls = nn.Conv2d(self.feat_channels, self.nc, 3, padding=1)
+        self.conv_reg = nn.Conv2d(self.feat_channels, 4, 3, padding=1)
+        self.conv_angle = nn.Conv2d(self.feat_channels, 1, 3, padding=1)
+        self.conv_centerness = nn.Conv2d(self.feat_channels, 1, 3, padding=1)
+        self.scales = nn.ModuleList(LearnableScale(1.0) for _ in range(self.nl))
+        self.angle_scale = LearnableScale(1.0) if self.scale_angle else None
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize Rotated FCOS head weights."""
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.normal_(module.weight, std=0.01)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+
+    def bias_init(self):
+        """Initialize detection biases once strides are available."""
+        self.conv_cls.bias.data[: self.nc] = bias_init_with_prob(0.01)
+        nn.init.constant_(self.conv_reg.bias, 0)
+        nn.init.constant_(self.conv_angle.bias, 0)
+        nn.init.constant_(self.conv_centerness.bias, 0)
+
+    def forward_single(self, x: torch.Tensor, scale: LearnableScale, stride: torch.Tensor | float):
+        """Forward pass for a single feature level."""
+        cls_feat = x
+        reg_feat = x
+        for cls_conv in self.cls_convs:
+            cls_feat = cls_conv(cls_feat)
+        for reg_conv in self.reg_convs:
+            reg_feat = reg_conv(reg_feat)
+
+        cls_score = self.conv_cls(cls_feat)
+        centerness = self.conv_centerness(reg_feat if self.centerness_on_reg else cls_feat)
+        bbox_pred = scale(self.conv_reg(reg_feat)).float()
+        if self.norm_on_bbox:
+            bbox_pred = bbox_pred.clamp(min=0)
+            if not self.training:
+                stride_value = stride.item() if isinstance(stride, torch.Tensor) else float(stride)
+                bbox_pred = bbox_pred * stride_value
+        else:
+            bbox_pred = bbox_pred.exp()
+        angle_pred = self.conv_angle(reg_feat)
+        if self.angle_scale is not None:
+            angle_pred = self.angle_scale(angle_pred).float()
+        return cls_score, bbox_pred, angle_pred, centerness
+
+    def _inference(
+        self,
+        cls_scores: list[torch.Tensor],
+        bbox_preds: list[torch.Tensor],
+        angle_preds: list[torch.Tensor],
+        centernesses: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Decode FCOS predictions into Ultralytics rotated prediction format."""
+        shape = cls_scores[0].shape
+        if self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(cls_scores, self.stride, 0.5))
+            self.shape = shape
+
+        bs = shape[0]
+        cls_logits = torch.cat([x.view(bs, self.nc, -1) for x in cls_scores], 2)
+        bbox_dist = torch.cat([x.view(bs, 4, -1) for x in bbox_preds], 2)
+        angle = torch.cat([x.view(bs, 1, -1) for x in angle_preds], 2)
+        centerness = torch.cat([x.view(bs, 1, -1) for x in centernesses], 2)
+
+        pixel_points = self.anchors.unsqueeze(0) * self.strides
+        decoded = dist2rbox(bbox_dist, angle, pixel_points, dim=1)
+        rboxes = torch.cat((decoded, angle), 1).transpose(1, 2)
+        rboxes = regularize_rboxes(rboxes, angle_mode=self.angle_mode).transpose(1, 2)
+        scores = cls_logits.sigmoid() * centerness.sigmoid()
+        return torch.cat((rboxes[:, :4], scores, rboxes[:, 4:5]), 1)
+
+    def forward(self, x: list[torch.Tensor]) -> tuple | torch.Tensor:
+        """Forward multi-level features through the Rotated FCOS head."""
+        outputs = [self.forward_single(feat, scale, stride) for feat, scale, stride in zip(x, self.scales, self.stride)]
+        cls_scores, bbox_preds, angle_preds, centernesses = (list(items) for items in zip(*outputs))
+        if self.training:
+            return cls_scores, bbox_preds, angle_preds, centernesses
+        y = self._inference(cls_scores, bbox_preds, angle_preds, centernesses)
+        raw = (cls_scores, bbox_preds, angle_preds, centernesses)
+        return y if self.export else (y, raw)
 
 
 class Pose(Detect):

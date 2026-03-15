@@ -174,6 +174,11 @@ class RTDETRValidator(DetectionValidator):
             task=self.args.task,
         )
 
+    def init_metrics(self, model: torch.nn.Module) -> None:
+        """Initialize validator metrics and cache the RT-DETR head for task-specific postprocessing."""
+        super().init_metrics(model)
+        self.rtdetr_head = _rtdetr_head(model)
+
     def postprocess(
         self, preds: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor]
     ) -> list[dict[str, torch.Tensor]]:
@@ -290,10 +295,10 @@ class RTDETRSegmentValidator(SegmentationValidator, RTDETRValidator):
 
         bs, _, nd = preds[0].shape
         nm = 32
-        head = _rtdetr_head(self.model)
+        head = getattr(self, "rtdetr_head", None)
         if head is not None and hasattr(head, "nm"):
             nm = head.nm
-        nc = len(self.model.names) if hasattr(self.model, "names") else nd - 4 - nm
+        nc = len(self.names) if self.names is not None else nd - 4 - nm
         imgsz = self._last_imgsz
         scale = torch.tensor([imgsz[1], imgsz[0], imgsz[1], imgsz[0]], device=preds[0].device, dtype=preds[0].dtype)
 

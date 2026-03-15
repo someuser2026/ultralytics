@@ -23,6 +23,7 @@ from ultralytics.nn.modules import (
     C3TR,
     ELAN1,
     OBB,
+    RotatedFCOS,
     PSA,
     SPP,
     SPPELAN,
@@ -110,6 +111,7 @@ from ultralytics.utils.loss import (
     RTDETRDetectionLoss,
     RTDETROBBLoss,
     RTDETRSegmentLoss,
+    RotatedFCOSLoss,
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
@@ -471,7 +473,7 @@ class DetectionModel(BaseModel):
                 """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
                 if self.end2end:
                     return self.forward(x)["one2many"]
-                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
+                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB, RotatedFCOS)) else self.forward(x)
 
             self.model.eval()  # Avoid changing batch statistics until training begins
             m.training = True  # Setting it to True to properly return strides
@@ -603,10 +605,12 @@ class OBBModel(DetectionModel):
             verbose (bool): Whether to display model information.
         """
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        if isinstance(self.model[-1], RotatedFCOS):
+            self.model[-1].angle_mode = self.yaml.get("angle_mode", "oc")
 
     def init_criterion(self):
         """Initialize the loss criterion for the model."""
-        return v8OBBLoss(self)
+        return RotatedFCOSLoss(self) if isinstance(self.model[-1], RotatedFCOS) else v8OBBLoss(self)
 
 
 class SegmentationModel(DetectionModel):
@@ -2208,14 +2212,14 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}#, Mask2FormerHead}
+            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, RotatedFCOS, ImagePoolingAttn, v10Detect}#, Mask2FormerHead}
         ):
             # print("f:", f)
             # print("ch:", ch)
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
+            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, RotatedFCOS}:
                 m.legacy = legacy
         elif m in frozenset({RTDETRDecoder, RTDETRSegmentDecoder, RTDETROBBDecoder}):  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
@@ -2225,7 +2229,10 @@ def parse_model(d, ch, verbose=True):
             # print("f:", f)
             # print("ch:", ch)
             c1 = [ch[x] for x in f]
-            c2 = [args[0] for _ in f]
+            num_outs = len(f)
+            if m is FPN and len(args) > 1 and isinstance(args[1], dict):
+                num_outs = args[1].get("num_outs", num_outs)
+            c2 = [args[0] for _ in range(num_outs)]
             args = [c1, *args[0:]]
             # print("c1:", c1)
             # print("c2:", c2)
@@ -2402,7 +2409,7 @@ def guess_model_task(model):
             return "classify"
         if "segment" in m:
             return "segment"
-        if "obb" in m:
+        if "obb" in m or "rotatedfcos" in m:
             return "obb"
         if "detect" in m or m == "rtdetrdecoder":
             return "detect"
@@ -2430,7 +2437,7 @@ def guess_model_task(model):
                 return "classify"
             elif isinstance(m, Pose):
                 return "pose"
-            elif isinstance(m, OBB):
+            elif isinstance(m, (OBB, RotatedFCOS)):
                 return "obb"
             elif isinstance(m, RTDETROBBDecoder):
                 return "obb"

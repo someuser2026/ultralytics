@@ -1156,6 +1156,16 @@ class FPN(BaseNeck):
     def __init__(self, in_channels: Sequence[int], out_channels: int, cfg: dict):
         super().__init__(in_channels, out_channels, cfg)
         L = len(self.in_channels)
+        self.num_outs = cfg.get("num_outs", L)
+        self.add_extra_convs = cfg.get("add_extra_convs", False)
+        self.relu_before_extra_convs = cfg.get("relu_before_extra_convs", False)
+        if self.num_outs < L:
+            raise ValueError(f"FPN num_outs must be >= number of inputs, got {self.num_outs} < {L}.")
+        if self.add_extra_convs not in {False, True, "on_output"}:
+            raise ValueError(
+                "FPN add_extra_convs must be False, True, or 'on_output'. "
+                f"Received {self.add_extra_convs!r}."
+            )
 
         # Lateral 1x1 convs (only needed if not using normalize_channels)
         # When normalize_channels=True, alignment is done in BaseNeck.align
@@ -1181,6 +1191,19 @@ class FPN(BaseNeck):
             )
             for _ in range(L - 1)
         ])
+        extra_levels = self.num_outs - L
+        self.extra_convs = nn.ModuleList(
+            ConvPolicy(
+                self.out_channels,
+                self.out_channels,
+                k=3,
+                s=2,
+                groups=self.conv_cfg.get("groups", 1),
+                dilation=self.conv_cfg.get("dilation", 1),
+                dcn=self._dcn("extra", i),
+            )
+            for i in range(extra_levels)
+        )
 
     def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
         """
@@ -1224,6 +1247,19 @@ class FPN(BaseNeck):
             
             # 3x3 smoothing to reduce aliasing from upsampling
             outs[i] = self.smooth[i](fused)
+
+        if not self.extra_convs:
+            return outs
+
+        extra_source = outs[-1]
+        for extra_conv in self.extra_convs:
+            if self.relu_before_extra_convs:
+                extra_source = F.relu(extra_source)
+            if self.add_extra_convs in {True, "on_output"}:
+                extra_source = extra_conv(extra_source)
+            else:
+                extra_source = F.max_pool2d(extra_source, kernel_size=1, stride=2)
+            outs.append(extra_source)
 
         return outs
 
@@ -1928,4 +1964,3 @@ def build_neck(name: str, in_channels: Sequence[int], out_channels: int, cfg) ->
     if name not in NECKS:
         raise KeyError(f"Unknown neck: {name}. Available: {list(NECKS.keys())}")
     return NECKS[name](in_channels, out_channels, cfg)
-

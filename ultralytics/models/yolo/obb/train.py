@@ -69,11 +69,17 @@ class OBBTrainer(yolo.detect.DetectionTrainer):
             >>> model = trainer.get_model(cfg="yolo11n-obb.yaml", weights="yolo11n-obb.pt")
         """
         model = OBBModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        self.args.angle_mode = model.yaml.get("angle_mode", getattr(self.args, "angle_mode", "oc"))
         return self._finalize_model_build(model, weights)
 
     def get_validator(self):
         """Return an instance of OBBValidator for validation of YOLO model."""
-        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        head = getattr(getattr(self, "model", None), "model", [None])[-1]
+        self.loss_names = ("box_loss", "cls_loss", "ctr_loss") if head.__class__.__name__ == "RotatedFCOS" else (
+            "box_loss",
+            "cls_loss",
+            "dfl_loss",
+        )
         return yolo.obb.OBBValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )

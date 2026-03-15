@@ -89,6 +89,7 @@ from .conv import (
 )
 from .head import (
     OBB,
+    RotatedFCOS,
     Classify,
     Detect,
     LRPCHead,
@@ -210,6 +211,7 @@ __all__ = (
     "MLP",
     "ResNetLayer",
     "OBB",
+    "RotatedFCOS",
     "WorldDetect",
     "YOLOEDetect",
     "YOLOESegment",
