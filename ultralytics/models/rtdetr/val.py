@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from ultralytics.data import YOLODataset
-from ultralytics.data.augment import Compose, Format, v8_transforms
+from ultralytics.data.augment import Compose, Format, PrepareAuxiliaryMaskInputs, v8_transforms
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.models.yolo.obb.val import OBBValidator
 from ultralytics.models.yolo.segment.val import SegmentationValidator
@@ -106,6 +106,15 @@ class RTDETRDataset(YOLODataset):
         else:
             # transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), auto=False, scale_fill=True)])
             transforms = Compose([])
+        transforms.append(
+            PrepareAuxiliaryMaskInputs(
+                use_shoreline_input=bool(getattr(hyp, "use_shoreline_input", False)),
+                use_land_water_input=bool(getattr(hyp, "use_land_water_input", False)),
+                use_shoreline_prior_loss=bool(getattr(hyp, "use_shoreline_prior_loss", False)),
+                use_land_water_prior_loss=bool(getattr(hyp, "use_land_water_prior_loss", False)),
+                shoreline_prior_max_dist=int(getattr(hyp, "shoreline_prior_max_dist", 128)),
+            )
+        )
         transforms.append(
             Format(
                 bbox_format="xywh",

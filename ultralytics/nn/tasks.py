@@ -112,6 +112,7 @@ from ultralytics.utils.loss import (
     RTDETROBBLoss,
     RTDETRSegmentLoss,
     RotatedFCOSLoss,
+    _get_cfg_value,
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
@@ -1313,9 +1314,17 @@ class RTDETROBBModel(RTDETRDetectionModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the RTDETROBBModel."""
-        # from ultralytics.utils.loss import RTDETROBBLoss
-
-        return RTDETROBBLoss(nc=self.yaml["nc"], use_vfl=True)
+        model_args = getattr(self, "args", None)
+        return RTDETROBBLoss(
+            nc=self.yaml["nc"],
+            use_vfl=True,
+            use_shoreline_prior_loss=bool(_get_cfg_value(model_args, "use_shoreline_prior_loss", False)),
+            use_land_water_prior_loss=bool(_get_cfg_value(model_args, "use_land_water_prior_loss", False)),
+            shoreline_prior_point_mode=_get_cfg_value(model_args, "shoreline_prior_point_mode", "center"),
+            shoreline_prior_weight=float(_get_cfg_value(model_args, "shoreline_prior_weight", 1.0)),
+            land_water_prior_weight=float(_get_cfg_value(model_args, "land_water_prior_weight", 1.0)),
+            shoreline_prior_max_dist=float(_get_cfg_value(model_args, "shoreline_prior_max_dist", 128.0)),
+        )
 
     def loss(self, batch, preds=None):
         """
@@ -1342,9 +1351,25 @@ class RTDETROBBModel(RTDETRDetectionModel):
             "batch_idx": batch_idx.to(img.device, dtype=torch.long).view(-1),
             "gt_groups": gt_groups,
         }
+        if "land_water_mask" in batch:
+            targets["land_water_mask"] = batch["land_water_mask"].to(
+                img.device, non_blocking=img.device.type == "cuda"
+            )
+        if "shoreline_distance_map" in batch:
+            targets["shoreline_distance_map"] = batch["shoreline_distance_map"].to(
+                img.device, non_blocking=img.device.type == "cuda"
+            )
 
         if preds is None:
-            preds = self.predict(img, batch={**targets, "bboxes": targets["bboxes"][..., :4]})
+            preds = self.predict(
+                img,
+                batch={
+                    "cls": targets["cls"],
+                    "bboxes": targets["bboxes"][..., :4],
+                    "batch_idx": targets["batch_idx"],
+                    "gt_groups": targets["gt_groups"],
+                },
+            )
         dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = preds if self.training else preds[1]
         if dn_meta is None:
             dn_bboxes, dn_scores = None, None
@@ -1360,7 +1385,17 @@ class RTDETROBBModel(RTDETRDetectionModel):
             (dec_bboxes, dec_scores), targets, dn_bboxes=dn_bboxes, dn_scores=dn_scores, dn_meta=dn_meta
         )
         return sum(loss.values()), torch.as_tensor(
-            [loss[k].detach() for k in ["loss_giou", "loss_class", "loss_bbox"]], device=img.device
+            [
+                loss.get(k, torch.tensor(0.0, device=img.device)).detach()
+                for k in (
+                    "loss_giou",
+                    "loss_class",
+                    "loss_bbox",
+                    "loss_shoreline_prior",
+                    "loss_land_water_prior",
+                )
+            ],
+            device=img.device,
         )
 
 

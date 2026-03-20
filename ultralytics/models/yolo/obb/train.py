@@ -75,10 +75,10 @@ class OBBTrainer(yolo.detect.DetectionTrainer):
     def get_validator(self):
         """Return an instance of OBBValidator for validation of YOLO model."""
         head = getattr(getattr(self, "model", None), "model", [None])[-1]
-        self.loss_names = ("box_loss", "cls_loss", "ctr_loss") if head.__class__.__name__ == "RotatedFCOS" else (
-            "box_loss",
-            "cls_loss",
-            "dfl_loss",
+        self.loss_names = (
+            ("box_loss", "cls_loss", "ctr_loss", "shoreline_prior_loss", "land_water_prior_loss")
+            if head.__class__.__name__ == "RotatedFCOS"
+            else ("box_loss", "cls_loss", "dfl_loss", "shoreline_prior_loss", "land_water_prior_loss")
         )
         return yolo.obb.OBBValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks

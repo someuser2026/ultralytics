@@ -109,6 +109,7 @@ class BaseDataset(Dataset):
         self.img_path = img_path
         self.imgsz = imgsz
         self.augment = augment
+        self.hyp = hyp
         self.single_cls = single_cls
         self.prefix = prefix
         self.fraction = fraction
@@ -173,6 +174,10 @@ class BaseDataset(Dataset):
             orig_channels += 1
         if getattr(hyp, "water_depth_indices_p", False):
             orig_channels += 4
+        if getattr(hyp, "use_shoreline_input", False):
+            orig_channels += 1
+        if getattr(hyp, "use_land_water_input", False):
+            orig_channels += 2
         return orig_channels
         # if getattr(hyp, "sobel_p", False):
         #     orig_channels += 2

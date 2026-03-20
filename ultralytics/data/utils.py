@@ -39,12 +39,137 @@ HELP_URL = "See https://docs.ultralytics.com/datasets for dataset formatting gui
 IMG_FORMATS = {"bmp", "dng", "jpeg", "jpg", "mpo", "png", "tif", "tiff", "webp", "pfm", "heic"}  # image suffixes
 VID_FORMATS = {"asf", "avi", "gif", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "ts", "wmv", "webm"}  # video suffixes
 FORMATS_HELP_MSG = f"Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID_FORMATS}"
+AUX_MASK_SPLITS = ("train", "val", "test", "minival")
+AUX_MASK_KEYS = ("shoreline_masks", "land_water_masks")
 
 
 def img2label_paths(img_paths: list[str]) -> list[str]:
     """Convert image paths to label paths by replacing 'images' with 'labels' and extension with '.txt'."""
     sa, sb = f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}"  # /images/, /labels/ substrings
     return [sb.join(x.rsplit(sa, 1)).rsplit(".", 1)[0] + ".txt" for x in img_paths]
+
+
+def get_auxiliary_mask_flags(hyp: Any = None) -> dict[str, bool]:
+    """Return mask-input and prior-loss requirements derived from the current args/config."""
+    use_shoreline_input = bool(getattr(hyp, "use_shoreline_input", False))
+    use_land_water_input = bool(getattr(hyp, "use_land_water_input", False))
+    use_shoreline_prior_loss = bool(getattr(hyp, "use_shoreline_prior_loss", False))
+    use_land_water_prior_loss = bool(getattr(hyp, "use_land_water_prior_loss", False))
+    return {
+        "use_shoreline_input": use_shoreline_input,
+        "use_land_water_input": use_land_water_input,
+        "use_shoreline_prior_loss": use_shoreline_prior_loss,
+        "use_land_water_prior_loss": use_land_water_prior_loss,
+        "require_shoreline": use_shoreline_input or use_shoreline_prior_loss,
+        "require_land_water": use_land_water_input or use_land_water_prior_loss or use_shoreline_prior_loss,
+        "enabled": any((use_shoreline_input, use_land_water_input, use_shoreline_prior_loss, use_land_water_prior_loss)),
+    }
+
+
+def _resolve_dataset_path(path: Path, spec: str) -> Path:
+    """Resolve a dataset-relative path spec to an absolute path."""
+    x = (path / spec).resolve()
+    if not x.exists() and spec.startswith("../"):
+        x = (path / spec[3:]).resolve()
+    return x
+
+
+def _resolve_split_entry(path: Path, spec: str | list[str]) -> str | list[str]:
+    """Resolve a split or auxiliary-root spec to absolute path(s)."""
+    if isinstance(spec, str):
+        return str(_resolve_dataset_path(path, spec))
+    return [str(_resolve_dataset_path(path, s)) for s in spec]
+
+
+def _normalize_split_roots(spec: str | list[str] | None) -> list[Path]:
+    """Return directory-style roots for split matching, tolerating txt/csv list inputs."""
+    if spec is None:
+        return []
+    entries = spec if isinstance(spec, list) else [spec]
+    roots = []
+    for entry in entries:
+        p = Path(entry)
+        roots.append((p.parent if p.is_file() else p).resolve())
+    return roots
+
+
+def build_auxiliary_root_mappings(data: dict[str, Any]) -> list[dict[str, Path | str | None]]:
+    """Build longest-prefix image-root to auxiliary-root mappings from a resolved data dict."""
+    mappings = []
+    shoreline_cfg = data.get("shoreline_masks") or {}
+    land_water_cfg = data.get("land_water_masks") or {}
+    for split in AUX_MASK_SPLITS:
+        image_roots = _normalize_split_roots(data.get(split))
+        shoreline_roots = _normalize_split_roots(shoreline_cfg.get(split))
+        land_water_roots = _normalize_split_roots(land_water_cfg.get(split))
+        if shoreline_roots and len(shoreline_roots) not in {1, len(image_roots)}:
+            raise ValueError(
+                f"shoreline_masks.{split} must define either 1 root or {len(image_roots)} roots to match {split}."
+            )
+        if land_water_roots and len(land_water_roots) not in {1, len(image_roots)}:
+            raise ValueError(
+                f"land_water_masks.{split} must define either 1 root or {len(image_roots)} roots to match {split}."
+            )
+        if len(shoreline_roots) == 1 and len(image_roots) > 1:
+            shoreline_roots *= len(image_roots)
+        if len(land_water_roots) == 1 and len(image_roots) > 1:
+            land_water_roots *= len(image_roots)
+        for i, image_root in enumerate(image_roots):
+            mappings.append(
+                {
+                    "split": split,
+                    "image_root": image_root,
+                    "shoreline_root": shoreline_roots[i] if i < len(shoreline_roots) else None,
+                    "land_water_root": land_water_roots[i] if i < len(land_water_roots) else None,
+                }
+            )
+    return sorted(mappings, key=lambda x: len(str(x["image_root"])), reverse=True)
+
+
+def resolve_auxiliary_mask_paths(
+    image_file: str | Path,
+    mappings: list[dict[str, Path | str | None]],
+    require_shoreline: bool = False,
+    require_land_water: bool = False,
+) -> dict[str, str | None]:
+    """Resolve shoreline and land/water PNG paths for an image using longest-prefix root matching."""
+    image_path = Path(image_file).resolve()
+    for mapping in mappings:
+        image_root = Path(mapping["image_root"])
+        try:
+            rel = image_path.relative_to(image_root)
+        except ValueError:
+            continue
+        out = {"split": mapping["split"], "shoreline_mask_file": None, "land_water_mask_file": None}
+        if mapping["shoreline_root"] is not None:
+            out["shoreline_mask_file"] = str((Path(mapping["shoreline_root"]) / rel).with_suffix(".png"))
+        if mapping["land_water_root"] is not None:
+            out["land_water_mask_file"] = str((Path(mapping["land_water_root"]) / rel).with_suffix(".png"))
+        if require_shoreline and not out["shoreline_mask_file"]:
+            raise FileNotFoundError(f"No shoreline mask root matched image '{image_path}'.")
+        if require_land_water and not out["land_water_mask_file"]:
+            raise FileNotFoundError(f"No land/water mask root matched image '{image_path}'.")
+        return out
+    raise FileNotFoundError(f"Could not match image '{image_path}' to any configured dataset split root.")
+
+
+def validate_auxiliary_mask_config(data: dict[str, Any], hyp: Any = None) -> None:
+    """Validate auxiliary-mask split roots against the current training or predict flags."""
+    flags = get_auxiliary_mask_flags(hyp)
+    if not flags["enabled"]:
+        return
+    if flags["require_shoreline"] and not data.get("shoreline_masks"):
+        raise SyntaxError("shoreline masks are required but 'shoreline_masks:' is missing from data.yaml.")
+    if flags["require_land_water"] and not data.get("land_water_masks"):
+        raise SyntaxError("land/water masks are required but 'land_water_masks:' is missing from data.yaml.")
+    for split in AUX_MASK_SPLITS:
+        if not data.get(split):
+            continue
+        if flags["require_shoreline"] and not (data.get("shoreline_masks") or {}).get(split):
+            raise SyntaxError(f"shoreline_masks.{split} is required when shoreline inputs or priors are enabled.")
+        if flags["require_land_water"] and not (data.get("land_water_masks") or {}).get(split):
+            raise SyntaxError(f"land_water_masks.{split} is required when land/water inputs or priors are enabled.")
+    build_auxiliary_root_mappings(data)
 
 
 def check_file_speeds(
@@ -438,6 +563,10 @@ def compute_channels(channels, hyp):
         orig_channels += 1
     if getattr(hyp, "water_depth_indices_p", False):
         orig_channels += 4
+    if getattr(hyp, "use_shoreline_input", False):
+        orig_channels += 1
+    if getattr(hyp, "use_land_water_input", False):
+        orig_channels += 2
     return orig_channels
 
 
@@ -499,13 +628,12 @@ def check_det_dataset(dataset: str, autodownload: bool = True, hyp: dict = None)
     data["path"] = path  # download scripts
     for k in "train", "val", "test", "minival":
         if data.get(k):  # prepend path
-            if isinstance(data[k], str):
-                x = (path / data[k]).resolve()
-                if not x.exists() and data[k].startswith("../"):
-                    x = (path / data[k][3:]).resolve()
-                data[k] = str(x)
-            else:
-                data[k] = [str((path / x).resolve()) for x in data[k]]
+            data[k] = _resolve_split_entry(path, data[k])
+    for k in AUX_MASK_KEYS:
+        if data.get(k):
+            data[k] = {split: _resolve_split_entry(path, spec) for split, spec in data[k].items()}
+
+    validate_auxiliary_mask_config(data, hyp)
 
     # Parse YAML
     val, s = (data.get(x) for x in ("val", "download"))

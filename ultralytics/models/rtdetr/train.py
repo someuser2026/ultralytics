@@ -185,5 +185,11 @@ class RTDETROBBTrainer(RTDETRTrainer):
         """Return a RTDETROBBValidator suitable for RT-DETR OBB model validation."""
         from .val import RTDETROBBValidator
 
-        self.loss_names = "giou_loss", "cls_loss", "l1_loss"
+        self.loss_names = (
+            "giou_loss",
+            "cls_loss",
+            "l1_loss",
+            "shoreline_prior_loss",
+            "land_water_prior_loss",
+        )
         return RTDETROBBValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args))

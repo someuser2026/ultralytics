@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from copy import deepcopy
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
@@ -19,11 +20,13 @@ from ultralytics.utils import LOCAL_RANK, LOGGER, NUM_THREADS, TQDM, colorstr
 from ultralytics.utils.instance import Instances
 from ultralytics.utils.ops import resample_segments, segments2boxes
 from ultralytics.utils.torch_utils import TORCHVISION_0_18
+from ultralytics.utils.patches import imread
 
 from .augment import (
     Compose,
     Format,
     LetterBox,
+    PrepareAuxiliaryMaskInputs,
     RandomLoadText,
     classify_augmentations,
     classify_transforms,
@@ -47,15 +50,18 @@ from .utils import (
     HELP_URL,
     check_file_speeds,
     get_hash,
+    get_auxiliary_mask_flags,
     img2label_paths,
     load_dataset_cache_file,
+    resolve_auxiliary_mask_paths,
     save_dataset_cache_file,
     verify_image,
     verify_image_label,
+    build_auxiliary_root_mappings,
 )
 
 # Ultralytics dataset *.cache version, >= 1.0.0 for Ultralytics YOLO models
-DATASET_CACHE_VERSION = "1.0.4"
+DATASET_CACHE_VERSION = "1.0.5"
 
 
 class YOLODataset(BaseDataset):
@@ -98,8 +104,52 @@ class YOLODataset(BaseDataset):
         self.use_keypoints = task == "pose"
         self.use_obb = task == "obb"
         self.data = data
+        self.hyp = kwargs.get("hyp")
+        self.auxiliary_mask_flags = get_auxiliary_mask_flags(self.hyp)
+        self.use_auxiliary_masks = self.auxiliary_mask_flags["enabled"]
+        self.auxiliary_root_mappings = build_auxiliary_root_mappings(self.data) if self.use_auxiliary_masks else []
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
         super().__init__(*args, channels=self.data.get("channels", 3), **kwargs)
+
+    def _resolve_auxiliary_mask_files(self, im_files: list[str]) -> tuple[list[str | None], list[str | None], list[str]]:
+        """Resolve and validate shoreline/land-water PNG sidecars for a sequence of image files."""
+        shoreline_files, land_water_files, hash_paths = [], [], []
+        for im_file in im_files:
+            resolved = resolve_auxiliary_mask_paths(
+                im_file,
+                self.auxiliary_root_mappings,
+                require_shoreline=self.auxiliary_mask_flags["require_shoreline"],
+                require_land_water=self.auxiliary_mask_flags["require_land_water"],
+            )
+            shoreline_file = resolved["shoreline_mask_file"]
+            land_water_file = resolved["land_water_mask_file"]
+            if shoreline_file and not Path(shoreline_file).is_file():
+                raise FileNotFoundError(f"Shoreline mask not found for '{im_file}': '{shoreline_file}'")
+            if land_water_file and not Path(land_water_file).is_file():
+                raise FileNotFoundError(f"Land/water mask not found for '{im_file}': '{land_water_file}'")
+            shoreline_files.append(shoreline_file)
+            land_water_files.append(land_water_file)
+            if shoreline_file:
+                hash_paths.append(shoreline_file)
+            if land_water_file:
+                hash_paths.append(land_water_file)
+        return shoreline_files, land_water_files, hash_paths
+
+    @staticmethod
+    def _read_png_mask(mask_file: str, expected_shape: tuple[int, int], resized_shape: tuple[int, int]) -> np.ndarray:
+        """Read a grayscale PNG mask, validate source size, and resize it with nearest interpolation."""
+        mask = imread(mask_file, flags=cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise FileNotFoundError(f"Mask not found or unreadable: '{mask_file}'")
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        if mask.shape != expected_shape:
+            raise ValueError(
+                f"Mask '{mask_file}' has shape {mask.shape}, expected {expected_shape} to match the source image."
+            )
+        if mask.shape != resized_shape:
+            mask = cv2.resize(mask, (resized_shape[1], resized_shape[0]), interpolation=cv2.INTER_NEAREST)
+        return mask
 
     def cache_labels(self, path: Path = Path("./labels.cache")) -> dict:
         """
@@ -164,7 +214,7 @@ class YOLODataset(BaseDataset):
             LOGGER.info("\n".join(msgs))
         if nf == 0:
             LOGGER.warning(f"{self.prefix}No labels found in {path}. {HELP_URL}")
-        x["hash"] = get_hash(self.label_files + self.im_files)
+        x["hash"] = get_hash(self.label_files + self.im_files + getattr(self, "_auxiliary_mask_hash_paths", []))
         x["results"] = nf, nm, ne, nc, len(self.im_files)
         x["msgs"] = msgs  # warnings
         save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
@@ -180,11 +230,14 @@ class YOLODataset(BaseDataset):
             (list[dict]): List of label dictionaries, each containing information about an image and its annotations.
         """
         self.label_files = img2label_paths(self.im_files)
+        self._auxiliary_mask_hash_paths = []
+        if self.use_auxiliary_masks:
+            _, _, self._auxiliary_mask_hash_paths = self._resolve_auxiliary_mask_files(self.im_files)
         cache_path = Path(self.label_files[0]).parent.with_suffix(".cache")
         try:
             cache, exists = load_dataset_cache_file(cache_path), True  # attempt to load a *.cache file
             assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
-            assert cache["hash"] == get_hash(self.label_files + self.im_files)  # identical hash
+            assert cache["hash"] == get_hash(self.label_files + self.im_files + self._auxiliary_mask_hash_paths)
         except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
             cache, exists = self.cache_labels(cache_path), False  # run cache ops
 
@@ -207,6 +260,13 @@ class YOLODataset(BaseDataset):
             if "cls_probs" not in lb:
                 lb["cls_probs"] = np.ones((len(lb["cls"]), 1), dtype=np.float32)
         self.im_files = [lb["im_file"] for lb in labels]  # update im_files
+        if self.use_auxiliary_masks:
+            shoreline_files, land_water_files, _ = self._resolve_auxiliary_mask_files(self.im_files)
+            for lb, shoreline_file, land_water_file in zip(labels, shoreline_files, land_water_files):
+                if shoreline_file:
+                    lb["shoreline_mask_file"] = shoreline_file
+                if land_water_file:
+                    lb["land_water_mask_file"] = land_water_file
 
         # Check if the dataset is all boxes or all segments
         lengths = ((len(lb["cls"]), len(lb["bboxes"]), len(lb["segments"])) for lb in labels)
@@ -223,6 +283,38 @@ class YOLODataset(BaseDataset):
             LOGGER.warning(f"Labels are missing or empty in {cache_path}, training may not work correctly. {HELP_URL}")
         return labels
 
+    def get_image_and_label(self, index: int) -> dict[str, Any]:
+        """Return the image, labels, and optional auxiliary masks for a dataset index."""
+        label = deepcopy(self.labels[index])
+        label.pop("shape", None)
+        label["img"], label["ori_shape"], label["resized_shape"] = self.load_image(index)
+        label["ratio_pad"] = (
+            label["resized_shape"][0] / label["ori_shape"][0],
+            label["resized_shape"][1] / label["ori_shape"][1],
+        )
+        if self.rect:
+            label["rect_shape"] = self.batch_shapes[self.batch[index]]
+        if self.use_auxiliary_masks:
+            shoreline_mask_file = label.get("shoreline_mask_file")
+            land_water_mask_file = label.get("land_water_mask_file")
+            if shoreline_mask_file:
+                shoreline_mask = self._read_png_mask(shoreline_mask_file, label["ori_shape"], label["resized_shape"])
+                label["shoreline_mask"] = (shoreline_mask > 0).astype(np.uint8)
+            if land_water_mask_file:
+                land_water_mask = self._read_png_mask(land_water_mask_file, label["ori_shape"], label["resized_shape"])
+                invalid = ~np.isin(land_water_mask, (0, 128, 255))
+                if invalid.any():
+                    raise ValueError(
+                        f"Land/water mask '{land_water_mask_file}' contains invalid values: "
+                        f"{sorted(np.unique(land_water_mask[invalid]).tolist())}"
+                    )
+                label["land_water_mask"] = np.where(
+                    land_water_mask == 128,
+                    1,
+                    np.where(land_water_mask == 255, 2, 0),
+                ).astype(np.uint8)
+        return self.update_labels_info(label)
+
     def build_transforms(self, hyp: dict | None = None) -> Compose:
         """
         Build and append transforms to the list.
@@ -234,6 +326,13 @@ class YOLODataset(BaseDataset):
             (Compose): Composed transforms.
         """
         if self.augment:
+            if self.use_auxiliary_masks:
+                for aug_name in ("mixup", "cutmix", "copy_paste"):
+                    if getattr(hyp, aug_name, 0.0):
+                        LOGGER.warning(
+                            f"{self.prefix}Disabling {aug_name} because auxiliary shoreline/land-water masks are enabled."
+                        )
+                        setattr(hyp, aug_name, 0.0)
             hyp.mosaic = hyp.mosaic if self.augment and not self.rect else 0.0
             hyp.mixup = hyp.mixup if self.augment and not self.rect else 0.0
             hyp.cutmix = hyp.cutmix if self.augment and not self.rect else 0.0
@@ -258,6 +357,15 @@ class YOLODataset(BaseDataset):
                 RidgeFilters(getattr(hyp, "ridge_p", False)),
                 AddWaterDepthIndices(getattr(hyp, "water_depth_indices_p", False)),
             ])
+        transforms.append(
+            PrepareAuxiliaryMaskInputs(
+                use_shoreline_input=bool(getattr(hyp, "use_shoreline_input", False)),
+                use_land_water_input=bool(getattr(hyp, "use_land_water_input", False)),
+                use_shoreline_prior_loss=bool(getattr(hyp, "use_shoreline_prior_loss", False)),
+                use_land_water_prior_loss=bool(getattr(hyp, "use_land_water_prior_loss", False)),
+                shoreline_prior_max_dist=int(getattr(hyp, "shoreline_prior_max_dist", 128)),
+            )
+        )
         transforms.append(
             Format(
                 bbox_format="xywh",
@@ -340,7 +448,7 @@ class YOLODataset(BaseDataset):
         values = list(zip(*[list(b.values()) for b in batch]))
         for i, k in enumerate(keys):
             value = values[i]
-            if k in {"img", "text_feats"}:
+            if k in {"img", "text_feats", "land_water_mask", "shoreline_distance_map"}:
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)

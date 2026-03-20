@@ -25,6 +25,39 @@ from ultralytics.utils.torch_utils import TORCHVISION_0_10, TORCHVISION_0_11, TO
 
 DEFAULT_MEAN = (0.0, 0.0, 0.0)
 DEFAULT_STD = (1.0, 1.0, 1.0)
+AUXILIARY_MASK_KEYS = ("shoreline_mask", "land_water_mask")
+
+
+def _ensure_mask_2d(mask: np.ndarray) -> np.ndarray:
+    """Return a HxW mask array regardless of grayscale channel bookkeeping."""
+    return mask[..., 0] if mask.ndim == 3 and mask.shape[2] == 1 else mask
+
+
+def _resize_aux_mask(mask: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Resize a sidecar mask with nearest-neighbor interpolation."""
+    mask = _ensure_mask_2d(mask)
+    return cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST)
+
+
+def _pad_aux_mask(mask: np.ndarray, top: int, bottom: int, left: int, right: int) -> np.ndarray:
+    """Pad a sidecar mask with zeros."""
+    mask = _ensure_mask_2d(mask)
+    return cv2.copyMakeBorder(mask, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
+
+
+def _warp_aux_mask(mask: np.ndarray, matrix: np.ndarray, size: tuple[int, int], perspective: bool) -> np.ndarray:
+    """Apply the same affine/perspective transform to a sidecar mask."""
+    mask = _ensure_mask_2d(mask)
+    if perspective:
+        return cv2.warpPerspective(mask, matrix, dsize=size, flags=cv2.INTER_NEAREST, borderValue=0)
+    return cv2.warpAffine(mask, matrix[:2], dsize=size, flags=cv2.INTER_NEAREST, borderValue=0)
+
+
+def _flip_aux_mask(mask: np.ndarray, direction: str) -> np.ndarray:
+    """Flip a sidecar mask vertically or horizontally."""
+    mask = _ensure_mask_2d(mask)
+    flipped = np.flipud(mask) if direction == "vertical" else np.fliplr(mask)
+    return np.ascontiguousarray(flipped)
 
 
 class BaseTransform:
@@ -547,6 +580,31 @@ class Mosaic(BaseMixTransform):
         self.n = n
         self.buffer_enabled = self.dataset.cache != "ram"
 
+    @staticmethod
+    def _init_aux_canvas(mask: np.ndarray | None, shape: tuple[int, int]) -> np.ndarray | None:
+        """Create a zero-valued mosaic canvas for a sidecar mask when present."""
+        if mask is None:
+            return None
+        return np.zeros(shape, dtype=_ensure_mask_2d(mask).dtype)
+
+    @staticmethod
+    def _place_aux_patch(
+        canvas: np.ndarray | None,
+        patch: np.ndarray | None,
+        y1a: int,
+        y2a: int,
+        x1a: int,
+        x2a: int,
+        y1b: int,
+        y2b: int,
+        x1b: int,
+        x2b: int,
+    ) -> None:
+        """Place a cropped sidecar-mask patch onto a mosaic canvas."""
+        if canvas is None or patch is None:
+            return
+        canvas[y1a:y2a, x1a:x2a] = _ensure_mask_2d(patch)[y1b:y2b, x1b:x2b]
+
     def get_indexes(self):
         """
         Return a list of random indexes from the dataset for mosaic augmentation.
@@ -626,15 +684,21 @@ class Mosaic(BaseMixTransform):
         """
         mosaic_labels = []
         s = self.imgsz
+        shoreline3 = None
+        land_water3 = None
         for i in range(3):
             labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
             # Load image
             img = labels_patch["img"]
             h, w = labels_patch.pop("resized_shape")
+            shoreline_patch = labels_patch.get("shoreline_mask")
+            land_water_patch = labels_patch.get("land_water_mask")
 
             # Place img in img3
             if i == 0:  # center
                 img3 = np.full((s * 3, s * 3, img.shape[2]), 114, dtype=np.uint8)  # base image with 3 tiles
+                shoreline3 = self._init_aux_canvas(shoreline_patch, (s * 3, s * 3))
+                land_water3 = self._init_aux_canvas(land_water_patch, (s * 3, s * 3))
                 h0, w0 = h, w
                 c = s, s, s + w, s + h  # xmin, ymin, xmax, ymax (base) coordinates
             elif i == 1:  # right
@@ -644,8 +708,12 @@ class Mosaic(BaseMixTransform):
 
             padw, padh = c[:2]
             x1, y1, x2, y2 = (max(x, 0) for x in c)  # allocate coordinates
+            src_y1, src_y2 = y1 - padh, y2 - padh
+            src_x1, src_x2 = x1 - padw, x2 - padw
 
-            img3[y1:y2, x1:x2] = img[y1 - padh :, x1 - padw :]  # img3[ymin:ymax, xmin:xmax]
+            img3[y1:y2, x1:x2] = img[src_y1:src_y2, src_x1:src_x2]  # img3[ymin:ymax, xmin:xmax]
+            self._place_aux_patch(shoreline3, shoreline_patch, y1, y2, x1, x2, src_y1, src_y2, src_x1, src_x2)
+            self._place_aux_patch(land_water3, land_water_patch, y1, y2, x1, x2, src_y1, src_y2, src_x1, src_x2)
             # hp, wp = h, w  # height, width previous for next iteration
 
             # Labels assuming imgsz*2 mosaic size
@@ -654,6 +722,10 @@ class Mosaic(BaseMixTransform):
         final_labels = self._cat_labels(mosaic_labels)
 
         final_labels["img"] = img3[-self.border[0] : self.border[0], -self.border[1] : self.border[1]]
+        if shoreline3 is not None:
+            final_labels["shoreline_mask"] = shoreline3[-self.border[0] : self.border[0], -self.border[1] : self.border[1]]
+        if land_water3 is not None:
+            final_labels["land_water_mask"] = land_water3[-self.border[0] : self.border[0], -self.border[1] : self.border[1]]
         return final_labels
 
     def _mosaic4(self, labels: dict[str, Any]) -> dict[str, Any]:
@@ -682,16 +754,22 @@ class Mosaic(BaseMixTransform):
         """
         mosaic_labels = []
         s = self.imgsz
+        shoreline4 = None
+        land_water4 = None
         yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.border)  # mosaic center x, y
         for i in range(4):
             labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
             # Load image
             img = labels_patch["img"]
             h, w = labels_patch.pop("resized_shape")
+            shoreline_patch = labels_patch.get("shoreline_mask")
+            land_water_patch = labels_patch.get("land_water_mask")
 
             # Place img in img4
             if i == 0:  # top left
                 img4 = np.full((s * 2, s * 2, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
+                shoreline4 = self._init_aux_canvas(shoreline_patch, (s * 2, s * 2))
+                land_water4 = self._init_aux_canvas(land_water_patch, (s * 2, s * 2))
                 x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
                 x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
             elif i == 1:  # top right
@@ -705,6 +783,8 @@ class Mosaic(BaseMixTransform):
                 x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
 
             img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]  # img4[ymin:ymax, xmin:xmax]
+            self._place_aux_patch(shoreline4, shoreline_patch, y1a, y2a, x1a, x2a, y1b, y2b, x1b, x2b)
+            self._place_aux_patch(land_water4, land_water_patch, y1a, y2a, x1a, x2a, y1b, y2b, x1b, x2b)
             padw = x1a - x1b
             padh = y1a - y1b
 
@@ -712,6 +792,10 @@ class Mosaic(BaseMixTransform):
             mosaic_labels.append(labels_patch)
         final_labels = self._cat_labels(mosaic_labels)
         final_labels["img"] = img4
+        if shoreline4 is not None:
+            final_labels["shoreline_mask"] = shoreline4
+        if land_water4 is not None:
+            final_labels["land_water_mask"] = land_water4
         return final_labels
 
     def _mosaic9(self, labels: dict[str, Any]) -> dict[str, Any]:
@@ -742,16 +826,22 @@ class Mosaic(BaseMixTransform):
         """
         mosaic_labels = []
         s = self.imgsz
+        shoreline9 = None
+        land_water9 = None
         hp, wp = -1, -1  # height, width previous
         for i in range(9):
             labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
             # Load image
             img = labels_patch["img"]
             h, w = labels_patch.pop("resized_shape")
+            shoreline_patch = labels_patch.get("shoreline_mask")
+            land_water_patch = labels_patch.get("land_water_mask")
 
             # Place img in img9
             if i == 0:  # center
                 img9 = np.full((s * 3, s * 3, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
+                shoreline9 = self._init_aux_canvas(shoreline_patch, (s * 3, s * 3))
+                land_water9 = self._init_aux_canvas(land_water_patch, (s * 3, s * 3))
                 h0, w0 = h, w
                 c = s, s, s + w, s + h  # xmin, ymin, xmax, ymax (base) coordinates
             elif i == 1:  # top
@@ -775,7 +865,11 @@ class Mosaic(BaseMixTransform):
             x1, y1, x2, y2 = (max(x, 0) for x in c)  # allocate coordinates
 
             # Image
-            img9[y1:y2, x1:x2] = img[y1 - padh :, x1 - padw :]  # img9[ymin:ymax, xmin:xmax]
+            src_y1, src_y2 = y1 - padh, y1 - padh + (y2 - y1)
+            src_x1, src_x2 = x1 - padw, x1 - padw + (x2 - x1)
+            img9[y1:y2, x1:x2] = img[src_y1:src_y2, src_x1:src_x2]  # img9[ymin:ymax, xmin:xmax]
+            self._place_aux_patch(shoreline9, shoreline_patch, y1, y2, x1, x2, src_y1, src_y2, src_x1, src_x2)
+            self._place_aux_patch(land_water9, land_water_patch, y1, y2, x1, x2, src_y1, src_y2, src_x1, src_x2)
             hp, wp = h, w  # height, width previous for next iteration
 
             # Labels assuming imgsz*2 mosaic size
@@ -784,6 +878,10 @@ class Mosaic(BaseMixTransform):
         final_labels = self._cat_labels(mosaic_labels)
 
         final_labels["img"] = img9[-self.border[0] : self.border[0], -self.border[1] : self.border[1]]
+        if shoreline9 is not None:
+            final_labels["shoreline_mask"] = shoreline9[-self.border[0] : self.border[0], -self.border[1] : self.border[1]]
+        if land_water9 is not None:
+            final_labels["land_water_mask"] = land_water9[-self.border[0] : self.border[0], -self.border[1] : self.border[1]]
         return final_labels
 
     @staticmethod
@@ -1351,6 +1449,9 @@ class RandomPerspective:
         # M is affine matrix
         # Scale for func:`box_candidates`
         img, M, scale = self.affine_transform(img, border)
+        for key in AUXILIARY_MASK_KEYS:
+            if labels.get(key) is not None:
+                labels[key] = _warp_aux_mask(labels[key], M, self.size, perspective=bool(self.perspective))
 
         bboxes = self.apply_bboxes(instances.bboxes, M)
 
@@ -1592,11 +1693,17 @@ class RandomFlip:
         if self.direction == "vertical" and random.random() < self.p:
             img = np.flipud(img)
             instances.flipud(h)
+            for key in AUXILIARY_MASK_KEYS:
+                if labels.get(key) is not None:
+                    labels[key] = _flip_aux_mask(labels[key], "vertical")
             if self.flip_idx is not None and instances.keypoints is not None:
                 instances.keypoints = np.ascontiguousarray(instances.keypoints[:, self.flip_idx, :])
         if self.direction == "horizontal" and random.random() < self.p:
             img = np.fliplr(img)
             instances.fliplr(w)
+            for key in AUXILIARY_MASK_KEYS:
+                if labels.get(key) is not None:
+                    labels[key] = _flip_aux_mask(labels[key], "horizontal")
             if self.flip_idx is not None and instances.keypoints is not None:
                 instances.keypoints = np.ascontiguousarray(instances.keypoints[:, self.flip_idx, :])
         labels["img"] = np.ascontiguousarray(img)
@@ -1732,6 +1839,9 @@ class LetterBox:
             img = cv2.resize(img, new_unpad, interpolation=self.interpolation)
             if img.ndim == 2:
                 img = img[..., None]
+            for key in AUXILIARY_MASK_KEYS:
+                if labels.get(key) is not None:
+                    labels[key] = _resize_aux_mask(labels[key], new_unpad)
 
         top, bottom = int(round(dh - 0.1)) if self.center else 0, int(round(dh + 0.1))
         left, right = int(round(dw - 0.1)) if self.center else 0, int(round(dw + 0.1))
@@ -1744,6 +1854,9 @@ class LetterBox:
             pad_img = np.full((h + top + bottom, w + left + right, c), fill_value=self.padding_value, dtype=img.dtype)
             pad_img[top : top + h, left : left + w] = img
             img = pad_img
+        for key in AUXILIARY_MASK_KEYS:
+            if labels.get(key) is not None:
+                labels[key] = _pad_aux_mask(labels[key], top, bottom, left, right)
 
         if labels.get("ratio_pad"):
             labels["ratio_pad"] = (labels["ratio_pad"], (left, top))  # for evaluation
@@ -3606,6 +3719,95 @@ class AddWaterDepthIndices:
         )
         
         return labels
+
+class PrepareAuxiliaryMaskInputs:
+    """Append optional shoreline/land-water channels and materialize prior-loss tensors."""
+
+    def __init__(
+        self,
+        use_shoreline_input: bool = False,
+        use_land_water_input: bool = False,
+        use_shoreline_prior_loss: bool = False,
+        use_land_water_prior_loss: bool = False,
+        shoreline_prior_max_dist: int = 128,
+    ) -> None:
+        self.use_shoreline_input = use_shoreline_input
+        self.use_land_water_input = use_land_water_input
+        self.use_shoreline_prior_loss = use_shoreline_prior_loss
+        self.use_land_water_prior_loss = use_land_water_prior_loss
+        self.shoreline_prior_max_dist = max(int(shoreline_prior_max_dist), 1)
+
+    @staticmethod
+    def _require_mask(labels: dict[str, Any], key: str, message: str) -> np.ndarray:
+        mask = labels.get(key)
+        if mask is None:
+            raise ValueError(message)
+        return _ensure_mask_2d(mask)
+
+    @staticmethod
+    def _append_channel(img: np.ndarray, channel: np.ndarray) -> np.ndarray:
+        img = img if img.ndim == 3 else img[..., None]
+        channel = _ensure_mask_2d(channel).astype(img.dtype, copy=False)[..., None]
+        return np.concatenate((img, channel), axis=2)
+
+    @staticmethod
+    def _build_binary_channel(mask: np.ndarray) -> np.ndarray:
+        return (_ensure_mask_2d(mask) > 0).astype(np.uint8) * 255
+
+    def _build_shoreline_distance_map(self, shoreline_mask: np.ndarray, land_water_mask: np.ndarray) -> np.ndarray:
+        shoreline_mask = (_ensure_mask_2d(shoreline_mask) > 0).astype(np.uint8)
+        land_water_mask = _ensure_mask_2d(land_water_mask).astype(np.uint8)
+        distance_map = np.zeros(land_water_mask.shape, dtype=np.float32)
+        water_mask = land_water_mask == 2
+        if not water_mask.any():
+            return distance_map
+        if shoreline_mask.any():
+            distance = cv2.distanceTransform((shoreline_mask == 0).astype(np.uint8), cv2.DIST_L2, 3)
+            distance = np.clip(distance, 0.0, float(self.shoreline_prior_max_dist)).astype(np.float32)
+        else:
+            distance = np.full(land_water_mask.shape, float(self.shoreline_prior_max_dist), dtype=np.float32)
+        distance_map[water_mask] = distance[water_mask]
+        return distance_map
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Append auxiliary inputs and convert prior-loss maps to tensors before Format."""
+        shoreline_mask = labels.pop("shoreline_mask", None)
+        land_water_mask = labels.pop("land_water_mask", None)
+
+        if self.use_shoreline_input or self.use_shoreline_prior_loss:
+            shoreline_mask = self._require_mask(
+                {"shoreline_mask": shoreline_mask},
+                "shoreline_mask",
+                "shoreline_mask is required when shoreline input or shoreline prior loss is enabled.",
+            )
+        if self.use_land_water_input or self.use_land_water_prior_loss or self.use_shoreline_prior_loss:
+            land_water_mask = self._require_mask(
+                {"land_water_mask": land_water_mask},
+                "land_water_mask",
+                "land_water_mask is required when land/water input or shoreline/land-water prior loss is enabled.",
+            )
+
+        if shoreline_mask is not None:
+            shoreline_mask = (shoreline_mask > 0).astype(np.uint8)
+        if land_water_mask is not None:
+            land_water_mask = land_water_mask.astype(np.uint8, copy=False)
+
+        img = labels["img"]
+        if self.use_shoreline_input and shoreline_mask is not None:
+            img = self._append_channel(img, self._build_binary_channel(shoreline_mask))
+        if self.use_land_water_input and land_water_mask is not None:
+            img = self._append_channel(img, ((land_water_mask == 1).astype(np.uint8) * 255))
+            img = self._append_channel(img, ((land_water_mask == 2).astype(np.uint8) * 255))
+        labels["img"] = img
+
+        if self.use_land_water_prior_loss or self.use_shoreline_prior_loss:
+            labels["land_water_mask"] = torch.from_numpy(land_water_mask[None].astype(np.int64, copy=False))
+        if self.use_shoreline_prior_loss:
+            shoreline_distance_map = self._build_shoreline_distance_map(shoreline_mask, land_water_mask)
+            labels["shoreline_distance_map"] = torch.from_numpy(shoreline_distance_map[None])
+
+        return labels
+
 
 class Format:
     """

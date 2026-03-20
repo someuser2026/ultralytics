@@ -1305,6 +1305,114 @@ class v8ClassificationLoss:
         return loss, loss.detach()
 
 
+def _get_cfg_value(cfg: Any, key: str, default: Any) -> Any:
+    """Read a config value from either a dict-like object or a namespace."""
+    if cfg is None:
+        return default
+    return cfg.get(key, default) if isinstance(cfg, dict) else getattr(cfg, key, default)
+
+
+def _points_to_grid(points: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """Convert pixel coordinates to grid_sample coordinates with align_corners=False."""
+    if width > 1:
+        x = ((points[..., 0] + 0.5) / width) * 2 - 1
+    else:
+        x = torch.zeros_like(points[..., 0])
+    if height > 1:
+        y = ((points[..., 1] + 0.5) / height) * 2 - 1
+    else:
+        y = torch.zeros_like(points[..., 1])
+    return torch.stack((x, y), dim=-1)
+
+
+def _points_in_bounds(points: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """Return a boolean mask for points that fall inside the image plane."""
+    return (
+        (points[..., 0] >= 0)
+        & (points[..., 0] <= max(width - 1, 0))
+        & (points[..., 1] >= 0)
+        & (points[..., 1] <= max(height - 1, 0))
+    )
+
+
+def _sample_map_at_points(map_tensor: torch.Tensor, points: torch.Tensor, mode: str = "nearest") -> torch.Tensor:
+    """Sample a (B, 1, H, W) map at pixel coordinates shaped (B, N, 2)."""
+    if map_tensor is None or points.numel() == 0:
+        return None
+    _, _, height, width = map_tensor.shape
+    grid = _points_to_grid(points, height, width).unsqueeze(1)
+    sampled = F.grid_sample(map_tensor.float(), grid, mode=mode, padding_mode="zeros", align_corners=False)
+    return sampled[:, 0, 0, :]
+
+
+def _compute_obb_spatial_prior_losses(
+    pred_rboxes: torch.Tensor,
+    conf_scores: torch.Tensor,
+    negative_mask: torch.Tensor,
+    land_water_mask: torch.Tensor | None,
+    shoreline_distance_map: torch.Tensor | None,
+    point_mode: str = "center",
+    shoreline_prior_max_dist: float = 128.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute shoreline-distance and land-region penalties for unmatched OBB predictions."""
+    zero = conf_scores.new_tensor(0.0)
+    if conf_scores.ndim == 3 and conf_scores.shape[-1] == 1:
+        conf_scores = conf_scores.squeeze(-1)
+    if pred_rboxes.numel() == 0 or conf_scores.numel() == 0 or not negative_mask.any():
+        return zero, zero
+    if land_water_mask is None and shoreline_distance_map is None:
+        return zero, zero
+
+    negative_mask = negative_mask.bool()
+    max_dist = max(float(shoreline_prior_max_dist), 1.0)
+
+    land_penalty = zero
+    shoreline_penalty = zero
+
+    centers = pred_rboxes[..., :2]
+    if land_water_mask is not None:
+        _, _, height, width = land_water_mask.shape
+        center_in_bounds = _points_in_bounds(centers, height, width)
+        center_classes = _sample_map_at_points(land_water_mask.float(), centers, mode="nearest").round().long()
+        land_indicator = ((center_classes == 1) & center_in_bounds).to(conf_scores.dtype)
+        land_penalty = (conf_scores[negative_mask] * land_indicator[negative_mask]).mean()
+    else:
+        center_classes = None
+
+    if shoreline_distance_map is None or land_water_mask is None:
+        return shoreline_penalty, land_penalty
+
+    _, _, height, width = shoreline_distance_map.shape
+    if point_mode == "closest_corner":
+        corners = xywhr2xyxyxyxy(pred_rboxes).view(pred_rboxes.shape[0], pred_rboxes.shape[1], 4, 2)
+        flat_corners = corners.view(pred_rboxes.shape[0], -1, 2)
+        corner_in_bounds = _points_in_bounds(flat_corners, height, width).view(pred_rboxes.shape[0], -1, 4)
+        corner_classes = _sample_map_at_points(land_water_mask.float(), flat_corners, mode="nearest").round().long()
+        corner_classes = corner_classes.view(pred_rboxes.shape[0], -1, 4)
+        corner_distance = _sample_map_at_points(shoreline_distance_map.float(), flat_corners, mode="bilinear")
+        corner_distance = corner_distance.view(pred_rboxes.shape[0], -1, 4)
+        valid_corners = (corner_classes == 2) & corner_in_bounds
+        corner_distance = torch.where(valid_corners, corner_distance, torch.full_like(corner_distance, float("inf")))
+        min_corner_distance = corner_distance.min(dim=-1).values
+        shoreline_weights = torch.where(
+            valid_corners.any(dim=-1),
+            min_corner_distance.clamp_(0.0, max_dist) / max_dist,
+            torch.zeros_like(conf_scores),
+        )
+    else:
+        if center_classes is None:
+            center_classes = _sample_map_at_points(land_water_mask.float(), centers, mode="nearest").round().long()
+        shoreline_distance = _sample_map_at_points(shoreline_distance_map.float(), centers, mode="bilinear")
+        shoreline_weights = torch.where(
+            (center_classes == 2) & _points_in_bounds(centers, height, width),
+            shoreline_distance.clamp_(0.0, max_dist) / max_dist,
+            torch.zeros_like(conf_scores),
+        )
+
+    shoreline_penalty = (conf_scores[negative_mask] * shoreline_weights[negative_mask]).mean()
+    return shoreline_penalty, land_penalty
+
+
 class v8OBBLoss(v8DetectionLoss):
     """Calculates losses for object detection, classification, and box distribution in rotated YOLO models."""
 
@@ -1313,6 +1421,12 @@ class v8OBBLoss(v8DetectionLoss):
         super().__init__(model)
         self.assigner = RotatedTaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = RotatedBboxLoss(self.reg_max).to(self.device)
+        self.use_shoreline_prior_loss = bool(_get_cfg_value(model.args, "use_shoreline_prior_loss", False))
+        self.use_land_water_prior_loss = bool(_get_cfg_value(model.args, "use_land_water_prior_loss", False))
+        self.shoreline_prior_point_mode = _get_cfg_value(model.args, "shoreline_prior_point_mode", "center")
+        self.shoreline_prior_weight = float(_get_cfg_value(model.args, "shoreline_prior_weight", 1.0))
+        self.land_water_prior_weight = float(_get_cfg_value(model.args, "land_water_prior_weight", 1.0))
+        self.shoreline_prior_max_dist = float(_get_cfg_value(model.args, "shoreline_prior_max_dist", 128.0))
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets for oriented bounding box detection."""
@@ -1333,7 +1447,7 @@ class v8OBBLoss(v8DetectionLoss):
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the loss for oriented bounding box detection."""
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        loss = torch.zeros(5, device=self.device)  # box, cls, dfl, shoreline_prior, land_water_prior
         feats, pred_angle = preds if isinstance(preds[0], list) else preds[1]
         batch_size = pred_angle.shape[0]  # batch size, number of masks, mask height, mask width
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
@@ -1400,11 +1514,26 @@ class v8OBBLoss(v8DetectionLoss):
         else:
             loss[0] += (pred_angle * 0).sum()
 
+        if self.use_shoreline_prior_loss or self.use_land_water_prior_loss:
+            pred_bboxes_px = pred_bboxes.clone()
+            pred_bboxes_px[..., :4] *= stride_tensor
+            loss[3], loss[4] = _compute_obb_spatial_prior_losses(
+                pred_bboxes_px,
+                pred_scores.sigmoid().amax(-1),
+                ~fg_mask,
+                batch.get("land_water_mask"),
+                batch.get("shoreline_distance_map"),
+                point_mode=self.shoreline_prior_point_mode,
+                shoreline_prior_max_dist=self.shoreline_prior_max_dist,
+            )
+
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
+        loss[3] *= self.shoreline_prior_weight
+        loss[4] *= self.land_water_prior_weight
 
-        return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+        return loss * batch_size, loss.detach()  # loss(box, cls, dfl, shoreline_prior, land_water_prior)
 
     def bbox_decode(
         self, anchor_points: torch.Tensor, pred_dist: torch.Tensor, pred_angle: torch.Tensor
@@ -1442,6 +1571,12 @@ class RotatedFCOSLoss:
         self.norm_on_bbox = m.norm_on_bbox
         self.bbox_loss_type = m.bbox_loss_type
         self.angle_mode = getattr(m, "angle_mode", getattr(model, "yaml", {}).get("angle_mode", "oc"))
+        self.use_shoreline_prior_loss = bool(_get_cfg_value(model.args, "use_shoreline_prior_loss", False))
+        self.use_land_water_prior_loss = bool(_get_cfg_value(model.args, "use_land_water_prior_loss", False))
+        self.shoreline_prior_point_mode = _get_cfg_value(model.args, "shoreline_prior_point_mode", "center")
+        self.shoreline_prior_weight = float(_get_cfg_value(model.args, "shoreline_prior_weight", 1.0))
+        self.land_water_prior_weight = float(_get_cfg_value(model.args, "land_water_prior_weight", 1.0))
+        self.shoreline_prior_max_dist = float(_get_cfg_value(model.args, "shoreline_prior_max_dist", 128.0))
         if self.bbox_loss_type not in {"probiou", "rotated_iou"}:
             raise ValueError(
                 f"Unsupported RotatedFCOS bbox_loss_type={self.bbox_loss_type!r}. "
@@ -1609,7 +1744,7 @@ class RotatedFCOSLoss:
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute Rotated FCOS classification, bbox, and centerness losses."""
-        loss = torch.zeros(3, device=self.device)
+        loss = torch.zeros(5, device=self.device)
         cls_scores, bbox_preds, angle_preds, centernesses = preds if len(preds) == 4 else preds[1]
         batch_size = cls_scores[0].shape[0]
         dtype = cls_scores[0].dtype
@@ -1701,8 +1836,30 @@ class RotatedFCOSLoss:
             loss[0] += (flatten_bbox_preds * 0).sum() + (flatten_angle_preds * 0).sum()
             loss[2] += (flatten_centerness * 0).sum()
 
+        if self.use_shoreline_prior_loss or self.use_land_water_prior_loss:
+            all_bbox_preds = flatten_bbox_preds
+            all_points = pixel_points.unsqueeze(0).expand(batch_size, -1, 2)
+            if self.norm_on_bbox:
+                all_bbox_preds = all_bbox_preds * stride_tensor.unsqueeze(0)
+            all_pred_boxes = torch.cat(
+                (dist2rbox(all_bbox_preds, flatten_angle_preds, all_points, dim=-1), flatten_angle_preds), dim=-1
+            )
+            all_pred_boxes = regularize_rboxes(all_pred_boxes, angle_mode=self.angle_mode)
+            confidence = flatten_cls_scores.sigmoid().amax(-1) * flatten_centerness.sigmoid()
+            loss[3], loss[4] = _compute_obb_spatial_prior_losses(
+                all_pred_boxes,
+                confidence,
+                ~fg_mask,
+                batch.get("land_water_mask"),
+                batch.get("shoreline_distance_map"),
+                point_mode=self.shoreline_prior_point_mode,
+                shoreline_prior_max_dist=self.shoreline_prior_max_dist,
+            )
+
         loss[0] *= self.hyp.box
         loss[1] *= self.hyp.cls
+        loss[3] *= self.shoreline_prior_weight
+        loss[4] *= self.land_water_prior_weight
         return loss * batch_size, loss.detach()
 
 
@@ -2588,6 +2745,42 @@ class RTDETROBBLoss(RTDETRDetectionLoss):
     This class uses probiou instead of bbox_iou for GIoU computation on 5D rotated bounding boxes (x, y, w, h, angle).
     """
 
+    def __init__(
+        self,
+        nc: int = 80,
+        loss_gain: dict[str, float] | None = None,
+        aux_loss: bool = True,
+        use_fl: bool = True,
+        use_vfl: bool = False,
+        use_uni_match: bool = False,
+        uni_match_ind: int = 0,
+        gamma: float = 1.5,
+        alpha: float = 0.25,
+        use_shoreline_prior_loss: bool = False,
+        use_land_water_prior_loss: bool = False,
+        shoreline_prior_point_mode: str = "center",
+        shoreline_prior_weight: float = 1.0,
+        land_water_prior_weight: float = 1.0,
+        shoreline_prior_max_dist: float = 128.0,
+    ):
+        super().__init__(
+            nc=nc,
+            loss_gain=loss_gain,
+            aux_loss=aux_loss,
+            use_fl=use_fl,
+            use_vfl=use_vfl,
+            use_uni_match=use_uni_match,
+            uni_match_ind=uni_match_ind,
+            gamma=gamma,
+            alpha=alpha,
+        )
+        self.use_shoreline_prior_loss = use_shoreline_prior_loss
+        self.use_land_water_prior_loss = use_land_water_prior_loss
+        self.shoreline_prior_point_mode = shoreline_prior_point_mode
+        self.shoreline_prior_weight = shoreline_prior_weight
+        self.land_water_prior_weight = land_water_prior_weight
+        self.shoreline_prior_max_dist = shoreline_prior_max_dist
+
     def _get_loss(
         self,
         pred_bboxes: torch.Tensor,
@@ -2672,6 +2865,50 @@ class RTDETROBBLoss(RTDETRDetectionLoss):
 
         loss[name_giou] = self.loss_gain["giou"] * loss[name_giou]
         return {k: v.squeeze() for k, v in loss.items()}
+
+    def forward(
+        self,
+        preds: tuple[torch.Tensor, torch.Tensor],
+        batch: dict[str, Any],
+        dn_bboxes: torch.Tensor | None = None,
+        dn_scores: torch.Tensor | None = None,
+        dn_meta: dict[str, Any] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Compute RT-DETR OBB losses plus optional shoreline and land/water prior penalties."""
+        pred_bboxes, pred_scores = preds
+        total_loss = super().forward(preds, batch, dn_bboxes=dn_bboxes, dn_scores=dn_scores, dn_meta=dn_meta)
+
+        loss_shoreline_prior = pred_bboxes.new_tensor(0.0)
+        loss_land_water_prior = pred_bboxes.new_tensor(0.0)
+        land_water_map = batch.get("land_water_mask")
+        if (self.use_shoreline_prior_loss or self.use_land_water_prior_loss) and land_water_map is not None:
+            final_bboxes_norm = pred_bboxes[-1]
+            final_bboxes = final_bboxes_norm.clone()
+            final_scores = pred_scores[-1]
+            _, _, height, width = land_water_map.shape
+            final_bboxes[..., [0, 2]] *= width
+            final_bboxes[..., [1, 3]] *= height
+
+            match_indices = self.matcher(final_bboxes_norm, final_scores, batch["bboxes"], batch["cls"], batch["gt_groups"])
+            negative_mask = torch.ones(final_scores.shape[:2], dtype=torch.bool, device=final_scores.device)
+            for batch_idx, (src_idx, _) in enumerate(match_indices):
+                negative_mask[batch_idx, src_idx] = False
+
+            loss_shoreline_prior, loss_land_water_prior = _compute_obb_spatial_prior_losses(
+                final_bboxes,
+                final_scores.sigmoid().amax(-1),
+                negative_mask,
+                land_water_map,
+                batch.get("shoreline_distance_map"),
+                point_mode=self.shoreline_prior_point_mode,
+                shoreline_prior_max_dist=self.shoreline_prior_max_dist,
+            )
+            loss_shoreline_prior *= self.shoreline_prior_weight
+            loss_land_water_prior *= self.land_water_prior_weight
+
+        total_loss["loss_shoreline_prior"] = loss_shoreline_prior
+        total_loss["loss_land_water_prior"] = loss_land_water_prior
+        return total_loss
 
 # --- Mask2Former losses ------------------------------------------------------
 from typing import List, Dict, Tuple

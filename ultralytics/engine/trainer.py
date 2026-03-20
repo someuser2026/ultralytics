@@ -22,11 +22,13 @@ from torch import distributed as dist
 from torch import nn, optim
 
 from ultralytics import __version__
-from ultralytics.cfg import get_cfg, get_save_dir
+from ultralytics.cfg import cfg2dict, get_cfg, get_save_dir
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.nn.tasks import load_checkpoint
 from ultralytics.utils import (
     DEFAULT_CFG,
+    DEFAULT_CFG_DICT,
+    DEFAULT_CFG_PATH,
     GIT,
     LOCAL_RANK,
     LOGGER,
@@ -121,6 +123,8 @@ class BaseTrainer:
             overrides (dict, optional): Configuration overrides.
             _callbacks (list, optional): List of callback functions.
         """
+        overrides = cfg2dict(overrides) if overrides else {}
+        self._explicit_epoch_limit = "epochs" in self._get_explicit_arg_keys(cfg, overrides)
         self.hub_session = overrides.pop("session", None)  # HUB
         self.args = get_cfg(cfg, overrides)
         self.check_resume(overrides)
@@ -198,6 +202,36 @@ class BaseTrainer:
             callbacks.add_integration_callbacks(self)
             # Start console logging immediately at trainer initialization
             self.run_callbacks("on_pretrain_routine_start")
+
+    @staticmethod
+    def _get_explicit_arg_keys(cfg, overrides):
+        """Return config keys that were explicitly supplied by the caller."""
+        explicit_keys = set(overrides)
+        if cfg is DEFAULT_CFG or cfg is DEFAULT_CFG_DICT:
+            return explicit_keys
+        if isinstance(cfg, dict):
+            if cfg == DEFAULT_CFG_DICT:
+                return explicit_keys
+            explicit_keys.update(cfg)
+        elif isinstance(cfg, (str, Path)):
+            if Path(cfg).expanduser().resolve() == DEFAULT_CFG_PATH.resolve():
+                return explicit_keys
+            explicit_keys.update(cfg2dict(cfg))
+        return explicit_keys
+
+    def _should_adjust_epochs_for_time(self):
+        """Return True when timed training should estimate epochs dynamically."""
+        return bool(self.args.time) and not self._explicit_epoch_limit
+
+    def _time_exceeded(self):
+        """Return True when the configured training time budget has been exhausted."""
+        return bool(self.args.time) and (time.time() - self.train_time_start) > (self.args.time * 3600)
+
+    def _training_duration_description(self):
+        """Describe the active stop criteria for training logs."""
+        if self.args.time and self._explicit_epoch_limit:
+            return f"up to {self.epochs} epochs or {self.args.time} hours (whichever comes first)..."
+        return f"{self.args.time} hours..." if self.args.time else f"{self.epochs} epochs..."
 
     def add_callback(self, event: str, callback):
         """Append the given callback to the event's callback list."""
@@ -821,7 +855,7 @@ class BaseTrainer:
             f"Image sizes {self.args.imgsz} train, {self.args.imgsz} val\n"
             f"Using {self.train_loader.num_workers * (self.world_size or 1)} dataloader workers\n"
             f"Logging results to {colorstr('bold', self.save_dir)}\n"
-            f"Starting training for " + (f"{self.args.time} hours..." if self.args.time else f"{self.epochs} epochs...")
+            f"Starting training for {self._training_duration_description()}"
         )
         if self.args.close_mosaic:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
@@ -848,6 +882,7 @@ class BaseTrainer:
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
+            time_limit_reached = False
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
                 # Warmup
@@ -889,13 +924,11 @@ class BaseTrainer:
 
                     # Timed stopping
                     if self.args.time:
-                        self.stop = (time.time() - self.train_time_start) > (self.args.time * 3600)
+                        time_limit_reached |= self._time_exceeded()
                         if RANK != -1:  # if DDP training
-                            broadcast_list = [self.stop if RANK == 0 else None]
-                            dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
-                            self.stop = broadcast_list[0]
-                        if self.stop:  # training time exceeded
-                            break
+                            broadcast_list = [time_limit_reached if RANK == 0 else None]
+                            dist.broadcast_object_list(broadcast_list, 0)  # broadcast timed stop state to all ranks
+                            time_limit_reached = broadcast_list[0]
 
                 # Log
                 if RANK in {-1, 0}:
@@ -919,17 +952,16 @@ class BaseTrainer:
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
             self.run_callbacks("on_train_epoch_end")
             if RANK in {-1, 0}:
+                time_limit_reached |= self._time_exceeded()
                 final_epoch = epoch + 1 >= self.epochs
                 self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
 
                 # Validation
-                if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
+                if self.args.val or final_epoch or self.stopper.possible_stop or self.stop or time_limit_reached:
                     self._clear_memory(threshold=0.5)  # prevent VRAM spike
                     self.metrics, self.fitness = self.validate()
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
-                self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
-                if self.args.time:
-                    self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
+                self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch or time_limit_reached
 
                 # Save model
                 if self.args.save or final_epoch:
@@ -940,7 +972,7 @@ class BaseTrainer:
             t = time.time()
             self.epoch_time = t - self.epoch_time_start
             self.epoch_time_start = t
-            if self.args.time:
+            if self._should_adjust_epochs_for_time():
                 mean_epoch_time = (t - self.train_time_start) / (epoch - self.start_epoch + 1)
                 self.epochs = self.args.epochs = math.ceil(self.args.time * 3600 / mean_epoch_time)
                 self._setup_scheduler()
@@ -1042,6 +1074,7 @@ class BaseTrainer:
                 "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
                 "scaler": self.scaler.state_dict(),
                 "train_args": vars(self.args),  # save as dict
+                "train_meta": {"explicit_epoch_limit": self._explicit_epoch_limit},
                 "train_metrics": {**self.metrics, **{"fitness": self.fitness}},
                 "train_results": self.read_results_csv(),
                 "date": datetime.now().isoformat(),
@@ -1270,12 +1303,17 @@ class BaseTrainer:
                 last = Path(check_file(resume) if exists else get_latest_run())
 
                 # Check that resume data YAML exists, otherwise strip to force re-download of dataset
-                ckpt_args = load_checkpoint(last)[0].args
+                _, ckpt = load_checkpoint(last)
+                ckpt_args = {**DEFAULT_CFG_DICT, **ckpt.get("train_args", {})}
                 if not isinstance(ckpt_args["data"], dict) and not Path(ckpt_args["data"]).exists():
                     ckpt_args["data"] = self.args.data
 
                 resume = True
                 self.args = get_cfg(ckpt_args)
+                self._explicit_epoch_limit = ckpt.get("train_meta", {}).get(
+                    "explicit_epoch_limit",
+                    self._explicit_epoch_limit or (bool(ckpt_args.get("time")) and ckpt_args.get("epochs") != DEFAULT_CFG.epochs),
+                )
                 self.args.model = self.args.resume = str(last)  # reinstate model
                 for k in (
                     "imgsz",
