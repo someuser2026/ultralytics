@@ -93,15 +93,31 @@ def _normalize_split_roots(spec: str | list[str] | None) -> list[Path]:
     return roots
 
 
+def _append_split_to_aux_root(spec: str | list[str], split: str) -> str | list[str]:
+    """Append a dataset split name to a base auxiliary-mask root or list of roots."""
+    if isinstance(spec, str):
+        return str(Path(spec) / split)
+    return [str(Path(entry) / split) for entry in spec]
+
+
+def _get_auxiliary_split_spec(spec: Any, split: str) -> str | list[str] | None:
+    """Return a split-specific auxiliary-mask spec from either a root-folder or per-split config."""
+    if spec is None:
+        return None
+    if isinstance(spec, dict):
+        return spec.get(split)
+    return _append_split_to_aux_root(spec, split)
+
+
 def build_auxiliary_root_mappings(data: dict[str, Any]) -> list[dict[str, Path | str | None]]:
     """Build longest-prefix image-root to auxiliary-root mappings from a resolved data dict."""
     mappings = []
-    shoreline_cfg = data.get("shoreline_masks") or {}
-    land_water_cfg = data.get("land_water_masks") or {}
+    shoreline_cfg = data.get("shoreline_masks")
+    land_water_cfg = data.get("land_water_masks")
     for split in AUX_MASK_SPLITS:
         image_roots = _normalize_split_roots(data.get(split))
-        shoreline_roots = _normalize_split_roots(shoreline_cfg.get(split))
-        land_water_roots = _normalize_split_roots(land_water_cfg.get(split))
+        shoreline_roots = _normalize_split_roots(_get_auxiliary_split_spec(shoreline_cfg, split))
+        land_water_roots = _normalize_split_roots(_get_auxiliary_split_spec(land_water_cfg, split))
         if shoreline_roots and len(shoreline_roots) not in {1, len(image_roots)}:
             raise ValueError(
                 f"shoreline_masks.{split} must define either 1 root or {len(image_roots)} roots to match {split}."
@@ -165,9 +181,9 @@ def validate_auxiliary_mask_config(data: dict[str, Any], hyp: Any = None) -> Non
     for split in AUX_MASK_SPLITS:
         if not data.get(split):
             continue
-        if flags["require_shoreline"] and not (data.get("shoreline_masks") or {}).get(split):
+        if flags["require_shoreline"] and not _get_auxiliary_split_spec(data.get("shoreline_masks"), split):
             raise SyntaxError(f"shoreline_masks.{split} is required when shoreline inputs or priors are enabled.")
-        if flags["require_land_water"] and not (data.get("land_water_masks") or {}).get(split):
+        if flags["require_land_water"] and not _get_auxiliary_split_spec(data.get("land_water_masks"), split):
             raise SyntaxError(f"land_water_masks.{split} is required when land/water inputs or priors are enabled.")
     build_auxiliary_root_mappings(data)
 
@@ -566,7 +582,7 @@ def compute_channels(channels, hyp):
     if getattr(hyp, "use_shoreline_input", False):
         orig_channels += 1
     if getattr(hyp, "use_land_water_input", False):
-        orig_channels += 2
+        orig_channels += 1
     return orig_channels
 
 
@@ -631,7 +647,12 @@ def check_det_dataset(dataset: str, autodownload: bool = True, hyp: dict = None)
             data[k] = _resolve_split_entry(path, data[k])
     for k in AUX_MASK_KEYS:
         if data.get(k):
-            data[k] = {split: _resolve_split_entry(path, spec) for split, spec in data[k].items()}
+            spec = data[k]
+            data[k] = {
+                split: _resolve_split_entry(path, split_spec)
+                for split in AUX_MASK_SPLITS
+                if data.get(split) and (split_spec := _get_auxiliary_split_spec(spec, split))
+            }
 
     validate_auxiliary_mask_config(data, hyp)
 

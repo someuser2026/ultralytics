@@ -8,9 +8,10 @@ import numpy as np
 import torch
 
 from tests import TMP
-from ultralytics.data.augment import PrepareAuxiliaryMaskInputs
-from ultralytics.data.utils import build_auxiliary_root_mappings, resolve_auxiliary_mask_paths
+from ultralytics.data.augment import PrepareAuxiliaryMaskInputs, RandomFlip
+from ultralytics.data.utils import build_auxiliary_root_mappings, check_det_dataset, resolve_auxiliary_mask_paths
 from ultralytics.engine.predictor import BasePredictor
+from ultralytics.utils.instance import Instances
 from ultralytics.utils.loss import _compute_obb_spatial_prior_losses
 
 
@@ -23,25 +24,59 @@ def test_auxiliary_mask_path_resolution() -> None:
     """Resolve shoreline and land/water sidecars by mirrored relative path and stem."""
     root = TMP / "obb_aux_paths"
     image_root = root / "images" / "val"
-    shore_root = root / "masks" / "shoreline" / "val"
-    land_root = root / "masks" / "land_water" / "val"
+    shore_root = root / "masks" / "shoreline"
+    land_root = root / "masks" / "land_water"
     image_path = image_root / "nested" / "sample.jpg"
     _write_png(image_path, np.zeros((4, 4, 3), dtype=np.uint8))
 
     data = {
         "val": str(image_root),
-        "shoreline_masks": {"val": str(shore_root)},
-        "land_water_masks": {"val": str(land_root)},
+        "shoreline_masks": str(shore_root),
+        "land_water_masks": str(land_root),
     }
     resolved = resolve_auxiliary_mask_paths(image_path, build_auxiliary_root_mappings(data), True, True)
 
     assert resolved["split"] == "val"
-    assert Path(resolved["shoreline_mask_file"]) == shore_root / "nested" / "sample.png"
-    assert Path(resolved["land_water_mask_file"]) == land_root / "nested" / "sample.png"
+    assert Path(resolved["shoreline_mask_file"]) == shore_root / "val" / "nested" / "sample.png"
+    assert Path(resolved["land_water_mask_file"]) == land_root / "val" / "nested" / "sample.png"
+
+
+def test_check_det_dataset_accepts_auxiliary_root_folders() -> None:
+    """Dataset parsing should expand auxiliary root folders to split-specific paths."""
+    root = TMP / "obb_aux_yaml"
+    (root / "images" / "train").mkdir(parents=True, exist_ok=True)
+    (root / "images" / "val").mkdir(parents=True, exist_ok=True)
+    (root / "masks" / "shoreline" / "train").mkdir(parents=True, exist_ok=True)
+    (root / "masks" / "shoreline" / "val").mkdir(parents=True, exist_ok=True)
+    (root / "masks" / "land_water" / "train").mkdir(parents=True, exist_ok=True)
+    (root / "masks" / "land_water" / "val").mkdir(parents=True, exist_ok=True)
+    data_yaml = root / "data.yaml"
+    data_yaml.write_text(
+        "\n".join(
+            [
+                f"path: {root}",
+                "train: images/train",
+                "val: images/val",
+                "shoreline_masks: masks/shoreline",
+                "land_water_masks: masks/land_water",
+                "names:",
+                "  0: foreground",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    data = check_det_dataset(str(data_yaml), autodownload=False)
+
+    assert Path(data["shoreline_masks"]["train"]) == root / "masks" / "shoreline" / "train"
+    assert Path(data["shoreline_masks"]["val"]) == root / "masks" / "shoreline" / "val"
+    assert Path(data["land_water_masks"]["train"]) == root / "masks" / "land_water" / "train"
+    assert Path(data["land_water_masks"]["val"]) == root / "masks" / "land_water" / "val"
 
 
 def test_prepare_auxiliary_mask_inputs_builds_channels_and_prior_maps() -> None:
-    """Append shoreline and one-hot land/water channels and emit prior-loss tensors."""
+    """Append shoreline plus a single semantic land/water channel and emit prior-loss tensors."""
     transform = PrepareAuxiliaryMaskInputs(
         use_shoreline_input=True,
         use_land_water_input=True,
@@ -63,12 +98,53 @@ def test_prepare_auxiliary_mask_inputs_builds_channels_and_prior_maps() -> None:
         }
     )
 
-    assert labels["img"].shape == (5, 5, 6)
+    assert labels["img"].shape == (5, 5, 5)
+    assert set(np.unique(labels["img"][..., 4]).tolist()) == {0, 128, 255}
     assert torch.equal(labels["land_water_mask"], torch.from_numpy(land_water_mask[None].astype(np.int64)))
     assert labels["shoreline_distance_map"].shape == (1, 5, 5)
     assert labels["shoreline_distance_map"][0, 0, 0].item() == 0.0  # no-data ignored
     assert labels["shoreline_distance_map"][0, 2, 0].item() == 0.0  # land ignored
     assert labels["shoreline_distance_map"][0, 2, 4].item() > 0.0  # water away from shoreline is penalized
+
+
+def test_auxiliary_mask_channels_follow_geometric_augmentation() -> None:
+    """Shoreline and land/water inputs must match the exact geometric transforms applied to the image."""
+    shoreline_mask = np.zeros((4, 6), dtype=np.uint8)
+    shoreline_mask[:, 1] = 1
+    land_water_mask = np.full((4, 6), 2, dtype=np.uint8)
+    land_water_mask[:, :2] = 1
+    land_water_mask[0, 0] = 0
+    encoded_land_water = np.where(land_water_mask == 1, 128, np.where(land_water_mask == 2, 255, 0)).astype(np.uint8)
+
+    img = np.zeros((4, 6, 3), dtype=np.uint8)
+    img[..., 0] = shoreline_mask * 255
+    img[..., 1] = encoded_land_water
+    labels = {
+        "img": img,
+        "instances": Instances(
+            np.zeros((0, 4), dtype=np.float32),
+            np.zeros((0, 1000, 2), dtype=np.float32),
+            bbox_format="xywh",
+            normalized=False,
+        ),
+        "shoreline_mask": shoreline_mask,
+        "land_water_mask": land_water_mask,
+    }
+
+    labels = RandomFlip(p=1.0, direction="horizontal")(labels)
+    expected_shoreline = labels["shoreline_mask"].copy()
+    expected_land_water = np.where(labels["land_water_mask"] == 1, 128, np.where(labels["land_water_mask"] == 2, 255, 0))
+    transformed_img = labels["img"].copy()
+
+    prepared = PrepareAuxiliaryMaskInputs(use_shoreline_input=True, use_land_water_input=True)(labels)
+
+    assert prepared["img"].shape == (4, 6, 5)
+    assert np.array_equal(prepared["img"][..., 3], expected_shoreline * 255)
+    assert np.array_equal(prepared["img"][..., 4], expected_land_water.astype(np.uint8))
+    assert np.array_equal(prepared["img"][..., 0], expected_shoreline * 255)
+    assert np.array_equal(prepared["img"][..., 1], expected_land_water.astype(np.uint8))
+    assert np.array_equal(transformed_img[..., 0], prepared["img"][..., 0])
+    assert np.array_equal(transformed_img[..., 1], prepared["img"][..., 1])
 
 
 def test_spatial_prior_losses_support_land_and_closest_corner_modes() -> None:
@@ -119,11 +195,11 @@ def test_predict_auxiliary_images_append_mask_channels() -> None:
     """Predict helper appends shoreline and land/water channels for file-based OBB sources."""
     root = TMP / "obb_aux_predict"
     image_root = root / "images" / "val"
-    shore_root = root / "masks" / "shoreline" / "val"
-    land_root = root / "masks" / "land_water" / "val"
+    shore_root = root / "masks" / "shoreline"
+    land_root = root / "masks" / "land_water"
     image_path = image_root / "sample.jpg"
-    shoreline_path = shore_root / "sample.png"
-    land_water_path = land_root / "sample.png"
+    shoreline_path = shore_root / "val" / "sample.png"
+    land_water_path = land_root / "val" / "sample.png"
 
     image = np.zeros((8, 8, 3), dtype=np.uint8)
     shoreline = np.zeros((8, 8), dtype=np.uint8)
@@ -140,8 +216,8 @@ def test_predict_auxiliary_images_append_mask_channels() -> None:
     predictor.imgsz = (8, 8)
     predictor.data = {
         "val": str(image_root),
-        "shoreline_masks": {"val": str(shore_root)},
-        "land_water_masks": {"val": str(land_root)},
+        "shoreline_masks": str(shore_root),
+        "land_water_masks": str(land_root),
     }
     predictor.args.use_shoreline_input = True
     predictor.args.use_land_water_input = True
@@ -151,7 +227,7 @@ def test_predict_auxiliary_images_append_mask_channels() -> None:
     predictor._setup_auxiliary_predict_context()
     prepared = predictor._prepare_auxiliary_predict_images([str(image_path)], [image])[0]
 
-    assert prepared.shape == (8, 8, 6)
+    assert prepared.shape == (8, 8, 5)
     assert prepared[..., 3].max() == 255  # shoreline
-    assert prepared[..., 4].max() == 255  # land
-    assert prepared[..., 5].max() == 255  # water
+    assert 128 in np.unique(prepared[..., 4])  # land
+    assert 255 in np.unique(prepared[..., 4])  # water

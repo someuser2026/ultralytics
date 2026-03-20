@@ -1,11 +1,13 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-import yaml
-from pathlib import Path
+import json
 import os
 import shutil
 from copy import deepcopy
+from pathlib import Path
+
 import numpy as np
+import yaml
 from PIL import Image
 # from ultralytics.models.yolo.model import YOLO
 
@@ -384,7 +386,8 @@ def on_train_epoch_end(trainer):
     if trainer.epoch == 1:
         _log_plots(trainer.plots, step=trainer.epoch + 1)
 
-def _get_val_test_dir(data_spec) -> tuple[bool, Path, Path]:
+
+def _get_val_test_dir(data_spec) -> tuple[bool, Path | None, Path | None]:
     """
     Return True iff 'test:' exists in the dataset YAML.
     Handles multiple data specification formats:
@@ -406,14 +409,22 @@ def _get_val_test_dir(data_spec) -> tuple[bool, Path, Path]:
                     # Check if 'test' key exists and is not None/empty
                     test_dir = data_dict.get("test")
                     val_dir = data_dict.get("val")
-                    return test_dir is not None and test_dir != "", Path(data_dict.get("path")) / test_dir, Path(data_dict.get("path")) / val_dir
-        
+                    return (
+                        test_dir is not None and test_dir != "",
+                        Path(data_dict.get("path")) / test_dir if test_dir else None,
+                        Path(data_dict.get("path")) / val_dir if val_dir else None,
+                    )
+
         # Case 2: data_spec is already a dictionary
         elif isinstance(data_spec, dict):
             test_dir = data_spec.get("test")
             val_dir = data_spec.get("val")
-            return test_dir is not None and test_dir != "", Path(data_spec.get("path")) / test_dir, Path(data_spec.get("path")) / val_dir
-        
+            return (
+                test_dir is not None and test_dir != "",
+                Path(data_spec.get("path")) / test_dir if test_dir else None,
+                Path(data_spec.get("path")) / val_dir if val_dir else None,
+            )
+
     except Exception as e:
         # If parsing fails (e.g., custom YAML loader, encoding issues),
         # return True optimistically and let Ultralytics validator handle it
@@ -422,16 +433,86 @@ def _get_val_test_dir(data_spec) -> tuple[bool, Path, Path]:
     
     # Optimistic default: if we can't determine, assume test exists
     # This prevents skipping test eval when it might be available
-    return False
+    return False, None, None
+
+
+def _prediction_task_name(result) -> str:
+    """Infer the prediction task name from a Results object."""
+    if result.obb is not None:
+        return "obb"
+    if result.probs is not None:
+        return "classify"
+    if result.keypoints is not None:
+        return "pose"
+    if result.masks is not None:
+        return "segment"
+    return "detect"
+
+
+def _prediction_json_payload(result) -> dict:
+    """Build a serializable per-image prediction payload."""
+    return {
+        "image_path": str(result.path),
+        "image_name": Path(result.path).name,
+        "task": _prediction_task_name(result),
+        "orig_shape": {"height": int(result.orig_shape[0]), "width": int(result.orig_shape[1])},
+        "speed_ms": {k: None if v is None else float(v) for k, v in result.speed.items()},
+        "predictions": result.summary(normalize=True),
+    }
+
+
+def _prediction_json_path(output_dir: Path, result, source_root: Path | None, index: int) -> Path:
+    """Create a stable JSON path for one prediction result."""
+    source_path = Path(result.path)
+    if source_root is not None:
+        try:
+            relative_path = source_path.resolve().relative_to(source_root.resolve())
+            return output_dir / relative_path.with_suffix(".json")
+        except Exception:
+            pass
+
+    candidate = output_dir / source_path.with_suffix(".json").name
+    if candidate.exists():
+        return output_dir / f"{source_path.stem}_{index:06d}.json"
+    return candidate
+
+
+def _save_predictions_json(results, output_dir, source_root=None) -> Path:
+    """Save prediction summaries as per-image JSON files plus a split manifest."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_root = Path(source_root) if source_root is not None else None
+    manifest = []
+
+    for index, result in enumerate(results):
+        json_path = _prediction_json_path(output_dir, result, source_root, index)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = _prediction_json_payload(result)
+        payload["json_file"] = str(json_path.relative_to(output_dir))
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        manifest.append(
+            {
+                "json_file": payload["json_file"],
+                "image_path": payload["image_path"],
+                "task": payload["task"],
+                "num_predictions": len(payload["predictions"]),
+            }
+        )
+
+    with open(output_dir / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump({"count": len(manifest), "predictions": manifest}, f, indent=2)
+
+    return output_dir
 
 def _log_predictions(pred_dir, run_name, subset):
     pred_dir = Path(pred_dir)
     if not pred_dir.exists():
-        LOGGER.warning(f"Skipping W&B upload; labels directory does not exist: {pred_dir}")
+        LOGGER.warning(f"Skipping W&B upload; predictions directory does not exist: {pred_dir}")
         return False
 
     try:
-        LOGGER.info(f"Logging {subset} labels from {pred_dir} to wandb")
+        LOGGER.info(f"Logging {subset} predictions from {pred_dir} to wandb")
         artifact = wb.Artifact(run_name + "_predictions_" + subset, type="predictions_" + subset)
         artifact.add_dir(str(pred_dir))
         logged_artifact = wb.log_artifact(artifact)
@@ -446,10 +527,10 @@ def _log_predictions(pred_dir, run_name, subset):
         except OSError:
             pass
 
-        LOGGER.info(f"Uploaded {subset} labels to wandb and removed local directory: {pred_dir}")
+        LOGGER.info(f"Uploaded {subset} predictions to wandb and removed local directory: {pred_dir}")
         return True
     except Exception as e:
-        LOGGER.warning(f"Failed to upload {subset} labels to wandb. Keeping local directory {pred_dir}. Error: {e}")
+        LOGGER.warning(f"Failed to upload {subset} predictions to wandb. Keeping local directory {pred_dir}. Error: {e}")
         return False
 
 
@@ -499,13 +580,15 @@ def on_train_end(trainer):
             LOGGER.info("Best checkpoint not found; using current model for test evaluation.")
             best_model = trainer.model
         
-        # prediction on val set
-        list(best_model.predict(val_dir, True, save_conf = True,
-            save_txt = True, conf = 0.01, project = trainer.args.project, name = os.path.join(trainer.args.name, "labels", "val")
-        ))
-        labels_dir = Path(trainer.args.project) / trainer.args.name / "labels"
-        val_labels = labels_dir / "val"
-        _log_predictions(val_labels, trainer.args.name, "val")
+        predictions_dir = Path(trainer.args.project) / trainer.args.name / "predictions"
+
+        if val_dir is not None:
+            val_predictions = predictions_dir / "val"
+            val_results = list(best_model.predict(val_dir, True, conf=0.01))
+            _save_predictions_json(val_results, val_predictions, source_root=val_dir)
+            _log_predictions(val_predictions, trainer.args.name, "val")
+        else:
+            LOGGER.info("No 'val' split found in data.yaml; skipping val prediction artifact export.")
 
         if not has_test:
             LOGGER.info("No 'test' split in data.yaml; skipping test evaluation.")
@@ -539,16 +622,16 @@ def on_train_end(trainer):
                 if "metrics/mAP50-95(B)" in test_results.results_dict:
                     map_value = test_results.results_dict["metrics/mAP50-95(B)"]
                     LOGGER.info(f"Test evaluation complete. mAP50-95: {map_value:.4f}")
-
-                # store predictions on val and test set for downstream processing
-                list(best_model.predict(test_dir, True, conf = 0.01, save_conf = True,
-                    save_txt = True, batch = 2, project = trainer.args.project, name = os.path.join(trainer.args.name, "labels", "test")
-                ))
-                test_labels = labels_dir / "test"
-                if test_labels.exists():
-                    _log_predictions(test_labels, trainer.args.name, "test")
             else:
                 LOGGER.info("Test results object missing 'results_dict' attribute.")
+
+            if test_dir is not None:
+                test_predictions = predictions_dir / "test"
+                prediction_results = list(best_model.predict(test_dir, True, conf=0.01, batch=2))
+                _save_predictions_json(prediction_results, test_predictions, source_root=test_dir)
+                _log_predictions(test_predictions, trainer.args.name, "test")
+            else:
+                LOGGER.info("No 'test' path found in data.yaml; skipping test prediction artifact export.")
 
     except Exception as e:
         # Log detailed error information

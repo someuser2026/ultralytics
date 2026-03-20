@@ -177,7 +177,7 @@ class BaseDataset(Dataset):
         if getattr(hyp, "use_shoreline_input", False):
             orig_channels += 1
         if getattr(hyp, "use_land_water_input", False):
-            orig_channels += 2
+            orig_channels += 1
         return orig_channels
         # if getattr(hyp, "sobel_p", False):
         #     orig_channels += 2

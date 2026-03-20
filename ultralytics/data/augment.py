@@ -3754,6 +3754,11 @@ class PrepareAuxiliaryMaskInputs:
     def _build_binary_channel(mask: np.ndarray) -> np.ndarray:
         return (_ensure_mask_2d(mask) > 0).astype(np.uint8) * 255
 
+    @staticmethod
+    def _build_land_water_channel(mask: np.ndarray) -> np.ndarray:
+        mask = _ensure_mask_2d(mask)
+        return np.where(mask == 1, 128, np.where(mask == 2, 255, 0)).astype(np.uint8)
+
     def _build_shoreline_distance_map(self, shoreline_mask: np.ndarray, land_water_mask: np.ndarray) -> np.ndarray:
         shoreline_mask = (_ensure_mask_2d(shoreline_mask) > 0).astype(np.uint8)
         land_water_mask = _ensure_mask_2d(land_water_mask).astype(np.uint8)
@@ -3796,8 +3801,7 @@ class PrepareAuxiliaryMaskInputs:
         if self.use_shoreline_input and shoreline_mask is not None:
             img = self._append_channel(img, self._build_binary_channel(shoreline_mask))
         if self.use_land_water_input and land_water_mask is not None:
-            img = self._append_channel(img, ((land_water_mask == 1).astype(np.uint8) * 255))
-            img = self._append_channel(img, ((land_water_mask == 2).astype(np.uint8) * 255))
+            img = self._append_channel(img, self._build_land_water_channel(land_water_mask))
         labels["img"] = img
 
         if self.use_land_water_prior_loss or self.use_shoreline_prior_loss:
