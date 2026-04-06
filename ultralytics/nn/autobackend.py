@@ -214,6 +214,7 @@ class AutoBackend(nn.Module):
             names = model.module.names if hasattr(model, "module") else model.names  # get class names
             model.half() if fp16 else model.float()
             ch = model.yaml.get("channels", 3)
+            task = getattr(model, "task", None) or getattr(getattr(model, "module", None), "task", None) or task
             for p in model.parameters():
                 p.requires_grad = False
             self.model = model  # explicitly assign for to(), cpu(), cuda(), half()
