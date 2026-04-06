@@ -1805,7 +1805,8 @@ class RotatedFCOSLoss:
         target_scores = flatten_cls_scores.new_zeros((batch_size, flatten_cls_scores.shape[1], self.nc))
         if fg_mask.any():
             batch_inds, point_inds = fg_mask.nonzero(as_tuple=True)
-            target_scores[batch_inds, point_inds, target_labels[fg_mask]] = target_probs[fg_mask, 0].to(dtype)
+            pos_target_probs = target_probs.squeeze(-1)[fg_mask].to(dtype)
+            target_scores[batch_inds, point_inds, target_labels[fg_mask]] = pos_target_probs
         loss[1] = self.loss_cls(flatten_cls_scores.reshape(-1, self.nc), target_scores.reshape(-1, self.nc)) / num_pos
 
         if fg_mask.any():
