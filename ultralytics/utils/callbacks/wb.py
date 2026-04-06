@@ -454,6 +454,7 @@ def _prediction_json_payload(result) -> dict:
     return {
         "image_path": str(result.path),
         "image_name": Path(result.path).name,
+        "image_stem": Path(result.path).stem,
         "task": _prediction_task_name(result),
         "orig_shape": {"height": int(result.orig_shape[0]), "width": int(result.orig_shape[1])},
         "speed_ms": {k: None if v is None else float(v) for k, v in result.speed.items()},
@@ -461,47 +462,41 @@ def _prediction_json_payload(result) -> dict:
     }
 
 
-def _prediction_json_path(output_dir: Path, result, source_root: Path | None, index: int) -> Path:
-    """Create a stable JSON path for one prediction result."""
+def _prediction_result_key(result, source_root: Path | None, index: int, used_keys: set[str]) -> str:
+    """Create a stable key for one prediction result inside the aggregate JSON payload."""
     source_path = Path(result.path)
     if source_root is not None:
         try:
             relative_path = source_path.resolve().relative_to(source_root.resolve())
-            return output_dir / relative_path.with_suffix(".json")
+            key = relative_path.with_suffix("").as_posix()
         except Exception:
-            pass
+            key = source_path.stem
+    else:
+        key = source_path.stem
 
-    candidate = output_dir / source_path.with_suffix(".json").name
-    if candidate.exists():
-        return output_dir / f"{source_path.stem}_{index:06d}.json"
-    return candidate
+    if key in used_keys:
+        key = f"{key}_{index:06d}"
+
+    used_keys.add(key)
+    return key
 
 
 def _save_predictions_json(results, output_dir, source_root=None) -> Path:
-    """Save prediction summaries as per-image JSON files plus a split manifest."""
+    """Save prediction summaries as one aggregate JSON file for the entire split."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     source_root = Path(source_root) if source_root is not None else None
-    manifest = []
+    used_keys = set()
+    payload = {"count": 0, "predictions": {}}
 
     for index, result in enumerate(results):
-        json_path = _prediction_json_path(output_dir, result, source_root, index)
-        json_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = _prediction_json_payload(result)
-        payload["json_file"] = str(json_path.relative_to(output_dir))
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        manifest.append(
-            {
-                "json_file": payload["json_file"],
-                "image_path": payload["image_path"],
-                "task": payload["task"],
-                "num_predictions": len(payload["predictions"]),
-            }
-        )
+        key = _prediction_result_key(result, source_root, index, used_keys)
+        payload["predictions"][key] = _prediction_json_payload(result)
 
-    with open(output_dir / "manifest.json", "w", encoding="utf-8") as f:
-        json.dump({"count": len(manifest), "predictions": manifest}, f, indent=2)
+    payload["count"] = len(payload["predictions"])
+
+    with open(output_dir / "predictions.json", "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
 
     return output_dir
 

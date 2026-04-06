@@ -2207,28 +2207,35 @@ class Albumentations:
         if not self.allow_multi_channel:
             return labels
         orig_dtype = im.dtype
+        aux_mask_keys = [key for key in AUXILIARY_MASK_KEYS if labels.get(key) is not None]
+        aux_masks = [labels[key] for key in aux_mask_keys]
 
         if self.contains_spatial:
             cls = labels["cls"]
             cls_probs = labels.get("cls_probs", np.ones((len(cls), 1), dtype=np.float32))
-            if len(cls):
+            if len(cls) or aux_masks:
                 labels["instances"].convert_bbox("xywh")
                 labels["instances"].normalize(*im.shape[:2][::-1])
                 bboxes = labels["instances"].bboxes
                 # TODO: add supports of segments and keypoints
                 class_labels = np.asarray(cls).reshape(-1).tolist()
                 prob_labels = np.asarray(cls_probs).reshape(-1).tolist()
-                new = self.transform(
+                transform_inputs = dict(
                     image=im,
                     bboxes=bboxes,
                     class_labels=class_labels,
                     cls_probs=prob_labels,
-                )  # transformed
-                if len(new["class_labels"]) > 0:  # skip update if no bbox in new im
+                )
+                if aux_masks:
+                    transform_inputs["masks"] = aux_masks
+                new = self.transform(**transform_inputs)  # transformed
+                if len(new["class_labels"]) > 0 or (not len(cls) and aux_masks):
                     labels["img"] = new["image"]
                     labels["cls"] = np.asarray(new["class_labels"], dtype=np.float32).reshape(-1, 1)
                     labels["cls_probs"] = np.asarray(new["cls_probs"], dtype=np.float32).reshape(-1, 1)
                     bboxes = np.array(new["bboxes"], dtype=np.float32)
+                    for key, mask in zip(aux_mask_keys, new.get("masks", ())):
+                        labels[key] = _ensure_mask_2d(mask).astype(labels[key].dtype, copy=False)
                 labels["instances"].update(bboxes=bboxes)
         else:
             labels["img"] = self.transform(image=labels["img"])["image"].astype(orig_dtype)  # transformed
