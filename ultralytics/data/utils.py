@@ -155,7 +155,16 @@ def resolve_auxiliary_mask_paths(
         try:
             rel = image_path.relative_to(image_root)
         except ValueError:
-            continue
+            # Support datasets that store split images as symlinks while image verification/cache resolves each image
+            # to its underlying target path. If the split root contains a symlink with the same basename that points to
+            # the resolved image file, use that split-relative name to resolve the auxiliary masks.
+            symlink_candidate = image_root / image_path.name
+            try:
+                if not symlink_candidate.exists() or symlink_candidate.resolve() != image_path:
+                    continue
+            except OSError:
+                continue
+            rel = symlink_candidate.relative_to(image_root)
         out = {"split": mapping["split"], "shoreline_mask_file": None, "land_water_mask_file": None}
         if mapping["shoreline_root"] is not None:
             out["shoreline_mask_file"] = str((Path(mapping["shoreline_root"]) / rel).with_suffix(".png"))
