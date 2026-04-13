@@ -1,0 +1,38 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# LEGNet-small Rotated FCOS small-object model with P2/4 - P6/64 outputs
+
+nc: 80
+angle_mode: le90
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, LWEGNet, [64, [1, 4, 4, 2], 2.0, 0.1]] # 0 -> [P2, P3, P4, P5]
+
+head:
+  - [0, 1, Index, [0]] # 1-P2/4
+  - [0, 1, Index, [1]] # 2-P3/8
+  - [0, 1, Index, [2]] # 3-P4/16
+  - [0, 1, Index, [3]] # 4-P5/32
+
+  - [[1, 2, 3, 4], 1, FPN, [256, {num_outs: 5, add_extra_convs: "on_output", relu_before_extra_convs: true}]] # 5
+
+  - [5, 1, Index, [0]] # 6-P2/4
+  - [5, 1, Index, [1]] # 7-P3/8
+  - [5, 1, Index, [2]] # 8-P4/16
+  - [5, 1, Index, [3]] # 9-P5/32
+  - [5, 1, Index, [4]] # 10-P6/64
+
+  - [[6, 7, 8, 9, 10], 1, RotatedFCOS, [
+      nc,
+      {
+        strides: [4, 8, 16, 32, 64],
+        regress_ranges: [[-1, 32], [32, 64], [64, 128], [128, 256], [256, 100000000.0]],
+        center_sampling: true,
+        center_sample_radius: 1.5,
+        norm_on_bbox: true,
+        centerness_on_reg: true,
+        scale_angle: true,
+        bbox_loss_type: rotated_iou
+      }
+    ]] # 11

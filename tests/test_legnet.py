@@ -9,6 +9,7 @@ LEGNET_MODELS = {
     "legnet-small-seg.yaml": ("Segment", 3),
     "legnet-small-obb.yaml": ("OBB", 3),
     "legnet-small-fcos.yaml": ("RotatedFCOS", 5),
+    "legnet-small-fcos-smallobj.yaml": ("RotatedFCOS", 5),
 }
 LEGNET_ROOT = Path(__file__).resolve().parents[1] / "ultralytics" / "cfg" / "models" / "legnet"
 LEGNET_TEST_READY = find_spec("cv2") is not None and find_spec("torch") is not None
