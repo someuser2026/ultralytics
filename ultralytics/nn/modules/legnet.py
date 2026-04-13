@@ -8,25 +8,11 @@ from typing import Iterable
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
 
 from .block import DropPath
 
 __all__ = ("LWEGNet",)
-
-
-class FrozenDepthwiseConv2d(nn.Module):
-    """Depthwise convolution backed by a non-trainable kernel buffer."""
-
-    def __init__(self, channels: int, kernel: Tensor, padding: int) -> None:
-        super().__init__()
-        self.channels = channels
-        self.padding = padding
-        self.register_buffer("weight", kernel.repeat(channels, 1, 1, 1))
-
-    def forward(self, x: Tensor) -> Tensor:
-        return F.conv2d(x, self.weight.to(dtype=x.dtype), padding=self.padding, groups=self.channels)
 
 
 def _gaussian_kernel(size: int, sigma: float) -> Tensor:
@@ -58,6 +44,21 @@ def _log_kernel(size: int, sigma: float) -> Tensor:
     return kernel.unsqueeze(0).unsqueeze(0)
 
 
+def _depthwise_conv2d(channels: int, kernel: Tensor, padding: int) -> nn.Conv2d:
+    """Create a trainable depthwise convolution initialized from an analytic kernel."""
+    conv = nn.Conv2d(
+        channels,
+        channels,
+        kernel_size=tuple(kernel.shape[-2:]),
+        padding=padding,
+        groups=channels,
+        bias=False,
+    )
+    with torch.no_grad():
+        conv.weight.copy_(kernel.repeat(channels, 1, 1, 1))
+    return conv
+
+
 class ConvExtra(nn.Module):
     def __init__(self, channels: int, act_layer: type[nn.Module]) -> None:
         super().__init__()
@@ -86,7 +87,7 @@ class Gaussian(nn.Module):
         feature_extra: bool = True,
     ) -> None:
         super().__init__()
-        self.gaussian = FrozenDepthwiseConv2d(channels, _gaussian_kernel(size, sigma), padding=size // 2)
+        self.gaussian = _depthwise_conv2d(channels, _gaussian_kernel(size, sigma), padding=size // 2)
         self.norm = nn.BatchNorm2d(channels)
         self.act = act_layer()
         self.conv_extra = ConvExtra(channels, act_layer) if feature_extra else None
@@ -103,8 +104,8 @@ class Scharr(nn.Module):
         super().__init__()
         scharr_x = torch.tensor([[-3.0, 0.0, 3.0], [-10.0, 0.0, 10.0], [-3.0, 0.0, 3.0]], dtype=torch.float32)
         scharr_y = torch.tensor([[-3.0, -10.0, -3.0], [0.0, 0.0, 0.0], [3.0, 10.0, 3.0]], dtype=torch.float32)
-        self.conv_x = FrozenDepthwiseConv2d(channels, scharr_x.unsqueeze(0).unsqueeze(0), padding=1)
-        self.conv_y = FrozenDepthwiseConv2d(channels, scharr_y.unsqueeze(0).unsqueeze(0), padding=1)
+        self.conv_x = _depthwise_conv2d(channels, scharr_x.unsqueeze(0).unsqueeze(0), padding=1)
+        self.conv_y = _depthwise_conv2d(channels, scharr_y.unsqueeze(0).unsqueeze(0), padding=1)
         self.norm = nn.BatchNorm2d(channels)
         self.act = act_layer()
         self.conv_extra = ConvExtra(channels, act_layer)
@@ -112,7 +113,7 @@ class Scharr(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         edges_x = self.conv_x(x)
         edges_y = self.conv_y(x)
-        scharr_edge = torch.sqrt(edges_x.pow(2) + edges_y.pow(2) + 1e-6)
+        scharr_edge = torch.sqrt(edges_x.pow(2) + edges_y.pow(2))
         scharr_edge = self.act(self.norm(scharr_edge))
         return self.conv_extra(x + scharr_edge)
 
@@ -191,7 +192,7 @@ class LoGFilter(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int, sigma: float, act_layer: type[nn.Module]) -> None:
         super().__init__()
         self.conv_init = nn.Conv2d(in_channels, out_channels, kernel_size=7, stride=1, padding=3)
-        self.log = FrozenDepthwiseConv2d(out_channels, _log_kernel(kernel_size, sigma), padding=kernel_size // 2)
+        self.log = _depthwise_conv2d(out_channels, _log_kernel(kernel_size, sigma), padding=kernel_size // 2)
         self.act = act_layer()
         self.norm1 = nn.BatchNorm2d(out_channels)
         self.norm2 = nn.BatchNorm2d(out_channels)

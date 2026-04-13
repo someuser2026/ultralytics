@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# submodules
+/LEGNet
+
 # C extensions
 *.so
 

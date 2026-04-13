@@ -1,0 +1,62 @@
+# number of classes
+nc: 1
+stride: 224
+# backbone
+backbone:
+  - [-1, 1, Timm, ['deit_small_patch16_224.fb_in1k', False, 3, True, [0, 1, 2, 3], 28, null, 'auto', False, False, True, False]]  # Layer 0: Timm backbone (x16)
+
+head:
+  # -------- ViT taps (all ~14x14 at 224 input) --------
+  - [0, 1, Index, [7]]       # Layer 1: f7
+  - [0, 1, Index, [12]]      # Layer 2: f12
+  - [0, 1, Index, [17]]      # Layer 3: f17
+  - [0, 1, Index, [22]]      # Layer 4: f22
+
+  # -------- Lateral 1x1 (unify channels) --------
+  - [1, 1, Conv, [256, 1, 1]]   # Layer 5: f7_l  (14x14)
+  - [2, 1, Conv, [256, 1, 1]]   # Layer 6: f12_l (14x14)
+  - [3, 1, Conv, [256, 1, 1]]   # Layer 7: f17_l (14x14)
+  - [4, 1, Conv, [256, 1, 1]]   # Layer 8: f22_l (14x14)
+
+  # -------- Same-res fusion at 14x14 (no up/down before concat) --------
+  - [-1, 1, SPPF, [256, 5]]      # Layer 9: ctx(f22_l) at 14x14
+  - [[-1, 7], 1, Concat, [1]]    # Layer 10: [f22_ctx, f17_l]
+  - [-1, 1, C2f, [256, True]]   # Layer 11
+  - [[-1, 6], 1, Concat, [1]]   # Layer 12: + f12_l
+  - [-1, 1, C2f, [256, True]]   # Layer 13
+  - [[-1, 5], 1, Concat, [1]]   # Layer 14: + f7_l
+  - [-1, 1, C2f, [256, True]]   # Layer 15: F14 (fused 14x14 feature)  ← base “P3”
+
+  # -------- Build the pyramid from F14 --------
+  # P2 (28x28): nn.Upsample after fusion
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]  # Layer 16: up(F14) → 28x28
+  - [-1, 1, C2f, [256, True]]                  # Layer 17: P2
+  - [-1, 1, nn.Dropout2d, [0.15]]              # Layer 18
+
+  # P4 (7x7) and P5 (~4x4): downsample from F14
+  - [15, 1, Conv, [256, 3, 2]]                 # Layer 19: 7x7
+  - [-1, 1, C2f, [256, True]]                  # Layer 20: P4
+  - [-1, 1, nn.Dropout2d, [0.15]]              # Layer 21
+  - [-1, 1, Conv, [256, 3, 2]]                 # Layer 22: ~4x4
+  - [-1, 1, C2f, [256, True]]                  # Layer 23: P5
+  - [-1, 1, nn.Dropout2d, [0.15]]              # Layer 24
+
+  # -------- Bottom-up PAN (P2→N3→N4→N5) --------
+  - [18, 1, Conv, [256, 3, 2]]                 # Layer 25: down(P2) 28→14
+  - [[-1, 15], 1, Concat, [1]]                 # Layer 26: match 14x14 with F14
+  - [-1, 1, C2f, [256, True]]                  # Layer 27: N3 (14x14)
+  - [-1, 1, nn.Dropout2d, [0.15]]              # Layer 28
+
+  - [-1, 1, Conv, [256, 3, 2]]                 # Layer 29: 14→7
+  - [[-1, 21], 1, Concat, [1]]                 # Layer 30: with P4 (7x7)
+  - [-1, 1, C2f, [256, True]]                  # Layer 31: N4 (7x7)
+  - [-1, 1, nn.Dropout2d, [0.15]]              # Layer 32
+
+  - [-1, 1, Conv, [256, 3, 2]]                 # Layer 33: 7→~4
+  - [[-1, 24], 1, Concat, [1]]                 # Layer 34: with P5 (~4x4)
+  - [-1, 1, C2f, [256, True]]                  # Layer 35: N5 (~4x4)
+  - [-1, 1, nn.Dropout2d, [0.15]]              # Layer 36
+
+  # -------- Segmentation head (balanced choice) --------
+  # Use one high-res + two coarse scales:
+  - [[18, 32, 36], 1, Segment, [nc, 32, 256]]  # Layer 37: P2 (28×28), N4 (7×7), N5 (~4×4)

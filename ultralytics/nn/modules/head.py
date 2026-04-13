@@ -422,7 +422,7 @@ class RotatedFCOS(Detect):
         self.norm_on_bbox = bool(cfg.get("norm_on_bbox", False))
         self.centerness_on_reg = bool(cfg.get("centerness_on_reg", False))
         self.scale_angle = bool(cfg.get("scale_angle", True))
-        self.bbox_loss_type = str(cfg.get("bbox_loss_type", "probiou"))
+        self.bbox_loss_type = str(cfg.get("bbox_loss_type", "rotated_iou"))
         self.angle_mode = str(cfg.get("angle_mode", "oc"))
 
         c1 = ch[0]

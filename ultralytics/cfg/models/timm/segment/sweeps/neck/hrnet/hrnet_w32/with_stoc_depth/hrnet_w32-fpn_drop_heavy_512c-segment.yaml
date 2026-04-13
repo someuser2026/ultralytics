@@ -1,0 +1,57 @@
+# number of classes
+nc: 1
+stride: 224
+
+# backbone
+backbone:
+  - [-1, 1, Timm, ['hrnet_w32', False, 3, True, [0, 1, 2, 3], 28, null, 'auto', False, False, True, False, 0.05]]  # Layer 0: Timm backbone (x16)
+
+head:
+  # Extract features from Timm backbone
+  - [0, 1, Index, [0]]                                       # Layer 1: Backbone Layer 0 (x4)
+  - [0, 1, Index, [1]]                                       # Layer 2: Backbone Layer 1 (x8)
+  - [0, 1, Index, [2]]                                       # Layer 3: Backbone Layer 2 (x16)
+  - [0, 1, Index, [3]]                                       # Layer 4: Backbone Layer 3 (x32)
+
+  # --------------------------------------------------------------------------
+  # Step 2: Apply PAFPN Neck (replaces your manual TD+BU paths)
+  # --------------------------------------------------------------------------
+  # Original config has:
+  # - Top-down: P5→P4→P3→P2 with concat fusion + C2f
+  # - Bottom-up: P2→P3→P4→P5 with concat fusion + C2f
+  # - Output channels: [192, 384, 768, 768] at scales [x4, x8, x16, x32]
+  
+  # Heavy dropout
+  - [[2, 3, 4], 1, FPN, [512, {
+      normalize_channels: true,
+      fusion: 'add',
+      attn_cfg: {per_level: null, after_fuse: null},
+      conv_cfg: {groups: 1, dilation: 1, dcn: {default: false}},
+      drop_td: 0.2,
+      drop_bu: 0.25
+  }]]
+
+    # Layer 5: PAFPN outputs 4 levels, but we need different channels per level
+    # Output: [256, 256, 256, 256] @ [x4, x8, x16, x32]
+  
+  # --------------------------------------------------------------------------
+  # Step 3: Adjust channels to match original [192, 384, 768, 768]
+  # --------------------------------------------------------------------------
+  # Extract each PAFPN level and adjust channels
+  # - [5, 1, Index, [0]]            # Layer 6: P2_fpn (256ch @ x4)
+  # - [-1, 1, Conv, [192, 1, 1]]    # Layer 7: P2_out (192ch @ x4) - matches Layer 15
+  
+  - [5, 1, Index, [0]]            # Layer 8: P3_fpn (256ch @ x8)
+  # - [-1, 1, Conv, [384, 1, 1]]    # Layer 9: P3_out (384ch @ x8) - matches Layer 18
+  
+  - [5, 1, Index, [1]]            # Layer 10: P4_fpn (256ch @ x16)
+  # - [-1, 1, Conv, [768, 1, 1]]    # Layer 11: P4_out (768ch @ x16) - matches Layer 21
+  
+  - [5, 1, Index, [2]]            # Layer 12: P5_fpn (256ch @ x32)
+  # - [-1, 1, Conv, [768, 1, 1]]    # Layer 13: P5_out (768ch @ x32) - matches Layer 24
+
+  # --------------------------------------------------------------------------
+  # Step 4: Segmentation Head (using 3 scales)
+  # --------------------------------------------------------------------------
+  - [[6, 7, 8], 1, Segment, [nc, 32, 256]]
+

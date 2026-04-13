@@ -1,0 +1,67 @@
+# number of classes
+nc: 1
+stride: 224
+# backbone
+backbone:
+  - [-1, 1, Timm, ['efficientnet_b1.ft_in1k', False, 3, True, [0, 1, 2, 3], 28, null, 'auto', False, False, True, False, 0.0]]  # Layer 0: Timm backbone (x16)
+
+head:
+  # Extract features from Timm backbone
+  - [0, 1, Index, [0]]                                       # Layer 1: Backbone Layer 0 (x4)
+  - [0, 1, Index, [1]]                                       # Layer 2: Backbone Layer 1 (x8)
+  - [0, 1, Index, [2]]                                       # Layer 3: Backbone Layer 2 (x16)
+  - [0, 1, Index, [3]]                                       # Layer 4: Backbone Layer 3 (x32)
+
+  # --------------------------------------------------------------------------
+  # Step 2: Apply PANet Neck (replaces your manual TD+BU paths)
+  # --------------------------------------------------------------------------
+  # Original config has:
+  # - Top-down: P5→P4→P3→P2 with concat fusion + C2f
+  # - Bottom-up: P2→P3→P4→P5 with concat fusion + C2f
+  # - Output channels: [192, 384, 768, 768] at scales [x4, x8, x16, x32]
+  
+  # --- Neck definition ---
+  - [[1, 2, 3, 4], 1, PANet, [256, {
+        normalize_channels: true,           # Align backbone channels to 256 via 1x1 convs
+        fusion: adapool,                     # Use concat fusion in both TD and BU paths
+        drop_td: 0.0,                      # 10% dropout in top-down path
+        drop_bu: 0.0,                      # 15% dropout in bottom-up path
+        attn_cfg: {                         # Optional attention modules
+          per_level: null,                   # Apply ECA after channel alignment (per level)
+          after_fuse: null                 # Apply Coordinate Attention after fusion
+        },
+        conv_cfg: {                         # Per-role deformable conv control
+          groups: 1,                        # Grouped convs (1 = standard)
+          dilation: 1,                      # No dilation
+          dcn: {
+            default: false,                 # All others use standard conv
+            smooth_td: [0, 0, 0, 0],        # Use DCN in top-down smoothing for first 2 levels
+            down_bu: [0, 0, 0],             # DCN only in 2nd bottom-up downsample
+            smooth_bu: [0, 0, 0]            # DCN in final bottom-up smoothing
+          }
+        }
+  }]]
+
+    # Layer 5: PANet outputs 4 levels, but we need different channels per level
+    # Output: [256, 256, 256, 256] @ [x4, x8, x16, x32]
+  
+  # --------------------------------------------------------------------------
+  # Step 3: Adjust channels to match original [192, 384, 768, 768]
+  # --------------------------------------------------------------------------
+  # Extract each PANet level and adjust channels
+  - [5, 1, Index, [0]]            # Layer 6: P2_fpn (256ch @ x4)
+  # - [-1, 1, Conv, [192, 1, 1]]    # Layer 7: P2_out (192ch @ x4) - matches Layer 15
+  
+  - [5, 1, Index, [1]]            # Layer 8: P3_fpn (256ch @ x8)
+  # - [-1, 1, Conv, [384, 1, 1]]    # Layer 9: P3_out (384ch @ x8) - matches Layer 18
+  
+  - [5, 1, Index, [2]]            # Layer 10: P4_fpn (256ch @ x16)
+  # - [-1, 1, Conv, [768, 1, 1]]    # Layer 11: P4_out (768ch @ x16) - matches Layer 21
+  
+  - [5, 1, Index, [3]]            # Layer 12: P5_fpn (256ch @ x32)
+  # - [-1, 1, Conv, [768, 1, 1]]    # Layer 13: P5_out (768ch @ x32) - matches Layer 24
+
+  # --------------------------------------------------------------------------
+  # Step 4: Segmentation Head (using 3 scales)
+  # --------------------------------------------------------------------------
+  - [[7, 8, 9], 1, Segment, [nc, 32, 256]]

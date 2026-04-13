@@ -1,0 +1,48 @@
+# number of classes
+nc: 1
+stride: 224
+# backbone
+backbone:
+  - [-1, 1, Timm, ['swin_tiny_patch4_window7_224.ms_in22k', False, 3, True, [0, 1, 2, 3], 28, null, 'auto', False, False, True, False]]  # Layer 0: Timm backbone (x16)
+
+head:
+  # Extract features from Timm backbone
+  - [0, 1, Index, [0]]                                       # Layer 1: Backbone Layer 0 (x4)
+  - [0, 1, Index, [1]]                                       # Layer 2: Backbone Layer 1 (x8)
+  - [0, 1, Index, [2]]                                       # Layer 3: Backbone Layer 2 (x16)
+  - [0, 1, Index, [3]]                                       # Layer 4: Backbone Layer 3 (x32)
+
+  - [1, 1, torchvision.ops.Permute, [[0, 3, 1, 2]]]          # Layer 5: Convert (B,H,W,C) to (B,C,H,W)
+  - [2, 1, torchvision.ops.Permute, [[0, 3, 1, 2]]]          # Layer 6: Convert (B,H,W,C) to (B,C,H,W)
+  - [3, 1, torchvision.ops.Permute, [[0, 3, 1, 2]]]          # Layer 7: Convert (B,H,W,C) to (B,C,H,W)
+  - [4, 1, torchvision.ops.Permute, [[0, 3, 1, 2]]]          # Layer 8: Convert (B,H,W,C) to (B,C,H,W)
+
+  - [-1, 1, nn.Upsample,        [None, 2, "nearest"]]        # Layer 9: Upsample by 2x (from 32x to 16x)
+  - [[-1, 7], 1, Concat,        [1]]                        # Layer 10: Concatenate Layer 9 (16x) and Backbone Layer 3 (16x)
+  # - [-1, 1, DeformableConv2d,   [768, 3, 1, 1, 1, 4, True, False]]  # Layer 11: Deformable Conv2d with 768 channels
+  - [-1, 1, nn.Identity, []]                                # Layer 11: Identity layer
+  - [-1, 1, C2f,                [768]]                      # Layer 12: C2f module with 768 channels (16x)
+
+  - [-1, 1, nn.Upsample,        [None, 2, "nearest"]]        # Layer 13: Upsample by 2x (from 16x to 8x)
+  - [[-1, 6], 1, Concat,        [1]]                        # Layer 14: Concatenate Layer 13 (8x) and Backbone Layer 2 (8x)
+  # - [-1, 1, DeformableConv2d,   [384, 3, 1, 1, 1, 4, True, False]]   # Layer 15: Deformable Conv2d with 384 channels
+  - [-1, 1, nn.Identity, []]                                # Layer 15: Identity layer
+  - [-1, 1, C2f,                [384]]                      # Layer 16: C2f module with 384 channels (8x)
+
+  - [-1, 1, nn.Upsample,        [None, 2, "nearest"]]        # Layer 17: Upsample by 2x (from 8x to 4x)
+  - [[-1, 5], 1, Concat,        [1]]                        # Layer 18: Concatenate Layer 17 (4x) and Backbone Layer 1 (4x)
+  - [-1, 1, C2f,                [192]]                      # Layer 19: C2f module with 192 channels (4x)
+
+  - [-1, 1, Conv,               [192, 3, 2]]                # Layer 20: Downsample by 2x (from 4x to 8x) using Conv
+  - [[-1, 16], 1, Concat,       [1]]                        # Layer 21: Concatenate Layer 20 (8x) and Layer 16 (8x)
+  - [-1, 1, C2f,                [384]]                      # Layer 22: C2f module with 384 channels (8x)
+
+  - [-1, 1, Conv,               [384, 3, 2]]                # Layer 23: Downsample by 2x (from 8x to 16x) using Conv
+  - [[-1, 12], 1, Concat,       [1]]                        # Layer 24: Concatenate Layer 23 (16x) and Layer 12 (16x)
+  - [-1, 1, C2f,                [768]]                      # Layer 25: C2f module with 768 channels (16x)
+
+  - [-1, 1, Conv,               [768, 3, 2]]                # Layer 26: Downsample by 2x (from 16x to 32x) using Conv
+  - [[-1, 8], 1, Concat,        [1]]                        # Layer 27: Concatenate Layer 26 (32x) and Layer 8 (32x)
+  - [-1, 1, C2f,                [768]]                      # Layer 28: C2f module with 768 channels (32x)
+
+  - [[19, 22, 25, 28], 1, Segment, [nc, 32, 256]]           # Layer 29: Segment head with input from Layers 19, 22, 25, and 28

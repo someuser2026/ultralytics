@@ -1,0 +1,36 @@
+# number of classes
+nc: 1
+stride: 224
+# backbone
+backbone:
+  - [-1, 1, Timm, ['maxvit_small_tf_224.in1k', False, 3, True, [0, 1, 2, 3], 32, null, 'auto', False, False, True, False]]  # Layer 0: Timm backbone (x16)
+
+head:
+  # Extract features from Timm backbone
+  - [0, 1, Index, [0]]                                       # Layer 1: Backbone Layer 0 (x4)
+  - [0, 1, Index, [1]]                                       # Layer 2: Backbone Layer 1 (x8)
+  - [0, 1, Index, [2]]                                       # Layer 3: Backbone Layer 2 (x16)
+  - [0, 1, Index, [3]]                                       # Layer 4: Backbone Layer 3 (x32)
+
+  # - [1, 1, torchvision.ops.Permute, [[0, 3, 1, 2]]]          # Layer 5: Convert (B,H,W,C) to (B,C,H,W)
+  # - [2, 1, torchvision.ops.Permute, [[0, 3, 1, 2]]]          # Layer 6: Convert (B,H,W,C) to (B,C,H,W)
+  # - [3, 1, torchvision.ops.Permute, [[0, 3, 1, 2]]]          # Layer 7: Convert (B,H,W,C) to (B,C,H,W)
+  # - [4, 1, torchvision.ops.Permute, [[0, 3, 1, 2]]]          # Layer 8: Convert (B,H,W,C) to (B,C,H,W)
+
+  - [-1, 1, nn.Upsample,        [None, 2, "nearest"]]         # Layer 9: Upsample by 2x (from 32x to 16x)
+  - [[-1, 3], 1, Concat,        [1]]                        # Layer 10: Concatenate Layer 9 (16x) and Backbone Layer 3 (16x)
+  - [-1, 3, C2f,                [768]]                      # Layer 11: C2f module with 768 channels (16x)
+
+  - [-1, 1, nn.Upsample,        [None, 2, "nearest"]]        # Layer 12: Upsample by 2x (from 16x to 8x)
+  - [[-1, 2], 1, Concat,        [1]]                        # Layer 13: Concatenate Layer 12 (8x) and Backbone Layer 2 (8x)
+  - [-1, 3, C2f,                [384]]                      # Layer 14: C2f module with 384 channels (8x)
+
+  - [-1, 1, Conv,               [384, 3, 2]]                # Layer 15: Downsample by 2x (from 8x to 16x) using Conv
+  - [[-1, 7], 1, Concat,       [1]]                        # Layer 16: Concatenate Layer 15 (16x) and Layer 11 (16x)
+  - [-1, 3, C2f,                [768]]                      # Layer 17: C2f module with 768 channels (16x)
+
+  - [-1, 1, Conv,               [768, 3, 2]]                # Layer 18: Downsample by 2x (from 16x to 32x) using Conv
+  - [[-1, 4], 1, Concat,       [1]]                        # Layer 19: Concatenate Layer 18 (32x) and Backbone Layer 3 (32x)
+  - [-1, 3, C2f,                [1024]]                     # Layer 20: C2f module with 1024 channels (32x)
+
+  - [[10, 13, 16], 1, Segment, [nc, 14, 256]]               # Layer 21: OBB module with 32x downsampling and 224 channels

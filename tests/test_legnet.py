@@ -49,3 +49,56 @@ def test_legnet_backbone_output_shapes():
     assert outputs[1].shape == (1, 128, 80, 80)
     assert outputs[2].shape == (1, 256, 40, 40)
     assert outputs[3].shape == (1, 512, 20, 20)
+
+
+@pytest.mark.skipif(not LEGNET_TEST_READY, reason="cv2 and torch are required to import Ultralytics models")
+def test_legnet_analytic_kernels_match_reference_initialization():
+    """LEGNet analytic filters should initialize from the reference Scharr, Gaussian, and LoG kernels."""
+    import torch
+
+    from ultralytics.nn.modules.legnet import LWEGNet, _gaussian_kernel, _log_kernel
+
+    backbone = LWEGNet()
+    stem = backbone.stem
+    stage0_scharr = backbone.stages[0].blocks[0].edge
+
+    scharr_x = torch.tensor([[-3.0, 0.0, 3.0], [-10.0, 0.0, 10.0], [-3.0, 0.0, 3.0]], dtype=torch.float32)
+    scharr_y = torch.tensor([[-3.0, -10.0, -3.0], [0.0, 0.0, 0.0], [3.0, 10.0, 3.0]], dtype=torch.float32)
+    scharr_x = scharr_x.unsqueeze(0).unsqueeze(0).repeat(stage0_scharr.conv_x.weight.shape[0], 1, 1, 1)
+    scharr_y = scharr_y.unsqueeze(0).unsqueeze(0).repeat(stage0_scharr.conv_y.weight.shape[0], 1, 1, 1)
+    gaussian = _gaussian_kernel(9, 0.5).repeat(stem.gaussian.gaussian.weight.shape[0], 1, 1, 1)
+    log_kernel = _log_kernel(7, 1.0).repeat(stem.log.log.weight.shape[0], 1, 1, 1)
+
+    assert torch.allclose(stage0_scharr.conv_x.weight.detach(), scharr_x)
+    assert torch.allclose(stage0_scharr.conv_y.weight.detach(), scharr_y)
+    assert torch.allclose(stem.gaussian.gaussian.weight.detach(), gaussian)
+    assert torch.allclose(stem.log.log.weight.detach(), log_kernel)
+
+    assert stage0_scharr.conv_x.weight.requires_grad
+    assert stage0_scharr.conv_y.weight.requires_grad
+    assert stem.gaussian.gaussian.weight.requires_grad
+    assert stem.log.log.weight.requires_grad
+
+
+@pytest.mark.skipif(not LEGNET_TEST_READY, reason="cv2 and torch are required to import Ultralytics models")
+def test_legnet_analytic_kernels_receive_gradients():
+    """LEGNet Scharr, Gaussian, and LoG kernels should participate in backpropagation."""
+    import torch
+
+    from ultralytics.nn.modules.legnet import LWEGNet
+
+    backbone = LWEGNet()
+    outputs = backbone(torch.randn(2, 3, 128, 128))
+    loss = sum(output.square().mean() for output in outputs)
+    loss.backward()
+
+    tracked_weights = [
+        backbone.stages[0].blocks[0].edge.conv_x.weight,
+        backbone.stages[0].blocks[0].edge.conv_y.weight,
+        backbone.stem.gaussian.gaussian.weight,
+        backbone.stem.log.log.weight,
+    ]
+    for weight in tracked_weights:
+        assert weight.grad is not None
+        assert torch.isfinite(weight.grad).all()
+        assert weight.grad.abs().sum() > 0

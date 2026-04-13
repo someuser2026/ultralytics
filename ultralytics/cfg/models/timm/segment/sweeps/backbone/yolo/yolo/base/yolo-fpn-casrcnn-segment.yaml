@@ -1,0 +1,80 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+# Cascade R-CNN object detection and instance segmentation model
+
+# RPN Configuration
+rpn_cfg: &rpn_cfg
+  anchor_sizes: [32, 64, 128, 256, 512]
+  ratios: [0.5, 1.0, 2.0]
+  pre_nms_topk: 2000
+  post_nms_topk: 1000
+  nms_thresh: 0.7
+  min_box_size: 0.0
+  fg_iou: 0.7
+  bg_iou: 0.3
+  samples_per_img: 256
+  fg_fraction: 0.5
+
+# ROI Pooling Configuration
+roi_cfg: &roi_cfg
+  pooler_resolution: 7
+  pooler_sampling: 2
+
+# Cascade Configuration
+cas_cfg: &cas_cfg
+  stages: 3
+  iou_thr: [0.5, 0.6, 0.7]
+  bbox_std:
+    - [0.1, 0.1, 0.2, 0.2]
+    - [0.05, 0.05, 0.1, 0.1]
+    - [0.033, 0.033, 0.067, 0.067]
+
+# Mask Configuration (for instance segmentation)
+mask_cfg: &mask_cfg
+  with_mask: false  # set to true for instance segmentation
+  mask_size: 28
+
+# Parameters
+nc: 80  # number of classes
+scales: # model compound scaling constants
+  # [depth, width, max_channels]
+  n: [0.33, 0.25, 1024]
+  s: [0.33, 0.50, 1024]
+  m: [0.67, 0.75, 768]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.25, 512]
+
+# Backbone (using YOLO backbone)
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]]  # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]]  # 1-P2/4
+  - [-1, 3, C2f, [128, True]]
+  - [-1, 1, Conv, [256, 3, 2]]  # 3-P3/8
+  - [-1, 6, C2f, [256, True]]
+  - [-1, 1, Conv, [512, 3, 2]]  # 5-P4/16
+  - [-1, 6, C2f, [512, True]]
+  - [-1, 1, Conv, [1024, 3, 2]]  # 7-P5/32
+  - [-1, 3, C2f, [1024, True]]
+  - [-1, 1, SPPF, [1024, 5]]  # 9
+
+# FPN Neck
+head:
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 6], 1, Concat, [1]]  # cat backbone P4
+  - [-1, 3, C2f, [512]]  # 12
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 4], 1, Concat, [1]]  # cat backbone P3
+  - [-1, 3, C2f, [256]]  # 15 (P3/8)
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 12], 1, Concat, [1]]  # cat head P4
+  - [-1, 3, C2f, [512]]  # 18 (P4/16)
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 9], 1, Concat, [1]]  # cat head P5
+  - [-1, 3, C2f, [1024]]  # 21 (P5/32)
+
+  # Cascade R-CNN Head
+  # Takes FPN features [P3, P4, P5] with channels [256, 512, 1024]
+  - [[15, 18, 21], 1, CascadeRCNNHead, [nc, {rpn: *rpn_cfg, roi: *roi_cfg, cas: *cas_cfg, mask: *mask_cfg}]]  # 22

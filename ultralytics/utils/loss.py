@@ -1739,7 +1739,7 @@ class RotatedFCOSLoss:
         if self.bbox_loss_type == "probiou":
             loss = 1.0 - probiou(pred_boxes, target_boxes)
         else:
-            loss = -torch.log(rotated_box_iou(pred_boxes, target_boxes).clamp_min(1e-7))
+            loss = -torch.log(rotated_box_iou(pred_boxes, target_boxes).clamp_min(1e-6))
         return (loss * weights).sum() / weights.sum().clamp_min(1e-6)
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1778,8 +1778,6 @@ class RotatedFCOSLoss:
             targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"].view(-1, 5), cls_probs), dim=1)
             if targets.numel():
                 targets[:, 2:6] *= imgsz[[1, 0, 1, 0]]
-                widths, heights = targets[:, 4], targets[:, 5]
-                targets = targets[(widths >= 2) & (heights >= 2)]
             gt_labels, gt_bboxes, gt_probs, mask_gt = self.preprocess(targets, batch_size)
         except RuntimeError as e:
             raise TypeError(
@@ -1830,8 +1828,7 @@ class RotatedFCOSLoss:
             pred_boxes = regularize_rboxes(pred_boxes, angle_mode=self.angle_mode)
             target_boxes = regularize_rboxes(target_boxes, angle_mode=self.angle_mode)
 
-            centerness_weights = pos_centerness_targets.clamp_min(1e-7)
-            loss[0] = self._bbox_loss(pred_boxes, target_boxes, centerness_weights)
+            loss[0] = self._bbox_loss(pred_boxes, target_boxes, pos_centerness_targets)
             loss[2] = self.loss_centerness(pos_centerness, pos_centerness_targets) / num_pos
         else:
             loss[0] += (flatten_bbox_preds * 0).sum() + (flatten_angle_preds * 0).sum()
@@ -1857,8 +1854,6 @@ class RotatedFCOSLoss:
                 shoreline_prior_max_dist=self.shoreline_prior_max_dist,
             )
 
-        loss[0] *= self.hyp.box
-        loss[1] *= self.hyp.cls
         loss[3] *= self.shoreline_prior_weight
         loss[4] *= self.land_water_prior_weight
         return loss * batch_size, loss.detach()
