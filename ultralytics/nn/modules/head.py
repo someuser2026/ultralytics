@@ -348,17 +348,23 @@ class OBB(Detect):
         >>> outputs = obb(x)
     """
 
-    def __init__(self, nc: int = 80, ne: int = 1, ch: tuple = ()):
+    def __init__(self, nc: int = 80, ne: int | dict = 1, ch: tuple = ()):
         """
         Initialize OBB with number of classes `nc` and layer channels `ch`.
 
         Args:
             nc (int): Number of classes.
-            ne (int): Number of extra parameters.
+            ne (int | dict): Number of extra parameters or OBB head config.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
         """
         super().__init__(nc, ch)
-        self.ne = ne  # number of extra parameters
+        cfg = ne if isinstance(ne, dict) else {}
+        self.ne = int(cfg.get("ne", ne if not isinstance(ne, dict) else 1))  # number of extra parameters
+        self.bbox_loss_type = str(cfg.get("bbox_loss_type", "probiou"))
+        if self.bbox_loss_type not in {"probiou", "kfiou"}:
+            raise ValueError(
+                f"Unsupported OBB bbox_loss_type={self.bbox_loss_type!r}. Expected 'probiou' or 'kfiou'."
+            )
 
         c4 = max(ch[0] // 4, self.ne)
         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.ne, 1)) for x in ch)

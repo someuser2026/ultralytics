@@ -1,0 +1,150 @@
+from copy import deepcopy
+from pathlib import Path
+
+import pytest
+import torch
+
+RCNN_ROOT = Path(__file__).resolve().parents[1] / "ultralytics" / "cfg" / "models" / "rcnn"
+RCNN_VARIANTS = {
+    "oriented_rcnn_r50_fpn_le90.yaml": ("OrientedRCNNHead", "obb"),
+    "rotated_faster_rcnn_unravelnet_fpn_le90.yaml": ("RotatedFasterRCNNHead", "obb"),
+    "mask_rcnn_r50_fpn.yaml": ("MaskRCNNHead", "segment"),
+    "cascade_mask_rcnn_r50_fpn.yaml": ("CascadeMaskRCNNHead", "segment"),
+}
+
+
+@pytest.mark.parametrize(("model_name", "expected"), RCNN_VARIANTS.items())
+def test_rcnn_variant_yaml_parses(model_name, expected):
+    from ultralytics.nn.tasks import parse_model, yaml_model_load
+
+    head_name, _ = expected
+    model_cfg = yaml_model_load(RCNN_ROOT / model_name)
+    model, save, backbone_layers, head_layers = parse_model(deepcopy(model_cfg), ch=3, verbose=False)
+
+    assert len(model) > 0
+    assert isinstance(save, list)
+    assert backbone_layers
+    assert head_layers
+    assert model[-1].__class__.__name__ == head_name
+
+
+@pytest.mark.parametrize(("model_name", "expected"), RCNN_VARIANTS.items())
+def test_rcnn_variant_task_inference(model_name, expected):
+    from ultralytics import RCNN, YOLO
+    from ultralytics.nn.tasks import guess_model_task, yaml_model_load
+
+    _, task = expected
+    model_path = RCNN_ROOT / model_name
+    cfg = yaml_model_load(model_path)
+
+    assert guess_model_task(cfg) == task
+
+    model = RCNN(str(model_path))
+    assert model.task == task
+    assert model.model.task == task
+
+    generic_model = YOLO(str(model_path))
+    assert generic_model.__class__.__name__ == "RCNN"
+    assert generic_model.task == task
+
+
+def test_rcnn_bbox_coders_roundtrip():
+    from ultralytics.nn.modules.rcnn import DeltaXYWHAHBBoxCoder, DeltaXYWHAOBBoxCoder, HorizontalBoxCoder
+
+    hanchors = torch.tensor([[10.0, 12.0, 42.0, 60.0], [30.0, 18.0, 70.0, 58.0]])
+    htargets = torch.tensor([[12.0, 15.0, 40.0, 54.0], [32.0, 20.0, 66.0, 56.0]])
+    hcoder = HorizontalBoxCoder(stds=(1.0, 1.0, 1.0, 1.0))
+    assert torch.allclose(hcoder.decode(hanchors, hcoder.encode(hanchors, htargets)), htargets, atol=1e-4)
+
+    rtargets = torch.tensor([[26.0, 34.0, 28.0, 18.0, 0.20], [48.0, 39.0, 20.0, 14.0, -0.35]])
+    h2r = DeltaXYWHAHBBoxCoder(stds=(1.0, 1.0, 1.0, 1.0, 1.0), angle_mode="le90", norm_factor=2, edge_swap=True)
+    decoded = h2r.decode(hanchors, h2r.encode(hanchors, rtargets))
+    assert torch.allclose(decoded[:, :4], rtargets[:, :4], atol=1e-4)
+
+    ranchors = torch.tensor([[26.0, 34.0, 28.0, 18.0, 0.20], [48.0, 39.0, 20.0, 14.0, -0.35]])
+    rtargets2 = torch.tensor([[28.0, 33.0, 26.0, 20.0, 0.15], [46.0, 40.0, 18.0, 16.0, -0.20]])
+    rcoder = DeltaXYWHAOBBoxCoder(stds=(1.0, 1.0, 1.0, 1.0, 1.0), angle_mode="le90", edge_swap=True, proj_xy=True)
+    decoded = rcoder.decode(ranchors, rcoder.encode(ranchors, rtargets2))
+    assert torch.allclose(decoded, rtargets2, atol=1e-4)
+
+
+def test_rotated_roi_align_shape_sanity():
+    from ultralytics.nn.modules.rcnn import _rotated_roi_align_multilevel
+
+    feats = [
+        torch.randn(2, 16, 32, 32),
+        torch.randn(2, 16, 16, 16),
+        torch.randn(2, 16, 8, 8),
+        torch.randn(2, 16, 4, 4),
+    ]
+    rois = torch.tensor(
+        [
+            [0.0, 48.0, 52.0, 24.0, 16.0, 0.2],
+            [1.0, 64.0, 40.0, 36.0, 20.0, -0.3],
+        ],
+        dtype=torch.float32,
+    )
+    pooled = _rotated_roi_align_multilevel(feats, rois, output_size=7, featmap_strides=(4, 8, 16, 32))
+    assert pooled.shape == (2, 16, 7, 7)
+    assert torch.isfinite(pooled).all()
+
+
+def _segment_batch():
+    img = torch.rand(2, 3, 128, 128)
+    batch = {
+        "img": img,
+        "batch_idx": torch.tensor([0, 1], dtype=torch.long),
+        "cls": torch.tensor([[0], [0]], dtype=torch.float32),
+        "bboxes": torch.tensor([[0.5, 0.5, 0.35, 0.25], [0.45, 0.55, 0.30, 0.28]], dtype=torch.float32),
+        "masks": torch.zeros(2, 128, 128, dtype=torch.float32),
+    }
+    batch["masks"][0, 40:88, 36:92] = 1
+    batch["masks"][1, 44:92, 28:86] = 1
+    return batch
+
+
+def _obb_batch():
+    return {
+        "img": torch.rand(2, 3, 128, 128),
+        "batch_idx": torch.tensor([0, 1], dtype=torch.long),
+        "cls": torch.tensor([[0], [0]], dtype=torch.float32),
+        "bboxes": torch.tensor(
+            [[0.5, 0.5, 0.28, 0.18, 0.10], [0.42, 0.58, 0.24, 0.20, -0.25]],
+            dtype=torch.float32,
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    ("model_name", "task"),
+    [
+        ("mask_rcnn_r50_fpn.yaml", "segment"),
+        ("cascade_mask_rcnn_r50_fpn.yaml", "segment"),
+        ("oriented_rcnn_r50_fpn_le90.yaml", "obb"),
+        ("rotated_faster_rcnn_unravelnet_fpn_le90.yaml", "obb"),
+    ],
+)
+def test_rcnn_variant_forward_and_loss_smoke(model_name, task):
+    from ultralytics.nn.tasks import RCNNOBBModel, RCNNSegmentationModel
+
+    model_cls = RCNNSegmentationModel if task == "segment" else RCNNOBBModel
+    batch = _segment_batch() if task == "segment" else _obb_batch()
+    model = model_cls(str(RCNN_ROOT / model_name), nc=1, ch=3, verbose=False)
+
+    model.train()
+    loss, loss_items = model(batch)
+    assert torch.isfinite(loss)
+    assert torch.isfinite(loss_items).all()
+    loss.backward()
+
+    model.eval()
+    with torch.no_grad():
+        preds = model(batch["img"])
+    assert len(preds) == batch["img"].shape[0]
+    for pred in preds:
+        assert {"bboxes", "conf", "cls"} <= set(pred)
+        if task == "segment":
+            assert "masks" in pred
+        else:
+            if pred["bboxes"].numel():
+                assert pred["bboxes"].shape[1] == 5

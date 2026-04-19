@@ -1,7 +1,0 @@
-path: /Users/manishagupta/Desktop/PhD/orig_paper_code/ultralytics/tests/tmp/obb_aux_yaml
-train: images/train
-val: images/val
-shoreline_masks: masks/shoreline
-land_water_masks: masks/land_water
-names:
-  0: foreground

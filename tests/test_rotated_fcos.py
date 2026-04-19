@@ -114,15 +114,34 @@ def _build_single_box_batch(imgsz: int, cx: float, cy: float, w: float, h: float
     }
 
 
-def _build_rotated_fcos_criterion(model_name: str = "legnet-small-fcos-smallobj.yaml", nc: int = 1, box: float = 7.5, cls: float = 0.5):
+def _build_rotated_fcos_criterion(
+    model_name: str = "legnet-small-fcos-smallobj.yaml",
+    nc: int = 1,
+    box: float = 7.5,
+    cls: float = 0.5,
+    bbox_loss_type: str | None = None,
+):
     """Instantiate a RotatedFCOS model and criterion for unit tests."""
     from ultralytics.nn.tasks import OBBModel, yaml_model_load
     from ultralytics.utils.loss import RotatedFCOSLoss
 
     cfg = yaml_model_load(LEGNET_ROOT / model_name)
+    if bbox_loss_type is not None:
+        cfg["head"][-1][3][1]["bbox_loss_type"] = bbox_loss_type
     model = OBBModel(cfg, ch=3, nc=nc, verbose=False)
     model.args = SimpleNamespace(box=box, cls=cls, angle_mode=cfg["angle_mode"])
     return model, RotatedFCOSLoss(model)
+
+
+def _build_obb_model(nc: int = 1, box: float = 7.5, cls: float = 0.5, dfl: float = 1.5, bbox_loss_type: str = "probiou"):
+    """Instantiate an OBB model configured with the selected bbox loss type."""
+    from ultralytics.nn.tasks import OBBModel, yaml_model_load
+
+    cfg = yaml_model_load(LEGNET_ROOT / "legnet-small-obb.yaml")
+    cfg["head"][-1][3][1] = {"ne": 1, "bbox_loss_type": bbox_loss_type}
+    model = OBBModel(cfg, ch=3, nc=nc, verbose=False)
+    model.args = SimpleNamespace(box=box, cls=cls, dfl=dfl, angle_mode=cfg.get("angle_mode", "oc"))
+    return model
 
 
 def _build_manual_fcos_preds(head, batch_size: int = 1, imgsz: int = 64, bbox_value: float = 1.0):
@@ -146,6 +165,36 @@ def test_rotated_fcos_default_bbox_loss_type_is_rotated_iou():
 
     head = RotatedFCOS(nc=1, ch=(256, 256, 256, 256, 256))
     assert head.bbox_loss_type == "rotated_iou"
+
+
+@pytest.mark.skipif(not ULTRA_READY, reason="cv2 and torch are required")
+def test_kfiou_similarity_matches_theoretical_2d_upper_bound_for_identical_boxes():
+    """Raw KFIoU should hit the known 2D upper bound for identical boxes."""
+    import torch
+
+    from ultralytics.utils.loss import kfiou_similarity
+
+    boxes = torch.tensor([[32.0, 24.0, 10.0, 6.0, 0.25], [12.0, 40.0, 5.0, 14.0, -0.4]], dtype=torch.float32)
+    similarity = kfiou_similarity(boxes, boxes)
+
+    assert torch.allclose(similarity, torch.full_like(similarity, 1.0 / 3.0), atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.skipif(not ULTRA_READY, reason="cv2 and torch are required")
+def test_kfiou_loss_increases_with_center_offset():
+    """Raw KFIoU stays center-invariant while the paper-style loss penalizes larger offsets."""
+    import torch
+
+    from ultralytics.utils.loss import kfiou_loss, kfiou_similarity
+
+    base = torch.tensor([[32.0, 32.0, 16.0, 8.0, 0.2]], dtype=torch.float32)
+    near = base.clone()
+    far = base.clone()
+    near[:, 0] += 2.0
+    far[:, 0] += 8.0
+
+    assert torch.allclose(kfiou_similarity(base, near), kfiou_similarity(base, far), atol=1e-6, rtol=1e-5)
+    assert kfiou_loss(base, far).item() > kfiou_loss(base, near).item()
 
 
 @pytest.mark.skipif(not ULTRA_READY, reason="cv2 and torch are required")
@@ -187,10 +236,36 @@ def test_rotated_fcos_bbox_loss_matches_weighted_log_iou():
 
 
 @pytest.mark.skipif(not ULTRA_READY, reason="cv2 and torch are required")
+def test_rotated_fcos_bbox_loss_matches_weighted_kfiou():
+    """The kfiou path should match the shared paper-style KFIoU helper."""
+    import torch
+
+    from ultralytics.utils.loss import kfiou_loss
+
+    _, criterion = _build_rotated_fcos_criterion(box=123.0, cls=0.01, bbox_loss_type="kfiou")
+    pred_boxes = torch.tensor([[32.0, 32.0, 10.0, 6.0, 0.20], [48.0, 20.0, 12.0, 8.0, -0.35]], dtype=torch.float32)
+    target_boxes = torch.tensor([[31.0, 33.0, 9.5, 6.5, 0.15], [49.0, 18.0, 11.5, 7.5, -0.30]], dtype=torch.float32)
+    weights = torch.tensor([0.25, 0.75], dtype=torch.float32)
+    center_strides = torch.tensor([[8.0], [16.0]], dtype=torch.float32)
+
+    expected = kfiou_loss(
+        pred_boxes,
+        target_boxes,
+        pred_centers=pred_boxes[:, :2] / center_strides,
+        target_centers=target_boxes[:, :2] / center_strides,
+    )
+    expected = (expected * weights).sum() / weights.sum().clamp_min(1e-6)
+
+    assert torch.allclose(criterion._bbox_loss(pred_boxes, target_boxes, weights, center_strides=center_strides), expected)
+
+
+@pytest.mark.skipif(not ULTRA_READY, reason="cv2 and torch are required")
 def test_rotated_fcos_loss_ignores_global_box_and_cls_gains():
     """RotatedFCOSLoss should not use Ultralytics global box/cls gains."""
-    criterion_model_a, criterion_a = _build_rotated_fcos_criterion(box=1.0, cls=1.0)
-    criterion_model_b, criterion_b = _build_rotated_fcos_criterion(box=99.0, cls=0.01)
+    import torch
+
+    criterion_model_a, criterion_a = _build_rotated_fcos_criterion(box=1.0, cls=1.0, bbox_loss_type="kfiou")
+    criterion_model_b, criterion_b = _build_rotated_fcos_criterion(box=99.0, cls=0.01, bbox_loss_type="kfiou")
 
     preds_a = _build_manual_fcos_preds(criterion_model_a.model[-1], imgsz=64)
     preds_b = _build_manual_fcos_preds(criterion_model_b.model[-1], imgsz=64)
@@ -199,7 +274,7 @@ def test_rotated_fcos_loss_ignores_global_box_and_cls_gains():
     total_a, items_a = criterion_a(preds_a, batch)
     total_b, items_b = criterion_b(preds_b, batch)
 
-    assert total_a.item() == pytest.approx(total_b.item(), rel=1e-6, abs=1e-6)
+    assert torch.allclose(total_a, total_b, rtol=1e-6, atol=1e-6)
     assert items_a[:3].tolist() == pytest.approx(items_b[:3].tolist(), rel=1e-6, abs=1e-6)
 
 
@@ -254,7 +329,7 @@ def test_rotated_fcos_cls_and_centerness_use_positive_count(monkeypatch):
 
 
 @pytest.mark.skipif(not ULTRA_READY, reason="cv2 and torch are required")
-@pytest.mark.parametrize("bbox_loss_type", ["probiou", "rotated_iou"])
+@pytest.mark.parametrize("bbox_loss_type", ["probiou", "rotated_iou", "kfiou"])
 @pytest.mark.parametrize("boxes_per_image", [[0, 0], [1, 0], [2, 1]])
 def test_rotated_fcos_forward_and_backward(boxes_per_image, bbox_loss_type):
     """Rotated FCOS should build, run, and backpropagate on synthetic OBB batches."""
@@ -272,9 +347,9 @@ def test_rotated_fcos_forward_and_backward(boxes_per_image, bbox_loss_type):
     model.train()
     batch = _build_synthetic_batch(batch_size=2, boxes_per_image=boxes_per_image)
     total_loss, loss_items = model.loss(batch)
-    assert total_loss.isfinite()
+    assert torch.isfinite(total_loss).all()
     assert torch.isfinite(loss_items).all()
-    total_loss.backward()
+    total_loss.sum().backward()
 
     head = model.model[-1]
     assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in head.parameters() if p.requires_grad)
@@ -284,3 +359,35 @@ def test_rotated_fcos_forward_and_backward(boxes_per_image, bbox_loss_type):
     preds = model(batch["img"])
     infer = preds[0] if isinstance(preds, tuple) else preds
     assert infer.shape[1] == 4 + model.model[-1].nc + 1
+
+
+@pytest.mark.skipif(not ULTRA_READY, reason="cv2 and torch are required")
+def test_obb_head_legacy_loss_type_defaults_to_probiou():
+    """Legacy OBB head args should still default to probiou."""
+    from ultralytics.nn.tasks import OBBModel, yaml_model_load
+
+    cfg = yaml_model_load(LEGNET_ROOT / "legnet-small-obb.yaml")
+    model = OBBModel(cfg, ch=3, nc=1, verbose=False)
+
+    assert model.model[-1].bbox_loss_type == "probiou"
+    assert model.model[-1].ne == 1
+
+
+@pytest.mark.skipif(not ULTRA_READY, reason="cv2 and torch are required")
+def test_obb_kfiou_forward_and_backward():
+    """OBB should build, run, and backpropagate with KFIoU selected on the head."""
+    import torch
+
+    model = _build_obb_model(nc=2, bbox_loss_type="kfiou")
+    model.train()
+    batch = _build_synthetic_batch(batch_size=2, boxes_per_image=[2, 1])
+
+    total_loss, loss_items = model.loss(batch)
+
+    assert model.model[-1].bbox_loss_type == "kfiou"
+    assert torch.isfinite(total_loss).all()
+    assert torch.isfinite(loss_items).all()
+    total_loss.sum().backward()
+
+    assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in model.model[-1].parameters() if p.requires_grad)
+    assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in model.model[0].parameters() if p.requires_grad)

@@ -1,0 +1,23 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# MMRotate parity preset for configs/planet_nearmap_448/oriented_rcnn_r50_fpn_1x_rgb10075s_le90.py
+task: obb
+model: ultralytics/cfg/models/rcnn/oriented_rcnn_r50_fpn_le90.yaml
+data: ultralytics/cfg/datasets/planet_nearmap10075s_448_obb.yaml
+imgsz: 448
+epochs: 100
+batch: 4
+workers: 4
+optimizer: SGD
+lr0: 0.005
+lrf: 0.1
+momentum: 0.9
+weight_decay: 0.0001
+warmup_epochs: 3.0
+cos_lr: false
+close_mosaic: 0
+fliplr: 0.25
+flipud: 0.25
+max_det: 2000
+iou: 0.1
+angle_mode: le90

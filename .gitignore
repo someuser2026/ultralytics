@@ -3,8 +3,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# codex files
+.codex
+
 # submodules
 /LEGNet
+/mmdetection
+/RHINO
 
 # C extensions
 *.so

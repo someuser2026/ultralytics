@@ -81,18 +81,24 @@ class YOLO(Model):
         else:
             # Continue with default YOLO initialization
             super().__init__(model=model, task=task, verbose=verbose)
-            if hasattr(self.model, "model") and "RTDETR" in self.model.model[-1]._get_name():  # if RTDETR head
+            if hasattr(self.model, "model") and "RHINO" in self.model.model[-1]._get_name():
+                from ultralytics import RHINO
+
+                new_instance = RHINO(self, task=task)
+                self.__class__ = type(new_instance)
+                self.__dict__ = new_instance.__dict__
+            elif hasattr(self.model, "model") and "RTDETR" in self.model.model[-1]._get_name():  # if RTDETR head
                 from ultralytics import RTDETR
 
                 new_instance = RTDETR(self, task=task)
                 self.__class__ = type(new_instance)
                 self.__dict__ = new_instance.__dict__
-            # elif hasattr(self.model, "model") and "CascadeRCNNHead" in self.model.model[-1]._get_name():
-            #     from ultralytics import CascadeRCNN
-                
-            #     new_instance = CascadeRCNN(self)
-            #     self.__class__ = type(new_instance)
-            #     self.__dict__ = new_instance.__dict__
+            elif hasattr(self.model, "model") and "RCNN" in self.model.model[-1]._get_name():
+                from ultralytics import RCNN
+
+                new_instance = RCNN(self, task=task)
+                self.__class__ = type(new_instance)
+                self.__dict__ = new_instance.__dict__
 
     @property
     def task_map(self) -> dict[str, dict[str, Any]]:

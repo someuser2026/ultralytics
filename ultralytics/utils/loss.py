@@ -321,9 +321,14 @@ class BboxLoss(nn.Module):
 class RotatedBboxLoss(BboxLoss):
     """Criterion class for computing training losses for rotated bounding boxes."""
 
-    def __init__(self, reg_max: int):
-        """Initialize the RotatedBboxLoss module with regularization maximum and DFL settings."""
+    def __init__(self, reg_max: int, bbox_loss_type: str = "probiou"):
+        """Initialize the RotatedBboxLoss module with regularization maximum and selected bbox objective."""
         super().__init__(reg_max)
+        if bbox_loss_type not in {"probiou", "kfiou"}:
+            raise ValueError(
+                f"Unsupported RotatedBboxLoss bbox_loss_type={bbox_loss_type!r}. Expected 'probiou' or 'kfiou'."
+            )
+        self.bbox_loss_type = bbox_loss_type
 
     def forward(
         self,
@@ -335,10 +340,13 @@ class RotatedBboxLoss(BboxLoss):
         target_scores_sum: torch.Tensor,
         fg_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute IoU and DFL losses for rotated bounding boxes."""
+        """Compute bbox and DFL losses for rotated bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = probiou(pred_bboxes[fg_mask], target_bboxes[fg_mask])
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        if self.bbox_loss_type == "probiou":
+            loss_box = 1.0 - probiou(pred_bboxes[fg_mask], target_bboxes[fg_mask]).squeeze(-1)
+        else:
+            loss_box = kfiou_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask])
+        loss_box = (loss_box.unsqueeze(-1) * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
@@ -348,7 +356,79 @@ class RotatedBboxLoss(BboxLoss):
         else:
             loss_dfl = torch.tensor(0.0).to(pred_dist.device)
 
-        return loss_iou, loss_dfl
+        return loss_box, loss_dfl
+
+
+def _xywhr_to_kfiou_gaussian(boxes: torch.Tensor, eps: float = 1e-7) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert xywhr boxes to Gaussian parameters using the KFIoU paper convention."""
+    if boxes.shape[-1] != 5:
+        raise ValueError(f"_xywhr_to_kfiou_gaussian expects shape (..., 5), got {boxes.shape}.")
+
+    xy = boxes[..., :2]
+    wh = boxes[..., 2:4].clamp_min(eps)
+    angle = boxes[..., 4]
+    var = wh.square() / 4.0
+    w_var, h_var = var.unbind(dim=-1)
+    cos = torch.cos(angle)
+    sin = torch.sin(angle)
+    cos2 = cos.square()
+    sin2 = sin.square()
+
+    sigma_xx = w_var * cos2 + h_var * sin2
+    sigma_yy = w_var * sin2 + h_var * cos2
+    sigma_xy = (w_var - h_var) * cos * sin
+    sigma = torch.stack((sigma_xx, sigma_xy, sigma_xy, sigma_yy), dim=-1).reshape(boxes.shape[:-1] + (2, 2))
+    return xy, sigma
+
+
+def _kfiou_box_volume(sigma: torch.Tensor) -> torch.Tensor:
+    """Return the 2D box volume surrogate induced by a covariance matrix."""
+    volume = 4.0 * sigma.det().clamp_min(0).sqrt()
+    return torch.where(torch.isfinite(volume), volume, torch.zeros_like(volume))
+
+
+def kfiou_similarity(boxes1: torch.Tensor, boxes2: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Compute the raw 2D KFIoU similarity for elementwise rotated box pairs."""
+    if boxes1.shape != boxes2.shape:
+        raise ValueError(f"kfiou_similarity expects matching shapes, got {boxes1.shape} and {boxes2.shape}.")
+    if boxes1.numel() == 0:
+        return boxes1.new_zeros(boxes1.shape[:-1])
+
+    _, sigma1 = _xywhr_to_kfiou_gaussian(boxes1, eps=eps)
+    _, sigma2 = _xywhr_to_kfiou_gaussian(boxes2, eps=eps)
+    eye = torch.eye(2, device=boxes1.device, dtype=boxes1.dtype).expand(sigma1.shape)
+    sigma_sum = sigma1 + sigma2 + eye * eps
+    kalman_gain = sigma1.matmul(torch.linalg.inv(sigma_sum))
+    sigma_kf = sigma1 - kalman_gain.matmul(sigma1)
+
+    volume1 = _kfiou_box_volume(sigma1)
+    volume2 = _kfiou_box_volume(sigma2)
+    volume_kf = _kfiou_box_volume(sigma_kf)
+    similarity = volume_kf / (volume1 + volume2 - volume_kf + eps)
+    similarity = torch.where(torch.isfinite(similarity), similarity, torch.zeros_like(similarity))
+    return similarity.clamp_min(0.0)
+
+
+def kfiou_center_loss(pred_centers: torch.Tensor, target_centers: torch.Tensor, beta: float = 1.0 / 9.0) -> torch.Tensor:
+    """Compute the KFIoU paper-style Smooth-L1 center loss."""
+    diff = (pred_centers - target_centers).abs()
+    return torch.where(diff < beta, 0.5 * diff.square() / beta, diff - 0.5 * beta).sum(dim=-1)
+
+
+def kfiou_loss(
+    pred_boxes: torch.Tensor,
+    target_boxes: torch.Tensor,
+    pred_centers: torch.Tensor | None = None,
+    target_centers: torch.Tensor | None = None,
+    beta: float = 1.0 / 9.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Compute the paper-style KFIoU regression loss per box pair."""
+    pred_centers = pred_boxes[..., :2] if pred_centers is None else pred_centers
+    target_centers = target_boxes[..., :2] if target_centers is None else target_centers
+    center_loss = kfiou_center_loss(pred_centers, target_centers, beta=beta)
+    similarity = kfiou_similarity(pred_boxes, target_boxes, eps=eps)
+    return center_loss + torch.exp(1.0 - similarity) - 1.0
 
 
 def _cross2d(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -1419,8 +1499,9 @@ class v8OBBLoss(v8DetectionLoss):
     def __init__(self, model):
         """Initialize v8OBBLoss with model, assigner, and rotated bbox loss; model must be de-paralleled."""
         super().__init__(model)
+        bbox_loss_type = getattr(model.model[-1], "bbox_loss_type", "probiou")
         self.assigner = RotatedTaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
-        self.bbox_loss = RotatedBboxLoss(self.reg_max).to(self.device)
+        self.bbox_loss = RotatedBboxLoss(self.reg_max, bbox_loss_type=bbox_loss_type).to(self.device)
         self.use_shoreline_prior_loss = bool(_get_cfg_value(model.args, "use_shoreline_prior_loss", False))
         self.use_land_water_prior_loss = bool(_get_cfg_value(model.args, "use_land_water_prior_loss", False))
         self.shoreline_prior_point_mode = _get_cfg_value(model.args, "shoreline_prior_point_mode", "center")
@@ -1577,10 +1658,10 @@ class RotatedFCOSLoss:
         self.shoreline_prior_weight = float(_get_cfg_value(model.args, "shoreline_prior_weight", 1.0))
         self.land_water_prior_weight = float(_get_cfg_value(model.args, "land_water_prior_weight", 1.0))
         self.shoreline_prior_max_dist = float(_get_cfg_value(model.args, "shoreline_prior_max_dist", 128.0))
-        if self.bbox_loss_type not in {"probiou", "rotated_iou"}:
+        if self.bbox_loss_type not in {"probiou", "rotated_iou", "kfiou"}:
             raise ValueError(
                 f"Unsupported RotatedFCOS bbox_loss_type={self.bbox_loss_type!r}. "
-                "Expected 'probiou' or 'rotated_iou'."
+                "Expected 'probiou', 'rotated_iou', or 'kfiou'."
             )
 
         self.loss_cls = FocalLoss(gamma=2.0, alpha=0.25)
@@ -1734,12 +1815,27 @@ class RotatedFCOSLoss:
             torch.stack(prob_targets, 0),
         )
 
-    def _bbox_loss(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    def _bbox_loss(
+        self,
+        pred_boxes: torch.Tensor,
+        target_boxes: torch.Tensor,
+        weights: torch.Tensor,
+        center_strides: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Compute bbox regression loss using the selected rotated-box objective."""
         if self.bbox_loss_type == "probiou":
-            loss = 1.0 - probiou(pred_boxes, target_boxes)
-        else:
+            loss = 1.0 - probiou(pred_boxes, target_boxes).squeeze(-1)
+        elif self.bbox_loss_type == "rotated_iou":
             loss = -torch.log(rotated_box_iou(pred_boxes, target_boxes).clamp_min(1e-6))
+        else:
+            if center_strides is None:
+                raise ValueError("center_strides is required when bbox_loss_type='kfiou'.")
+            loss = kfiou_loss(
+                pred_boxes,
+                target_boxes,
+                pred_centers=pred_boxes[:, :2] / center_strides,
+                target_centers=target_boxes[:, :2] / center_strides,
+            )
         return (loss * weights).sum() / weights.sum().clamp_min(1e-6)
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1828,7 +1924,10 @@ class RotatedFCOSLoss:
             pred_boxes = regularize_rboxes(pred_boxes, angle_mode=self.angle_mode)
             target_boxes = regularize_rboxes(target_boxes, angle_mode=self.angle_mode)
 
-            loss[0] = self._bbox_loss(pred_boxes, target_boxes, pos_centerness_targets)
+            if self.bbox_loss_type == "kfiou":
+                loss[0] = self._bbox_loss(pred_boxes, target_boxes, pos_centerness_targets, center_strides=pos_strides)
+            else:
+                loss[0] = self._bbox_loss(pred_boxes, target_boxes, pos_centerness_targets)
             loss[2] = self.loss_centerness(pos_centerness, pos_centerness_targets) / num_pos
         else:
             loss[0] += (flatten_bbox_preds * 0).sum() + (flatten_angle_preds * 0).sum()

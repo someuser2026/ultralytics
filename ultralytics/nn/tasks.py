@@ -63,12 +63,15 @@ from ultralytics.nn.modules import (
     RepConv,
     RepNCSPELAN4,
     RepVGGDW,
+    ResNetBackbone,
     ResNetLayer,
     RTDETRDecoder,
+    RotatedFasterRCNNHead,
     SCDown,
     Segment,
     SimpleStem,
     TorchVision,
+    UnravelNetBackbone,
     VisionClueMerge,
     VSSBlock,
     WorldDetect,
@@ -76,6 +79,9 @@ from ultralytics.nn.modules import (
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
+    OrientedRCNNHead,
+    MaskRCNNHead,
+    CascadeMaskRCNNHead,
     ConvNeXtBlock,
     ConvNeXtStem,
     ConvNeXtDownsample,
@@ -93,6 +99,7 @@ from ultralytics.nn.modules import (
     RepFPN,
     ScaleEqualizingFPN,
     BiFPN,
+    RHINOOBBDecoder,
     RTDETROBBDecoder,
     RTDETRSegmentDecoder,
     LWEGNet,
@@ -114,6 +121,7 @@ from ultralytics.utils.loss import (
     RotatedFCOSLoss,
     _get_cfg_value,
 )
+from ultralytics.utils.rhino import RHINOOBBLoss
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
 from ultralytics.utils.plotting import feature_visualization
@@ -646,6 +654,83 @@ class SegmentationModel(DetectionModel):
     def init_criterion(self):
         """Initialize the loss criterion for the SegmentationModel."""
         return v8SegmentationLoss(self)
+
+
+class _RCNNModel(BaseModel):
+    """Base model class for native RCNN segmentation and OBB heads."""
+
+    def __init__(self, cfg, ch=3, nc=None, task="detect", verbose=True):
+        super().__init__()
+        self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)
+        self.yaml["channels"] = ch
+        if nc and nc != self.yaml["nc"]:
+            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+            self.yaml["nc"] = nc
+        self.model, self.save, self.backbone_layers, self.head_layers = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)
+        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}
+        self.inplace = self.yaml.get("inplace", True)
+        self.task = task
+        self.end2end = True
+        stride = self.yaml.get("stride", 32)
+        self.stride = torch.as_tensor(stride if isinstance(stride, (list, tuple)) else [stride], dtype=torch.float32)
+        self.loss_names = tuple(getattr(self.model[-1], "loss_names", ("loss",)))
+        initialize_weights(self)
+        if verbose:
+            self.info()
+            LOGGER.info("")
+
+    def _forward_backbone_neck(self, x, profile=False, visualize=False):
+        y = []
+        for m in self.model[:-1]:
+            if m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            if profile:
+                self._profile_one_layer(m, x, [])
+            x = m(x)
+            y.append(x if m.i in self.save else None)
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+        return x, y
+
+    @staticmethod
+    def _head_input(head, x, y):
+        if head.f == -1:
+            return x
+        if isinstance(head.f, int):
+            return y[head.f]
+        sources = [x if j == -1 else y[j] for j in head.f]
+        return sources[0] if len(sources) == 1 and isinstance(sources[0], (list, tuple)) else sources
+
+    def predict(self, x, profile=False, visualize=False, augment=False, embed=None):
+        if augment:
+            return self._predict_augment(x)
+        x, y = self._forward_backbone_neck(x, profile=profile, visualize=visualize)
+        head = self.model[-1]
+        return head(self._head_input(head, x, y))
+
+    def loss(self, batch, preds=None):
+        if preds is not None and isinstance(preds, tuple) and len(preds) == 2 and isinstance(preds[0], torch.Tensor):
+            return preds
+        x, y = self._forward_backbone_neck(batch["img"])
+        head = self.model[-1]
+        return head.loss(self._head_input(head, x, y), batch)
+
+    def init_criterion(self):
+        raise NotImplementedError("RCNN models compute losses inside the RCNN head.")
+
+
+class RCNNSegmentationModel(_RCNNModel):
+    """Native RCNN model for Mask R-CNN and Cascade Mask R-CNN."""
+
+    def __init__(self, cfg="mask-rcnn.yaml", ch=3, nc=None, verbose=True):
+        super().__init__(cfg=cfg, ch=ch, nc=nc, task="segment", verbose=verbose)
+
+
+class RCNNOBBModel(_RCNNModel):
+    """Native RCNN model for rotated Faster R-CNN and Oriented R-CNN."""
+
+    def __init__(self, cfg="oriented-rcnn.yaml", ch=3, nc=None, verbose=True):
+        super().__init__(cfg=cfg, ch=ch, nc=nc, task="obb", verbose=verbose)
 
 
 class PoseModel(DetectionModel):
@@ -1381,6 +1466,99 @@ class RTDETROBBModel(RTDETRDetectionModel):
         dec_scores = torch.cat([enc_scores.unsqueeze(0), dec_scores])
 
         # For now, use detection loss - OBB-specific angle loss can be added later
+        loss = self.criterion(
+            (dec_bboxes, dec_scores), targets, dn_bboxes=dn_bboxes, dn_scores=dn_scores, dn_meta=dn_meta
+        )
+        return sum(loss.values()), torch.as_tensor(
+            [
+                loss.get(k, torch.tensor(0.0, device=img.device)).detach()
+                for k in (
+                    "loss_giou",
+                    "loss_class",
+                    "loss_bbox",
+                    "loss_shoreline_prior",
+                    "loss_land_water_prior",
+                )
+            ],
+            device=img.device,
+        )
+
+
+class RHINOOBBModel(RTDETROBBModel):
+    """RHINO OBB model that configures the decoder and criterion from the YAML rhino block."""
+
+    def __init__(self, cfg="rhino-r50-obb.yaml", ch=3, nc=None, verbose=True):
+        self.task = "obb"
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        self._configure_rhino_head()
+
+    def _configure_rhino_head(self):
+        head = self.model[-1]
+        rhino_cfg = deepcopy(self.yaml.get("rhino", {}))
+        if hasattr(head, "configure_rhino"):
+            head.configure_rhino(rhino_cfg)
+        self.rhino_cfg = getattr(head, "rhino_cfg", rhino_cfg)
+
+    def init_criterion(self):
+        model_args = getattr(self, "args", None)
+        rhino_cfg = deepcopy(getattr(self, "rhino_cfg", self.yaml.get("rhino", {})))
+        return RHINOOBBLoss(
+            nc=self.yaml["nc"],
+            matcher_costs=rhino_cfg.get("matcher_costs"),
+            dn_matcher_costs=rhino_cfg.get("dn_matcher_costs"),
+            loss_weights=rhino_cfg.get("loss_weights"),
+            loss_types=rhino_cfg.get("loss_types"),
+            use_shoreline_prior_loss=bool(_get_cfg_value(model_args, "use_shoreline_prior_loss", False)),
+            use_land_water_prior_loss=bool(_get_cfg_value(model_args, "use_land_water_prior_loss", False)),
+            shoreline_prior_point_mode=_get_cfg_value(model_args, "shoreline_prior_point_mode", "center"),
+            shoreline_prior_weight=float(_get_cfg_value(model_args, "shoreline_prior_weight", 1.0)),
+            land_water_prior_weight=float(_get_cfg_value(model_args, "land_water_prior_weight", 1.0)),
+            shoreline_prior_max_dist=float(_get_cfg_value(model_args, "shoreline_prior_max_dist", 128.0)),
+        )
+
+    def loss(self, batch, preds=None):
+        if not hasattr(self, "criterion"):
+            self.criterion = self.init_criterion()
+
+        img = batch["img"]
+        bs = img.shape[0]
+        batch_idx = batch["batch_idx"]
+        gt_groups = [(batch_idx == i).sum().item() for i in range(bs)]
+        targets = {
+            "cls": batch["cls"].to(img.device, dtype=torch.long).view(-1),
+            "bboxes": batch["bboxes"].to(device=img.device),
+            "batch_idx": batch_idx.to(img.device, dtype=torch.long).view(-1),
+            "gt_groups": gt_groups,
+        }
+        if "land_water_mask" in batch:
+            targets["land_water_mask"] = batch["land_water_mask"].to(
+                img.device, non_blocking=img.device.type == "cuda"
+            )
+        if "shoreline_distance_map" in batch:
+            targets["shoreline_distance_map"] = batch["shoreline_distance_map"].to(
+                img.device, non_blocking=img.device.type == "cuda"
+            )
+
+        if preds is None:
+            preds = self.predict(
+                img,
+                batch={
+                    "cls": targets["cls"],
+                    "bboxes": targets["bboxes"],
+                    "batch_idx": targets["batch_idx"],
+                    "gt_groups": targets["gt_groups"],
+                },
+            )
+        dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = preds if self.training else preds[1]
+        if dn_meta is None:
+            dn_bboxes, dn_scores = None, None
+        else:
+            dn_bboxes, dec_bboxes = torch.split(dec_bboxes, dn_meta["dn_num_split"], dim=2)
+            dn_scores, dec_scores = torch.split(dec_scores, dn_meta["dn_num_split"], dim=2)
+
+        dec_bboxes = torch.cat([enc_bboxes.unsqueeze(0), dec_bboxes])
+        dec_scores = torch.cat([enc_scores.unsqueeze(0), dec_scores])
+
         loss = self.criterion(
             (dec_bboxes, dec_scores), targets, dn_bboxes=dn_bboxes, dn_scores=dn_scores, dn_meta=dn_meta
         )
@@ -2256,10 +2434,13 @@ def parse_model(d, ch, verbose=True):
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, RotatedFCOS}:
                 m.legacy = legacy
-        elif m in frozenset({RTDETRDecoder, RTDETRSegmentDecoder, RTDETROBBDecoder}):  # special case, channels arg must be passed in index 1
+        elif m in frozenset({RTDETRDecoder, RTDETRSegmentDecoder, RTDETROBBDecoder, RHINOOBBDecoder}):  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
-        # elif m in frozenset({CascadeRCNNHead}):
-        #     args = [[ch[x] for x in f], *args]
+        elif m in frozenset({MaskRCNNHead, CascadeMaskRCNNHead, RotatedFasterRCNNHead, OrientedRCNNHead}):
+            head_ch = ch[f[0]] if isinstance(f, list) and len(f) == 1 and isinstance(ch[f[0]], list) else [ch[x] for x in f]
+            args = [head_ch, *args]
+            c2 = head_ch[0] if isinstance(head_ch, list) else head_ch
+            m_ = m(*args)
         elif m in necks:
             # print("f:", f)
             # print("ch:", ch)
@@ -2333,6 +2514,13 @@ def parse_model(d, ch, verbose=True):
             args = [c1, *args]
             m_ = m(*args)
             c2 = m_.channels
+        elif m in frozenset({ResNetBackbone, UnravelNetBackbone}):
+            if n != 1:
+                raise ValueError(f"{m.__name__} must be declared with repeats=1 in model YAML.")
+            c1 = ch[f]
+            args = [c1, *args]
+            m_ = m(*args)
+            c2 = m_.channels
         elif m is Timm:
             c1 = ch[f]
             args[2] = c1
@@ -2352,7 +2540,7 @@ def parse_model(d, ch, verbose=True):
             c2 = ch[f]
 
         # Fixed: Move this outside ConvNeXtBlock handling and fix the condition
-        if m not in frozenset({ConvNeXtBlock, LWEGNet, Timm}):
+        if m not in frozenset({ConvNeXtBlock, LWEGNet, Timm, ResNetBackbone, UnravelNetBackbone, MaskRCNNHead, CascadeMaskRCNNHead, RotatedFasterRCNNHead, OrientedRCNNHead}):
             # if m in {Segment, YOLOESegment}:
             #     print("[DEBUG] Segment sources f =", f)
             #     print("[DEBUG] Segment in-channels =", [ch[u] for u in f], flush=True)
@@ -2442,9 +2630,9 @@ def guess_model_task(model):
         m = cfg["head"][-1][-2].lower()  # output module name
         if m in {"classify", "classifier", "cls", "fc"}:
             return "classify"
-        if "segment" in m:
+        if "segment" in m or "maskrcnn" in m:
             return "segment"
-        if "obb" in m or "rotatedfcos" in m:
+        if "obb" in m or "rotatedfcos" in m or "orientedrcnn" in m or "rotatedfasterrcnn" in m:
             return "obb"
         if "detect" in m or m == "rtdetrdecoder":
             return "detect"
@@ -2464,7 +2652,7 @@ def guess_model_task(model):
             with contextlib.suppress(Exception):
                 return cfg2task(eval(x))
         for m in model.modules():
-            if isinstance(m, (Segment, YOLOESegment)):
+            if isinstance(m, (Segment, YOLOESegment, MaskRCNNHead, CascadeMaskRCNNHead)):
                 return "segment"
             elif isinstance(m, RTDETRSegmentDecoder):
                 return "segment"
@@ -2472,9 +2660,9 @@ def guess_model_task(model):
                 return "classify"
             elif isinstance(m, Pose):
                 return "pose"
-            elif isinstance(m, (OBB, RotatedFCOS)):
+            elif isinstance(m, (OBB, RotatedFCOS, RotatedFasterRCNNHead, OrientedRCNNHead)):
                 return "obb"
-            elif isinstance(m, RTDETROBBDecoder):
+            elif isinstance(m, (RTDETROBBDecoder, RHINOOBBDecoder)):
                 return "obb"
             elif isinstance(m, RTDETRDecoder):
                 return "detect"

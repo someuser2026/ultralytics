@@ -957,7 +957,11 @@ def entrypoint(debug: str = "") -> None:
         LOGGER.warning(f"'model' argument is missing. Using default 'model={model}'.")
     overrides["model"] = model
     stem = Path(model).stem.lower()
-    if "rtdetr" in stem:  # guess architecture
+    if "rhino" in stem:
+        from ultralytics import RHINO
+
+        model = RHINO(model, task=task)
+    elif "rtdetr" in stem:  # guess architecture
         from ultralytics import RTDETR
 
         model = RTDETR(model, task=task)  # no task argument

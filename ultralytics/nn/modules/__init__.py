@@ -104,6 +104,7 @@ from .head import (
     RTDETRSegmentDecoder,
     # CascadeRCNNHead
 )
+from .rhino import RHINOOBBDecoder
 from .transformer import (
     AIFI,
     MLP,
@@ -130,6 +131,8 @@ from .neck import (
     ScaleEqualizingFPN,
 )
 from .legnet import LWEGNet
+from .rcnn import CascadeMaskRCNNHead, MaskRCNNHead, OrientedRCNNHead, RotatedFasterRCNNHead
+from .rcnn_backbone import ResNetBackbone, UnravelNetBackbone
 # from .mask2formerhead import (
 #     Mask2FormerHead
 # )
@@ -217,6 +220,12 @@ __all__ = (
     "YOLOESegment",
     "v10Detect",
     "LRPCHead",
+    "ResNetBackbone",
+    "UnravelNetBackbone",
+    "MaskRCNNHead",
+    "CascadeMaskRCNNHead",
+    "RotatedFasterRCNNHead",
+    "OrientedRCNNHead",
     "ImagePoolingAttn",
     "MaxSigmoidAttnBlock",
     "ContrastiveHead",
@@ -255,6 +264,7 @@ __all__ = (
     "RepFPN",
     "ScaleEqualizingFPN",
     "LWEGNet",
+    "RHINOOBBDecoder",
     "RTDETROBBDecoder",
     "RTDETRSegmentDecoder",
     "SimpleStem",

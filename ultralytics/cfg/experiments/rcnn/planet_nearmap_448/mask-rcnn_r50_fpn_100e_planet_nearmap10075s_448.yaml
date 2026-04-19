@@ -1,0 +1,24 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# MMDetection parity preset for configs/planet_nearmap_448/mask-rcnn_r50_fpn_100e_planet_nearmap10075s_448.py
+task: segment
+model: ultralytics/cfg/models/rcnn/mask_rcnn_r50_fpn.yaml
+data: ultralytics/cfg/datasets/planet_nearmap10075s_448_segment.yaml
+imgsz: 448
+epochs: 100
+batch: 4
+workers: 4
+optimizer: SGD
+lr0: 0.0025
+lrf: 0.1
+momentum: 0.9
+weight_decay: 0.0001
+warmup_epochs: 3.0
+cos_lr: false
+close_mosaic: 0
+fliplr: 0.5
+flipud: 0.0
+overlap_mask: false
+mask_ratio: 1
+max_det: 100
+iou: 0.5
