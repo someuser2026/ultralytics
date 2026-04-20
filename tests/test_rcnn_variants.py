@@ -7,9 +7,13 @@ import torch
 RCNN_ROOT = Path(__file__).resolve().parents[1] / "ultralytics" / "cfg" / "models" / "rcnn"
 RCNN_VARIANTS = {
     "oriented_rcnn_r50_fpn_le90.yaml": ("OrientedRCNNHead", "obb"),
+    "oriented_rcnn_r50_fpn_le90_smallobj.yaml": ("OrientedRCNNHead", "obb"),
     "rotated_faster_rcnn_unravelnet_fpn_le90.yaml": ("RotatedFasterRCNNHead", "obb"),
+    "rotated_faster_rcnn_unravelnet_fpn_le90_smallobj.yaml": ("RotatedFasterRCNNHead", "obb"),
     "mask_rcnn_r50_fpn.yaml": ("MaskRCNNHead", "segment"),
+    "mask_rcnn_r50_fpn_smallobj.yaml": ("MaskRCNNHead", "segment"),
     "cascade_mask_rcnn_r50_fpn.yaml": ("CascadeMaskRCNNHead", "segment"),
+    "cascade_mask_rcnn_r50_fpn_smallobj.yaml": ("CascadeMaskRCNNHead", "segment"),
 }
 
 

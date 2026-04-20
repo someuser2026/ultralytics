@@ -176,6 +176,97 @@ def test_rotatedfcos_submitter_resolves_local_configs(tmp_path: Path) -> None:
     assert len(_parse_call_log(qsub_log)) == 2
 
 
+def test_rcnn_submitters_resolve_smallobj_configs(tmp_path: Path) -> None:
+    """Smoke-test the RCNN small-object submitters with aliases, paths, and dry-run flows."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{\n"
+        "  echo CALL\n"
+        "  for arg in \"$@\"; do\n"
+        "    printf '%s\\n' \"$arg\"\n"
+        "  done\n"
+        "  echo END\n"
+        "} >> \"$QSUB_LOG\"\n",
+    )
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["QSUB_LOG"] = str(qsub_log)
+
+    cases = [
+        (
+            ["bash", "jobs/train/hpc/bash_scripts_obb/submit_oriented_rcnn.sh", "oriented-rcnn-smallobj", "224", "8", "pn10075s", "0"],
+            "obb",
+            "rcnn_obb",
+            "ultralytics/cfg/models/rcnn/oriented_rcnn_r50_fpn_le90_smallobj.yaml",
+            "21",
+        ),
+        (
+            ["bash", "jobs/train/hpc/bash_scripts_obb/submit_rotated_faster_rcnn.sh", "rotated-faster-rcnn-smallobj", "224", "8", "0", "0"],
+            "obb",
+            "rcnn_obb",
+            "ultralytics/cfg/models/rcnn/rotated_faster_rcnn_unravelnet_fpn_le90_smallobj.yaml",
+            "0",
+        ),
+        (
+            ["bash", "jobs/train/hpc/bash_scripts_seg/submit_mask_rcnn.sh", "mask-rcnn-smallobj", "224", "4", "pn10075s", "0"],
+            "segment",
+            "rcnn_segment",
+            "ultralytics/cfg/models/rcnn/mask_rcnn_r50_fpn_smallobj.yaml",
+            "21",
+        ),
+        (
+            ["bash", "jobs/train/hpc/bash_scripts_seg/submit_cascade_mask_rcnn.sh", "cascade-mask-rcnn-smallobj", "224", "4", "21", "0"],
+            "segment",
+            "rcnn_segment",
+            "ultralytics/cfg/models/rcnn/cascade_mask_rcnn_r50_fpn_smallobj.yaml",
+            "21",
+        ),
+    ]
+
+    for cmd, _, _, _, _ in cases:
+        subprocess.run(cmd, cwd=REPO_ROOT, env=env, check=True)
+
+    dry_run = subprocess.run(
+        [
+            "bash",
+            "jobs/train/hpc/bash_scripts_seg/submit_mask_rcnn.sh",
+            str(REPO_ROOT / "ultralytics/cfg/models/rcnn/mask_rcnn_r50_fpn_smallobj.yaml"),
+            "256",
+            "2",
+            "0",
+            "1",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == len(cases)
+
+    for call, (_, task, project, config_yaml, multispectral) in zip(calls, cases):
+        assert call[-1] == "jobs/train/hpc/planet_full.pbs"
+        vars_map = _parse_varlist(call)
+        assert vars_map["TASK"] == task
+        assert vars_map["PROJECT"] == project
+        assert vars_map["CONFIG_YAML"] == config_yaml
+        assert vars_map["MULTISPECTRAL"] == multispectral
+        assert "/Users/manishagupta/Desktop/PhD/Code" not in vars_map["CONFIG_YAML"]
+        assert Path(REPO_ROOT / vars_map["CONFIG_YAML"]).is_file()
+
+    assert "[DRY RUN] qsub -V -v" in dry_run.stdout
+    assert len(_parse_call_log(qsub_log)) == len(cases)
+
+
 def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
     """Smoke-test the PBS wrapper with stubbed micromamba and yolo commands."""
     bin_dir = tmp_path / "bin"
