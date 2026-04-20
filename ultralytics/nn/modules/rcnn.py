@@ -464,7 +464,7 @@ def _rotated_roi_align_single(feat: Tensor, rois: Tensor, output_size: int) -> T
         return feat.new_zeros((0, feat.shape[1], output_size, output_size))
     _, _, h, w = feat.shape
     batch_idx = rois[:, 0].long()
-    boxes = rois[:, 1:]
+    boxes = rois[:, 1:].to(dtype=feat.dtype)
     cx, cy, bw, bh, angle = boxes.unbind(dim=-1)
     xs = (torch.arange(output_size, device=feat.device, dtype=feat.dtype) + 0.5) / output_size - 0.5
     ys = (torch.arange(output_size, device=feat.device, dtype=feat.dtype) + 0.5) / output_size - 0.5
@@ -476,8 +476,17 @@ def _rotated_roi_align_single(feat: Tensor, rois: Tensor, output_size: int) -> T
     gx = cx[:, None, None] + xx * cos_a - yy * sin_a
     gy = cy[:, None, None] + xx * sin_a + yy * cos_a
     grid = torch.stack((2 * gx / max(w - 1, 1) - 1, 2 * gy / max(h - 1, 1) - 1), dim=-1)
-    sampled = F.grid_sample(feat[batch_idx], grid, mode="bilinear", padding_mode="zeros", align_corners=True)
-    return sampled
+    pooled = feat.new_zeros((rois.shape[0], feat.shape[1], output_size, output_size))
+    for bi in batch_idx.unique(sorted=True):
+        idx = torch.where(batch_idx == bi)[0]
+        pooled[idx] = F.grid_sample(
+            feat[bi : bi + 1].expand(idx.numel(), -1, -1, -1),
+            grid[idx],
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+    return pooled
 
 
 def _rotated_roi_align_multilevel(feats: list[Tensor], rois: Tensor, output_size: int, featmap_strides=(4, 8, 16, 32)) -> Tensor:

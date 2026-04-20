@@ -93,6 +93,31 @@ def test_rotated_roi_align_shape_sanity():
     assert torch.isfinite(pooled).all()
 
 
+def test_rotated_roi_align_accepts_half_features():
+    from ultralytics.nn.modules.rcnn import _rotated_roi_align_multilevel
+
+    feats = [
+        torch.randn(2, 16, 32, 32, dtype=torch.float16),
+        torch.randn(2, 16, 16, 16, dtype=torch.float16),
+        torch.randn(2, 16, 8, 8, dtype=torch.float16),
+        torch.randn(2, 16, 4, 4, dtype=torch.float16),
+    ]
+    rois = torch.tensor(
+        [
+            [0.0, 48.0, 52.0, 24.0, 16.0, 0.2],
+            [0.0, 32.0, 28.0, 18.0, 14.0, -0.1],
+            [1.0, 64.0, 40.0, 36.0, 20.0, -0.3],
+        ],
+        dtype=torch.float32,
+    )
+
+    pooled = _rotated_roi_align_multilevel(feats, rois, output_size=7, featmap_strides=(4, 8, 16, 32))
+
+    assert pooled.dtype == torch.float16
+    assert pooled.shape == (3, 16, 7, 7)
+    assert torch.isfinite(pooled.float()).all()
+
+
 def test_oriented_rcnn_rpn_targets_accept_amp_deltas():
     from ultralytics.nn.modules.rcnn import OrientedRCNNHead
 
