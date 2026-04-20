@@ -280,6 +280,118 @@ def test_oriented_rcnn_rpn_targets_accept_amp_deltas():
     assert proposals[0].shape[-1] == 5
 
 
+def test_rotated_faster_rcnn_rpn_uses_level_aware_batched_nms(monkeypatch):
+    import ultralytics.nn.modules.rcnn as rcnn_module
+
+    class DummyRPN(torch.nn.Module):
+        def forward(self, feats):
+            return [
+                torch.tensor([[[[2.0]], [[1.0]]]], dtype=torch.float32),
+                torch.tensor([[[[0.5]]]], dtype=torch.float32),
+            ], [
+                torch.zeros(1, 8, 1, 1, dtype=torch.float32),
+                torch.zeros(1, 4, 1, 1, dtype=torch.float32),
+            ]
+
+    calls = {}
+
+    def fake_batched_nms(boxes, scores, idxs, iou_threshold, use_fast_nms=False):
+        calls["boxes"] = boxes.clone()
+        calls["scores"] = scores.clone()
+        calls["idxs"] = idxs.clone()
+        calls["iou_threshold"] = iou_threshold
+        calls["use_fast_nms"] = use_fast_nms
+        return torch.tensor([1, 0], device=boxes.device)
+
+    monkeypatch.setattr(rcnn_module.TorchNMS, "batched_nms", staticmethod(fake_batched_nms))
+
+    head = rcnn_module.RotatedFasterRCNNHead(
+        in_channels=[8],
+        nc=1,
+        cfg={
+            "rpn": {
+                "strides": [4, 8],
+                "anchor_scales": [1],
+                "anchor_ratios": [1.0, 2.0],
+                "pre_nms_topk_train": 1,
+                "post_nms_topk_train": 2,
+                "pre_nms_topk_test": 1,
+                "post_nms_topk_test": 2,
+                "samples_per_img": 1,
+            },
+            "roi": {"featmap_strides": [4]},
+        },
+    )
+    head.rpn_head = DummyRPN()
+
+    feats = [torch.zeros(1, 8, 1, 1), torch.zeros(1, 8, 1, 1)]
+    _, _, proposals = head._rpn_loss_and_proposals(feats, [torch.zeros((0, 5), dtype=torch.float32)], image_shape=(8, 8), train=False)
+
+    assert calls["boxes"].shape == (2, 4)
+    assert calls["scores"].shape == (2,)
+    assert torch.equal(calls["idxs"], torch.tensor([0, 1]))
+    assert calls["iou_threshold"] == pytest.approx(head.cfg["rpn"]["nms_thresh"])
+    assert calls["use_fast_nms"] is False
+    assert proposals[0].shape == (2, 4)
+    assert torch.allclose(proposals[0], calls["boxes"][torch.tensor([1, 0])])
+
+
+def test_oriented_rcnn_rpn_uses_hbox_level_aware_batched_nms(monkeypatch):
+    import ultralytics.nn.modules.rcnn as rcnn_module
+
+    class DummyRPN(torch.nn.Module):
+        def forward(self, feats):
+            return [
+                torch.tensor([[[[2.0]]]], dtype=torch.float32),
+                torch.tensor([[[[1.0]]]], dtype=torch.float32),
+            ], [
+                torch.zeros(1, 6, 1, 1, dtype=torch.float32),
+                torch.zeros(1, 6, 1, 1, dtype=torch.float32),
+            ]
+
+    calls = {}
+
+    def fake_batched_nms(boxes, scores, idxs, iou_threshold, use_fast_nms=False):
+        calls["boxes"] = boxes.clone()
+        calls["scores"] = scores.clone()
+        calls["idxs"] = idxs.clone()
+        calls["iou_threshold"] = iou_threshold
+        calls["use_fast_nms"] = use_fast_nms
+        return torch.tensor([1, 0], device=boxes.device)
+
+    monkeypatch.setattr(rcnn_module.TorchNMS, "batched_nms", staticmethod(fake_batched_nms))
+
+    head = rcnn_module.OrientedRCNNHead(
+        in_channels=[8],
+        nc=1,
+        cfg={
+            "rpn": {
+                "strides": [4, 8],
+                "anchor_scales": [1],
+                "anchor_ratios": [1.0],
+                "pre_nms_topk_train": 1,
+                "post_nms_topk_train": 2,
+                "pre_nms_topk_test": 1,
+                "post_nms_topk_test": 2,
+                "samples_per_img": 1,
+            },
+            "roi": {"featmap_strides": [4]},
+        },
+    )
+    head.rpn_head = DummyRPN()
+
+    feats = [torch.zeros(1, 8, 1, 1), torch.zeros(1, 8, 1, 1)]
+    _, _, proposals = head._rpn_loss_and_proposals(feats, [torch.zeros((0, 5), dtype=torch.float32)], image_shape=(8, 8), train=False)
+
+    assert calls["boxes"].shape == (2, 4)
+    assert calls["scores"].shape == (2,)
+    assert torch.equal(calls["idxs"], torch.tensor([0, 1]))
+    assert calls["iou_threshold"] == pytest.approx(head.cfg["rpn"]["nms_thresh"])
+    assert calls["use_fast_nms"] is False
+    assert proposals[0].shape == (2, 5)
+    assert torch.allclose(calls["boxes"][torch.tensor([1, 0])], rcnn_module._rboxes_to_xyxy(proposals[0]))
+
+
 @pytest.mark.parametrize("head_name", ["MaskRCNNHead", "CascadeMaskRCNNHead"])
 def test_segment_rcnn_heads_do_not_use_rotated_roi_align(monkeypatch, head_name):
     import ultralytics.nn.modules.rcnn as rcnn_module

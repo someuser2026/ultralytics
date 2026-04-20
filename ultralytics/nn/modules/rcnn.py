@@ -990,8 +990,8 @@ class _RotatedRCNNBase(nn.Module):
         for bi in range(batch_size):
             img_cls_loss = feats[0].new_tensor(0.0)
             img_box_loss = feats[0].new_tensor(0.0)
-            per_scores, per_boxes = [], []
-            for lvl_logits, lvl_deltas, lvl_anchors in zip(obj_logits, bbox_deltas, anchors):
+            per_scores, per_boxes, level_ids = [], [], []
+            for level, (lvl_logits, lvl_deltas, lvl_anchors) in enumerate(zip(obj_logits, bbox_deltas, anchors)):
                 scores = lvl_logits[bi].permute(1, 2, 0).reshape(-1)
                 deltas = lvl_deltas[bi].permute(1, 2, 0).reshape(-1, 6 if self.oriented_proposals else 4)
                 if train:
@@ -1023,14 +1023,16 @@ class _RotatedRCNNBase(nn.Module):
                 keep = _remove_small_boxes(decoded, self.cfg["rpn"]["min_box_size"], rotated=self.oriented_proposals)
                 per_scores.append(probs[idx][keep])
                 per_boxes.append(decoded[keep])
+                level_ids.append(decoded.new_full((keep.numel(),), level, dtype=torch.long))
             total_obj = total_obj + img_cls_loss / max(len(anchors), 1)
             total_box = total_box + img_box_loss / max(len(anchors), 1)
             boxes = torch.cat(per_boxes, dim=0) if per_boxes else feats[0].new_zeros((0, 5 if self.oriented_proposals else 4))
             scores = torch.cat(per_scores, dim=0) if per_scores else feats[0].new_zeros((0,))
+            lvl_ids = torch.cat(level_ids, dim=0) if level_ids else feats[0].new_zeros((0,), dtype=torch.long)
             if self.oriented_proposals:
-                keep = TorchNMS.fast_nms(boxes, scores, self.cfg["rpn"]["nms_thresh"], iou_func=batch_probiou)[:post_nms]
+                keep = TorchNMS.batched_nms(_rboxes_to_xyxy(boxes), scores, lvl_ids, self.cfg["rpn"]["nms_thresh"])[:post_nms]
             else:
-                keep = TorchNMS.nms(boxes, scores, self.cfg["rpn"]["nms_thresh"])[:post_nms]
+                keep = TorchNMS.batched_nms(boxes, scores, lvl_ids, self.cfg["rpn"]["nms_thresh"])[:post_nms]
             proposals.append(boxes[keep])
         return total_obj / batch_size, total_box / batch_size, proposals
 
