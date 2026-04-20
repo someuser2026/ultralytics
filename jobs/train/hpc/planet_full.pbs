@@ -7,8 +7,10 @@
 
 set -euo pipefail
 
-source ~/.bashrc 2>/dev/null || true
-source ~/.profile 2>/dev/null || true
+if [[ "${SOURCE_USER_SHELL_RC:-0}" == "1" ]]; then
+    source ~/.bashrc 2>/dev/null || true
+    source ~/.profile 2>/dev/null || true
+fi
 
 export MAMBA_EXE="${MAMBA_EXE:-/srv/scratch/z5428587/mamba/bin/micromamba}"
 export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-/srv/scratch/z5428587/mamba}"
@@ -70,6 +72,7 @@ model_stem() {
     stem="$(basename "$1")"
     stem="${stem%.*}"
     stem="${stem%-seg}"
+    stem="${stem%-segment}"
     stem="${stem%-obb}"
     printf '%s\n' "${stem}"
 }

@@ -20,8 +20,8 @@ Usage:
 
 Examples:
   bash ${SCRIPT_PUBLIC_NAME}
-  bash ${SCRIPT_PUBLIC_NAME} ${DEFAULT_MODEL_ALIAS} 224 8 pn10075s 1
-  bash ${SCRIPT_PUBLIC_NAME} ${DEFAULT_CONFIG_PATH} 224 8 21 0
+  bash ${SCRIPT_PUBLIC_NAME} ${DEFAULT_MODEL_ALIAS} 448 8 pn10075s 1
+  bash ${SCRIPT_PUBLIC_NAME} ${DEFAULT_CONFIG_PATH} 448 8 21 0
 
 Supported aliases:
 EOF
@@ -66,7 +66,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 MODEL_OR_CONFIG="${1:-${DEFAULT_MODEL_ALIAS}}"
-IMGSZ="${2:-224}"
+IMGSZ="${2:-448}"
 BATCH="${3:-8}"
 MULTISPECTRAL_OPT="${4:-21}"
 DRY_RUN="${5:-${DRY_RUN:-0}}"
