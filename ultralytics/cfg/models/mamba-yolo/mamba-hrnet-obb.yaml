@@ -1,7 +1,8 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-# OBB model with an HRNet-style multi-resolution Mamba backbone.
-# The backbone is the experimental part; the neck/head stay close to standard YOLO OBB wiring.
+# OBB model with a faithful HRNet-style staged Mamba backbone.
+# Stage layout: 1 branch -> 2 branches -> 3 branches -> 4 branches.
+# Each branch uses VSSBlock stacks in place of HRNet bottlenecks/basic blocks.
 
 nc: 80  # number of classes
 scales:  # [depth, width, max_channels]
@@ -10,70 +11,106 @@ scales:  # [depth, width, max_channels]
   L: [0.67, 0.75, 768]
 
 backbone:
-  # Seed the four-resolution pyramid with Mamba-YOLO blocks.
+  # Stem + Stage 1 (single high-resolution branch)
   - [-1, 1, SimpleStem, [128, 3]]  # 0-P2/4
-  - [-1, 2, VSSBlock, [128]]  # 1-P2
-  - [-1, 1, VisionClueMerge, [256]]  # 2-P3/8
-  - [-1, 2, VSSBlock, [256]]  # 3-P3
-  - [-1, 1, VisionClueMerge, [512]]  # 4-P4/16
-  - [-1, 2, VSSBlock, [512]]  # 5-P4
-  - [-1, 1, VisionClueMerge, [1024]]  # 6-P5/32
-  - [-1, 2, VSSBlock, [1024]]  # 7-P5
+  - [-1, 2, VSSBlock, [128]]  # 1 Stage1-B1
 
-  # Per-branch refinement before exchange.
-  - [1, 1, VSSBlock, [128]]  # 8-P2 refine
-  - [3, 1, VSSBlock, [256]]  # 9-P3 refine
-  - [5, 1, VSSBlock, [512]]  # 10-P4 refine
-  - [7, 1, VSSBlock, [1024]]  # 11-P5 refine
+  # Transition 1: 1 -> 2 branches
+  - [1, 1, VSSBlock, [128]]  # 2 Stage2-B1 transition
+  - [1, 1, Conv, [256, 3, 2]]  # 3 Stage2-B2 downsample
+  - [-1, 1, VSSBlock, [256]]  # 4 Stage2-B2 transition
 
-  # HRNet-style full fusion for P2.
-  - [9, 1, nn.Upsample, [None, 2, "nearest"]]  # 12 P3 -> P2
-  - [10, 1, nn.Upsample, [None, 4, "nearest"]]  # 13 P4 -> P2
-  - [11, 1, nn.Upsample, [None, 8, "nearest"]]  # 14 P5 -> P2
-  - [[8, 12, 13, 14], 1, Concat, [1]]  # 15
-  - [-1, 2, VSSBlock, [128]]  # 16 fused P2
+  # Stage 2 branches
+  - [2, 2, VSSBlock, [128]]  # 5 Stage2-B1
+  - [4, 2, VSSBlock, [256]]  # 6 Stage2-B2
 
-  # HRNet-style full fusion for P3.
-  - [8, 1, Conv, [256, 3, 2]]  # 17 P2 -> P3
-  - [10, 1, nn.Upsample, [None, 2, "nearest"]]  # 18 P4 -> P3
-  - [11, 1, nn.Upsample, [None, 4, "nearest"]]  # 19 P5 -> P3
-  - [[17, 9, 18, 19], 1, Concat, [1]]  # 20
-  - [-1, 2, VSSBlock, [256]]  # 21 fused P3
+  # Stage 2 exchange fusion
+  - [6, 1, nn.Upsample, [None, 2, "nearest"]]  # 7 B2 -> B1
+  - [[5, 7], 1, Concat, [1]]  # 8
+  - [-1, 2, VSSBlock, [128]]  # 9 Stage2 fused B1
+  - [5, 1, Conv, [256, 3, 2]]  # 10 B1 -> B2
+  - [[10, 6], 1, Concat, [1]]  # 11
+  - [-1, 2, VSSBlock, [256]]  # 12 Stage2 fused B2
 
-  # HRNet-style full fusion for P4.
-  - [8, 1, Conv, [256, 3, 2]]  # 22 P2 -> P3
-  - [22, 1, Conv, [512, 3, 2]]  # 23 P2 -> P4
-  - [9, 1, Conv, [512, 3, 2]]  # 24 P3 -> P4
-  - [11, 1, nn.Upsample, [None, 2, "nearest"]]  # 25 P5 -> P4
-  - [[23, 24, 10, 25], 1, Concat, [1]]  # 26
-  - [-1, 2, VSSBlock, [512]]  # 27 fused P4
+  # Transition 2: 2 -> 3 branches
+  - [12, 1, Conv, [512, 3, 2]]  # 13 Stage3-B3 downsample
+  - [-1, 1, VSSBlock, [512]]  # 14 Stage3-B3 transition
 
-  # HRNet-style full fusion for P5.
-  - [8, 1, Conv, [256, 3, 2]]  # 28 P2 -> P3
-  - [28, 1, Conv, [512, 3, 2]]  # 29 P2 -> P4
-  - [29, 1, Conv, [1024, 3, 2]]  # 30 P2 -> P5
-  - [9, 1, Conv, [512, 3, 2]]  # 31 P3 -> P4
-  - [31, 1, Conv, [1024, 3, 2]]  # 32 P3 -> P5
-  - [10, 1, Conv, [1024, 3, 2]]  # 33 P4 -> P5
-  - [[30, 32, 33, 11], 1, Concat, [1]]  # 34
-  - [-1, 2, VSSBlock, [1024]]  # 35 fused P5
-  - [-1, 1, SPPF, [1024, 5]]  # 36 final P5
+  # Stage 3 branches
+  - [9, 2, VSSBlock, [128]]  # 15 Stage3-B1
+  - [12, 2, VSSBlock, [256]]  # 16 Stage3-B2
+  - [14, 2, VSSBlock, [512]]  # 17 Stage3-B3
+
+  # Stage 3 exchange fusion
+  - [16, 1, nn.Upsample, [None, 2, "nearest"]]  # 18 B2 -> B1
+  - [17, 1, nn.Upsample, [None, 4, "nearest"]]  # 19 B3 -> B1
+  - [[15, 18, 19], 1, Concat, [1]]  # 20
+  - [-1, 2, VSSBlock, [128]]  # 21 Stage3 fused B1
+  - [15, 1, Conv, [256, 3, 2]]  # 22 B1 -> B2
+  - [17, 1, nn.Upsample, [None, 2, "nearest"]]  # 23 B3 -> B2
+  - [[22, 16, 23], 1, Concat, [1]]  # 24
+  - [-1, 2, VSSBlock, [256]]  # 25 Stage3 fused B2
+  - [15, 1, Conv, [256, 3, 2]]  # 26 B1 -> temp P3
+  - [26, 1, Conv, [512, 3, 2]]  # 27 B1 -> B3
+  - [16, 1, Conv, [512, 3, 2]]  # 28 B2 -> B3
+  - [[27, 28, 17], 1, Concat, [1]]  # 29
+  - [-1, 2, VSSBlock, [512]]  # 30 Stage3 fused B3
+
+  # Transition 3: 3 -> 4 branches
+  - [30, 1, Conv, [1024, 3, 2]]  # 31 Stage4-B4 downsample
+  - [-1, 1, VSSBlock, [1024]]  # 32 Stage4-B4 transition
+
+  # Stage 4 branches
+  - [21, 2, VSSBlock, [128]]  # 33 Stage4-B1
+  - [25, 2, VSSBlock, [256]]  # 34 Stage4-B2
+  - [30, 2, VSSBlock, [512]]  # 35 Stage4-B3
+  - [32, 2, VSSBlock, [1024]]  # 36 Stage4-B4
+
+  # Final exchange fusion (4 branches)
+  - [34, 1, nn.Upsample, [None, 2, "nearest"]]  # 37 B2 -> B1
+  - [35, 1, nn.Upsample, [None, 4, "nearest"]]  # 38 B3 -> B1
+  - [36, 1, nn.Upsample, [None, 8, "nearest"]]  # 39 B4 -> B1
+  - [[33, 37, 38, 39], 1, Concat, [1]]  # 40
+  - [-1, 2, VSSBlock, [128]]  # 41 final P2
+
+  - [33, 1, Conv, [256, 3, 2]]  # 42 B1 -> B2
+  - [35, 1, nn.Upsample, [None, 2, "nearest"]]  # 43 B3 -> B2
+  - [36, 1, nn.Upsample, [None, 4, "nearest"]]  # 44 B4 -> B2
+  - [[42, 34, 43, 44], 1, Concat, [1]]  # 45
+  - [-1, 2, VSSBlock, [256]]  # 46 final P3
+
+  - [33, 1, Conv, [256, 3, 2]]  # 47 B1 -> temp P3
+  - [47, 1, Conv, [512, 3, 2]]  # 48 B1 -> B3
+  - [34, 1, Conv, [512, 3, 2]]  # 49 B2 -> B3
+  - [36, 1, nn.Upsample, [None, 2, "nearest"]]  # 50 B4 -> B3
+  - [[48, 49, 35, 50], 1, Concat, [1]]  # 51
+  - [-1, 2, VSSBlock, [512]]  # 52 final P4
+
+  - [33, 1, Conv, [256, 3, 2]]  # 53 B1 -> temp P3
+  - [53, 1, Conv, [512, 3, 2]]  # 54 B1 -> temp P4
+  - [54, 1, Conv, [1024, 3, 2]]  # 55 B1 -> B4
+  - [34, 1, Conv, [512, 3, 2]]  # 56 B2 -> temp P4
+  - [56, 1, Conv, [1024, 3, 2]]  # 57 B2 -> B4
+  - [35, 1, Conv, [1024, 3, 2]]  # 58 B3 -> B4
+  - [[55, 57, 58, 36], 1, Concat, [1]]  # 59
+  - [-1, 2, VSSBlock, [1024]]  # 60 final P5
+  - [-1, 1, SPPF, [1024, 5]]  # 61 final P5 + context
 
 head:
-  - [36, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 27], 1, Concat, [1]]  # cat backbone P4
-  - [-1, 2, C3k2, [512, False]]  # 39
+  - [61, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 52], 1, Concat, [1]]  # cat backbone P4
+  - [-1, 2, C3k2, [512, False]]  # 64
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 21], 1, Concat, [1]]  # cat backbone P3
-  - [-1, 2, C3k2, [256, False]]  # 42 (P3/8-small)
+  - [[-1, 46], 1, Concat, [1]]  # cat backbone P3
+  - [-1, 2, C3k2, [256, False]]  # 67 (P3/8-small)
 
   - [-1, 1, Conv, [256, 3, 2]]
-  - [[-1, 39], 1, Concat, [1]]  # cat head P4
-  - [-1, 2, C3k2, [512, False]]  # 45 (P4/16-medium)
+  - [[-1, 64], 1, Concat, [1]]  # cat head P4
+  - [-1, 2, C3k2, [512, False]]  # 70 (P4/16-medium)
 
   - [-1, 1, Conv, [512, 3, 2]]
-  - [[-1, 36], 1, Concat, [1]]  # cat head P5
-  - [-1, 2, C3k2, [1024, True]]  # 48 (P5/32-large)
+  - [[-1, 61], 1, Concat, [1]]  # cat head P5
+  - [-1, 2, C3k2, [1024, True]]  # 73 (P5/32-large)
 
-  - [[42, 45, 48], 1, OBB, [nc, 1]]  # OBB(P3, P4, P5)
+  - [[67, 70, 73], 1, OBB, [nc, 1]]  # OBB(P3, P4, P5)
