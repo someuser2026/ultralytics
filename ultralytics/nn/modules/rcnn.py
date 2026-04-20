@@ -927,7 +927,9 @@ class _RotatedRCNNBase(nn.Module):
                 deltas = lvl_deltas[bi].permute(1, 2, 0).reshape(-1, 6 if self.oriented_proposals else 4)
                 if train:
                     labels = lvl_anchors.new_full((lvl_anchors.shape[0],), -1, dtype=torch.long)
-                    box_targets = deltas.new_zeros((lvl_anchors.shape[0], deltas.shape[1]))
+                    # Keep regression targets in anchor precision so AMP half deltas do not
+                    # downcast the encoded targets before assignment.
+                    box_targets = lvl_anchors.new_zeros((lvl_anchors.shape[0], deltas.shape[1]))
                     if gt_hboxes[bi].numel():
                         iou = box_iou(lvl_anchors, gt_hboxes[bi])
                         max_iou, matched = iou.max(dim=1)

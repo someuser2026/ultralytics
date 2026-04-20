@@ -267,6 +267,83 @@ def test_rcnn_submitters_resolve_smallobj_configs(tmp_path: Path) -> None:
     assert len(_parse_call_log(qsub_log)) == len(cases)
 
 
+def test_mamba_yolo_submitters_resolve_local_configs(tmp_path: Path) -> None:
+    """Smoke-test the Mamba-YOLO submitters with aliases, paths, and dry-run flows."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{\n"
+        "  echo CALL\n"
+        "  for arg in \"$@\"; do\n"
+        "    printf '%s\\n' \"$arg\"\n"
+        "  done\n"
+        "  echo END\n"
+        "} >> \"$QSUB_LOG\"\n",
+    )
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["QSUB_LOG"] = str(qsub_log)
+
+    cases = [
+        (
+            ["bash", "jobs/train/hpc/bash_scripts_seg/submit_yolo_mamba_seg.sh", "yolo-mamba-seg", "224", "8", "pn10075s", "0"],
+            "segment",
+            "mamba_yolo_segment",
+            "ultralytics/cfg/models/mamba-yolo/yolo-mamba-seg.yaml",
+            "21",
+        ),
+        (
+            [
+                "bash",
+                "jobs/train/hpc/bash_scripts_obb/submit_mamba_yolo_obb.sh",
+                str(REPO_ROOT / "ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-L-obb-demo.yaml"),
+                "256",
+                "8",
+                "0",
+                "0",
+            ],
+            "obb",
+            "mamba_yolo_obb",
+            "ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-L-obb-demo.yaml",
+            "0",
+        ),
+    ]
+
+    for cmd, _, _, _, _ in cases:
+        subprocess.run(cmd, cwd=REPO_ROOT, env=env, check=True)
+
+    dry_run = subprocess.run(
+        ["bash", "jobs/train/hpc/bash_scripts_obb/submit_mamba_yolo_obb.sh", "mamba-yolo-l-obb", "224", "16", "21", "1"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == len(cases)
+
+    for call, (_, task, project, config_yaml, multispectral) in zip(calls, cases):
+        assert call[-1] == "jobs/train/hpc/planet_full.pbs"
+        vars_map = _parse_varlist(call)
+        assert vars_map["TASK"] == task
+        assert vars_map["PROJECT"] == project
+        assert vars_map["CONFIG_YAML"] == config_yaml
+        assert vars_map["MULTISPECTRAL"] == multispectral
+        assert "/Users/manishagupta/Desktop/PhD/Code" not in vars_map["CONFIG_YAML"]
+        assert Path(REPO_ROOT / vars_map["CONFIG_YAML"]).is_file()
+
+    assert "[DRY RUN] qsub -V -v" in dry_run.stdout
+    assert len(_parse_call_log(qsub_log)) == len(cases)
+
+
 def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
     """Smoke-test the PBS wrapper with stubbed micromamba and yolo commands."""
     bin_dir = tmp_path / "bin"

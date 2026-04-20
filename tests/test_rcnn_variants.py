@@ -93,6 +93,42 @@ def test_rotated_roi_align_shape_sanity():
     assert torch.isfinite(pooled).all()
 
 
+def test_oriented_rcnn_rpn_targets_accept_amp_deltas():
+    from ultralytics.nn.modules.rcnn import OrientedRCNNHead
+
+    class DummyRPN(torch.nn.Module):
+        def forward(self, feats):
+            return [torch.zeros(1, 1, 1, 1)], [torch.zeros(1, 6, 1, 1, dtype=torch.float16)]
+
+    head = OrientedRCNNHead(
+        in_channels=[8],
+        nc=1,
+        cfg={
+            "rpn": {
+                "strides": [4],
+                "anchor_scales": [1],
+                "anchor_ratios": [1.0],
+                "pre_nms_topk_train": 1,
+                "post_nms_topk_train": 1,
+                "pre_nms_topk_test": 1,
+                "post_nms_topk_test": 1,
+                "samples_per_img": 1,
+            },
+            "roi": {"featmap_strides": [4]},
+        },
+    )
+    head.rpn_head = DummyRPN()
+    feats = [torch.zeros(1, 8, 1, 1)]
+    gt_boxes = [torch.tensor([[2.0, 2.0, 4.0, 4.0, 0.0]], dtype=torch.float32)]
+
+    cls_loss, box_loss, proposals = head._rpn_loss_and_proposals(feats, gt_boxes, image_shape=(4, 4), train=True)
+
+    assert torch.isfinite(cls_loss)
+    assert torch.isfinite(box_loss)
+    assert len(proposals) == 1
+    assert proposals[0].shape[-1] == 5
+
+
 def _segment_batch():
     img = torch.rand(2, 3, 128, 128)
     batch = {
