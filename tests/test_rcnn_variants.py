@@ -88,7 +88,7 @@ def test_rotated_roi_align_shape_sanity():
         ],
         dtype=torch.float32,
     )
-    pooled = _rotated_roi_align_multilevel(feats, rois, output_size=7, featmap_strides=(4, 8, 16, 32))
+    pooled = _rotated_roi_align_multilevel(feats, rois, output_size=7, sampling_ratio=2, featmap_strides=(4, 8, 16, 32))
     assert pooled.shape == (2, 16, 7, 7)
     assert torch.isfinite(pooled).all()
 
@@ -111,11 +111,94 @@ def test_rotated_roi_align_accepts_half_features():
         dtype=torch.float32,
     )
 
-    pooled = _rotated_roi_align_multilevel(feats, rois, output_size=7, featmap_strides=(4, 8, 16, 32))
+    pooled = _rotated_roi_align_multilevel(feats, rois, output_size=7, sampling_ratio=2, featmap_strides=(4, 8, 16, 32))
 
     assert pooled.dtype == torch.float16
     assert pooled.shape == (3, 16, 7, 7)
     assert torch.isfinite(pooled.float()).all()
+
+
+def test_rotated_roi_align_adaptive_sampling_is_finite():
+    from ultralytics.nn.modules.rcnn import _rotated_roi_align_multilevel
+
+    feats = [
+        torch.randn(2, 16, 32, 32),
+        torch.randn(2, 16, 16, 16),
+        torch.randn(2, 16, 8, 8),
+        torch.randn(2, 16, 4, 4),
+    ]
+    rois = torch.tensor(
+        [
+            [0.0, 24.0, 18.0, 9.0, 11.0, 0.2],
+            [1.0, 64.0, 40.0, 36.0, 20.0, -0.3],
+        ],
+        dtype=torch.float32,
+    )
+
+    pooled = _rotated_roi_align_multilevel(feats, rois, output_size=7, sampling_ratio=0, featmap_strides=(4, 8, 16, 32))
+
+    assert pooled.shape == (2, 16, 7, 7)
+    assert torch.isfinite(pooled).all()
+
+
+def _rcnn_feats(dtype=torch.float32):
+    return [
+        torch.randn(2, 16, 32, 32, dtype=dtype),
+        torch.randn(2, 16, 16, 16, dtype=dtype),
+        torch.randn(2, 16, 8, 8, dtype=dtype),
+        torch.randn(2, 16, 4, 4, dtype=dtype),
+        torch.randn(2, 16, 2, 2, dtype=dtype),
+    ]
+
+
+def test_oriented_rcnn_routes_through_rotated_roi_align(monkeypatch):
+    import ultralytics.nn.modules.rcnn as rcnn_module
+
+    calls = {"axis": 0, "rotated": 0}
+
+    def fake_axis(*args, **kwargs):
+        calls["axis"] += 1
+        raise AssertionError("OrientedRCNNHead should not use axis-aligned ROI pooling")
+
+    def fake_rotated(feats, rois, output_size, sampling_ratio=0, featmap_strides=(4, 8, 16, 32)):
+        calls["rotated"] += 1
+        assert sampling_ratio == 3
+        return feats[0].new_zeros((rois.shape[0], feats[0].shape[1], output_size, output_size))
+
+    monkeypatch.setattr(rcnn_module, "_roi_align_multilevel", fake_axis)
+    monkeypatch.setattr(rcnn_module, "_rotated_roi_align_multilevel", fake_rotated)
+
+    head = rcnn_module.OrientedRCNNHead([16], 1, cfg={"roi": {"sampling_ratio": 3, "featmap_strides": [4, 8, 16, 32]}})
+    rois = torch.tensor([[0.0, 48.0, 52.0, 24.0, 16.0, 0.2], [1.0, 64.0, 40.0, 36.0, 20.0, -0.3]], dtype=torch.float32)
+    pooled = head._roi_pool(_rcnn_feats(), rois)
+
+    assert pooled.shape == (2, 16, 7, 7)
+    assert calls == {"axis": 0, "rotated": 1}
+
+
+def test_rotated_faster_rcnn_routes_through_axis_roi_align(monkeypatch):
+    import ultralytics.nn.modules.rcnn as rcnn_module
+
+    calls = {"axis": 0, "rotated": 0}
+
+    def fake_axis(feats, rois, output_size, sampling_ratio, featmap_strides=(4, 8, 16, 32)):
+        calls["axis"] += 1
+        assert sampling_ratio == 3
+        return feats[0].new_zeros((rois.shape[0], feats[0].shape[1], output_size, output_size))
+
+    def fake_rotated(*args, **kwargs):
+        calls["rotated"] += 1
+        raise AssertionError("RotatedFasterRCNNHead should not use rotated ROI pooling")
+
+    monkeypatch.setattr(rcnn_module, "_roi_align_multilevel", fake_axis)
+    monkeypatch.setattr(rcnn_module, "_rotated_roi_align_multilevel", fake_rotated)
+
+    head = rcnn_module.RotatedFasterRCNNHead([16], 1, cfg={"roi": {"sampling_ratio": 3, "featmap_strides": [4, 8, 16, 32]}})
+    rois = torch.tensor([[0.0, 10.0, 12.0, 42.0, 60.0], [1.0, 30.0, 18.0, 70.0, 58.0]], dtype=torch.float32)
+    pooled = head._roi_pool(_rcnn_feats(), rois)
+
+    assert pooled.shape == (2, 16, 7, 7)
+    assert calls == {"axis": 1, "rotated": 0}
 
 
 def test_oriented_rcnn_rpn_targets_accept_amp_deltas():
@@ -152,6 +235,33 @@ def test_oriented_rcnn_rpn_targets_accept_amp_deltas():
     assert torch.isfinite(box_loss)
     assert len(proposals) == 1
     assert proposals[0].shape[-1] == 5
+
+
+@pytest.mark.parametrize("head_name", ["MaskRCNNHead", "CascadeMaskRCNNHead"])
+def test_segment_rcnn_heads_do_not_use_rotated_roi_align(monkeypatch, head_name):
+    import ultralytics.nn.modules.rcnn as rcnn_module
+
+    calls = {"axis": 0, "rotated": 0}
+
+    def fake_axis(feats, rois, output_size, sampling_ratio, featmap_strides=(4, 8, 16, 32)):
+        calls["axis"] += 1
+        return feats[0].new_zeros((rois.shape[0], feats[0].shape[1], output_size, output_size))
+
+    def fake_rotated(*args, **kwargs):
+        calls["rotated"] += 1
+        raise AssertionError("Segment RCNN heads should not use rotated ROI pooling")
+
+    monkeypatch.setattr(rcnn_module, "_roi_align_multilevel", fake_axis)
+    monkeypatch.setattr(rcnn_module, "_rotated_roi_align_multilevel", fake_rotated)
+
+    head_cls = getattr(rcnn_module, head_name)
+    head = head_cls([16], 1)
+    loss, loss_items = head.loss(_rcnn_feats(), _segment_batch())
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(loss_items).all()
+    assert calls["rotated"] == 0
+    assert calls["axis"] >= 2
 
 
 def _segment_batch():

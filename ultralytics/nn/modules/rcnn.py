@@ -29,6 +29,8 @@ __all__ = (
     "OrientedRCNNHead",
 )
 
+_ROTATED_ROI_ALIGN_CHUNK_SIZE = 256
+
 
 def _merge_dict(defaults: dict, override: dict | None) -> dict:
     cfg = {**defaults}
@@ -459,37 +461,65 @@ def _roi_align_multilevel(feats: list[Tensor], rois: Tensor, output_size: int, s
     return pooled
 
 
-def _rotated_roi_align_single(feat: Tensor, rois: Tensor, output_size: int) -> Tensor:
+def _rotated_roi_align_fixed(feat: Tensor, rois: Tensor, output_size: int, sampling_ratio_h: int, sampling_ratio_w: int) -> Tensor:
     if rois.numel() == 0:
         return feat.new_zeros((0, feat.shape[1], output_size, output_size))
+
     _, _, h, w = feat.shape
-    batch_idx = rois[:, 0].long()
-    boxes = rois[:, 1:].to(dtype=feat.dtype)
+    boxes = rois[:, 1:] if rois.shape[-1] == 6 else rois
+    boxes = boxes.to(dtype=torch.float32)
     cx, cy, bw, bh, angle = boxes.unbind(dim=-1)
-    xs = (torch.arange(output_size, device=feat.device, dtype=feat.dtype) + 0.5) / output_size - 0.5
-    ys = (torch.arange(output_size, device=feat.device, dtype=feat.dtype) + 0.5) / output_size - 0.5
-    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-    xx = xx[None] * bw[:, None, None]
-    yy = yy[None] * bh[:, None, None]
-    cos_a = torch.cos(angle)[:, None, None]
-    sin_a = torch.sin(angle)[:, None, None]
-    gx = cx[:, None, None] + xx * cos_a - yy * sin_a
-    gy = cy[:, None, None] + xx * sin_a + yy * cos_a
-    grid = torch.stack((2 * gx / max(w - 1, 1) - 1, 2 * gy / max(h - 1, 1) - 1), dim=-1)
-    pooled = feat.new_zeros((rois.shape[0], feat.shape[1], output_size, output_size))
-    for bi in batch_idx.unique(sorted=True):
-        idx = torch.where(batch_idx == bi)[0]
-        pooled[idx] = F.grid_sample(
-            feat[bi : bi + 1].expand(idx.numel(), -1, -1, -1),
-            grid[idx],
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        )
-    return pooled
+    cx = cx - 0.5
+    cy = cy - 0.5
+    bw = bw.clamp(min=1e-6)
+    bh = bh.clamp(min=1e-6)
+
+    out_y = torch.arange(output_size, device=feat.device, dtype=torch.float32)
+    out_x = torch.arange(output_size, device=feat.device, dtype=torch.float32)
+    sample_y = (torch.arange(sampling_ratio_h, device=feat.device, dtype=torch.float32) + 0.5) / sampling_ratio_h
+    sample_x = (torch.arange(sampling_ratio_w, device=feat.device, dtype=torch.float32) + 0.5) / sampling_ratio_w
+    y_offsets = (out_y[:, None] + sample_y[None]) / output_size - 0.5
+    x_offsets = (out_x[:, None] + sample_x[None]) / output_size - 0.5
+
+    rel_x = bw[:, None, None, None, None] * x_offsets[None, None, :, None, :]
+    rel_y = bh[:, None, None, None, None] * y_offsets[None, :, None, :, None]
+    cos_a = torch.cos(angle)[:, None, None, None, None]
+    sin_a = torch.sin(angle)[:, None, None, None, None]
+    gx = cx[:, None, None, None, None] + rel_x * cos_a - rel_y * sin_a
+    gy = cy[:, None, None, None, None] + rel_x * sin_a + rel_y * cos_a
+    gx = gx.permute(0, 1, 3, 2, 4).reshape(boxes.shape[0], output_size * sampling_ratio_h, output_size * sampling_ratio_w)
+    gy = gy.permute(0, 1, 3, 2, 4).reshape(boxes.shape[0], output_size * sampling_ratio_h, output_size * sampling_ratio_w)
+    grid = torch.stack((2 * gx / max(w - 1, 1) - 1, 2 * gy / max(h - 1, 1) - 1), dim=-1).to(dtype=feat.dtype)
+
+    sampled = F.grid_sample(
+        feat.expand(boxes.shape[0], -1, -1, -1),
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    return sampled.reshape(
+        boxes.shape[0], feat.shape[1], output_size, sampling_ratio_h, output_size, sampling_ratio_w
+    ).mean(dim=(3, 5))
 
 
-def _rotated_roi_align_multilevel(feats: list[Tensor], rois: Tensor, output_size: int, featmap_strides=(4, 8, 16, 32)) -> Tensor:
+def _rotated_roi_align_single(feat: Tensor, rois: Tensor, output_size: int, sampling_ratio: int) -> Tensor:
+    if rois.numel() == 0:
+        return feat.new_zeros((0, feat.shape[1], output_size, output_size))
+    if sampling_ratio > 0:
+        return _rotated_roi_align_fixed(feat, rois, output_size, sampling_ratio, sampling_ratio)
+
+    boxes = rois[:, 1:] if rois.shape[-1] == 6 else rois
+    boxes = boxes.to(dtype=torch.float32)
+    pooled = []
+    for box in boxes:
+        sample_h = max(1, int(math.ceil(float(box[3].clamp(min=1e-6) / output_size))))
+        sample_w = max(1, int(math.ceil(float(box[2].clamp(min=1e-6) / output_size))))
+        pooled.append(_rotated_roi_align_fixed(feat, box[None], output_size, sample_h, sample_w))
+    return torch.cat(pooled, dim=0) if pooled else feat.new_zeros((0, feat.shape[1], output_size, output_size))
+
+
+def _rotated_roi_align_multilevel(feats: list[Tensor], rois: Tensor, output_size: int, sampling_ratio: int = 0, featmap_strides=(4, 8, 16, 32)) -> Tensor:
     if rois.numel() == 0:
         return feats[0].new_zeros((0, feats[0].shape[1], output_size, output_size))
     levels = _assign_levels_from_rboxes(rois[:, 1:], max_level=min(5, len(featmap_strides) + 1))
@@ -498,9 +528,19 @@ def _rotated_roi_align_multilevel(feats: list[Tensor], rois: Tensor, output_size
         idx = torch.where(levels == level)[0]
         if idx.numel() == 0:
             continue
-        rois_scaled = rois[idx].clone()
+        rois_scaled = rois[idx].to(dtype=torch.float32).clone()
         rois_scaled[:, 1:5] /= float(stride)
-        pooled[idx] = _rotated_roi_align_single(feats[level - 2], rois_scaled, output_size)
+        batch_idx = rois_scaled[:, 0].long()
+        for bi in batch_idx.unique(sorted=True):
+            img_idx = torch.where(batch_idx == bi)[0]
+            if img_idx.numel() == 0:
+                continue
+            feat_img = feats[level - 2][bi : bi + 1]
+            rois_img = rois_scaled[img_idx, 1:]
+            global_idx = idx[img_idx]
+            for start in range(0, rois_img.shape[0], _ROTATED_ROI_ALIGN_CHUNK_SIZE):
+                end = start + _ROTATED_ROI_ALIGN_CHUNK_SIZE
+                pooled[global_idx[start:end]] = _rotated_roi_align_single(feat_img, rois_img[start:end], output_size, sampling_ratio)
     return pooled
 
 
@@ -976,7 +1016,9 @@ class _RotatedRCNNBase(nn.Module):
 
     def _roi_pool(self, feats: list[Tensor], rois: Tensor) -> Tensor:
         if self.oriented_proposals:
-            return _rotated_roi_align_multilevel(feats[:4], rois, self.cfg["roi"]["pool_size"], self.cfg["roi"]["featmap_strides"])
+            return _rotated_roi_align_multilevel(
+                feats[:4], rois, self.cfg["roi"]["pool_size"], self.cfg["roi"]["sampling_ratio"], self.cfg["roi"]["featmap_strides"]
+            )
         return _roi_align_multilevel(feats[:4], rois, self.cfg["roi"]["pool_size"], self.cfg["roi"]["sampling_ratio"], self.cfg["roi"]["featmap_strides"])
 
     def loss(self, feats: list[Tensor], batch: dict) -> tuple[Tensor, Tensor]:
