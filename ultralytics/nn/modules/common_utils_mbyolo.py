@@ -4,8 +4,8 @@ from functools import partial
 from typing import Any, Callable
 
 import torch
-
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from .block import DropPath
@@ -38,6 +38,68 @@ def _require_selective_scan():
             "Install optional Python deps like 'einops' and build the extension with "
             "'cd selective_scan && pip install .' before using Mamba blocks."
         ) from _selective_scan_error
+
+
+def _raise_selective_scan_cpu_runtime_error():
+    raise RuntimeError(
+        "Mamba-YOLO selective scan CPU fallback is available only during model construction stride probing. "
+        "Normal CPU execution is not supported; move the model to CUDA for training or inference and keep the "
+        "compiled selective_scan extension installed."
+    )
+
+
+def _selective_scan_ref_build_only(u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=False):
+    """Pure PyTorch selective scan used only for CPU model-construction fallback."""
+    dtype_in = u.dtype
+    A = A.to(dtype_in)
+    B = B.to(dtype_in)
+    C = C.to(dtype_in)
+    D = D.to(dtype_in) if D is not None else None
+    delta = delta.to(dtype_in)
+    delta_bias = delta_bias.to(dtype_in) if delta_bias is not None else None
+
+    if delta_bias is not None:
+        delta = delta + delta_bias[..., None]
+    if delta_softplus:
+        delta = F.softplus(delta)
+
+    batch, dim, dstate = u.shape[0], A.shape[0], A.shape[1]
+    is_variable_B = B.dim() >= 3
+    is_variable_C = C.dim() >= 3
+    if A.is_complex():
+        if is_variable_B:
+            B = torch.view_as_complex(rearrange(B, "... (l two) -> ... l two", two=2))
+        if is_variable_C:
+            C = torch.view_as_complex(rearrange(C, "... (l two) -> ... l two", two=2))
+
+    state = A.new_zeros((batch, dim, dstate))
+    outputs = []
+    delta_a = torch.exp(torch.einsum("bdl,dn->bdln", delta, A))
+    if not is_variable_B:
+        delta_b_u = torch.einsum("bdl,dn,bdl->bdln", delta, B, u)
+    elif B.dim() == 3:
+        delta_b_u = torch.einsum("bdl,bnl,bdl->bdln", delta, B, u)
+    else:
+        B = repeat(B, "b g n l -> b (g h) n l", h=dim // B.shape[1])
+        delta_b_u = torch.einsum("bdl,bdnl,bdl->bdln", delta, B, u)
+    if is_variable_C and C.dim() == 4:
+        C = repeat(C, "b g n l -> b (g h) n l", h=dim // C.shape[1])
+
+    for index in range(u.shape[2]):
+        state = delta_a[:, :, index] * state + delta_b_u[:, :, index]
+        if not is_variable_C:
+            y = torch.einsum("bdn,dn->bd", state, C)
+        elif C.dim() == 3:
+            y = torch.einsum("bdn,bn->bd", state, C[:, :, index])
+        else:
+            y = torch.einsum("bdn,bdn->bd", state, C[:, :, :, index])
+        if y.is_complex():
+            y = y.real * 2
+        outputs.append(y)
+
+    y = torch.stack(outputs, dim=2)
+    out = y if D is None else y + u * rearrange(D, "d -> d 1")
+    return out.to(dtype=dtype_in)
 
 
 class LayerNorm2d(nn.Module):
@@ -169,7 +231,8 @@ def cross_selective_scan(
         force_fp32=False,  # False if ssoflex
         ssoflex=True,
         SelectiveScan=None,
-        scan_mode_type='default'
+        scan_mode_type='default',
+        allow_cpu_fallback_for_build=False,
 ):
     # out_norm: whatever fits (B, L, C); LayerNorm; Sigmoid; Softmax(dim=1);...
 
@@ -179,7 +242,12 @@ def cross_selective_scan(
     L = H * W
 
     def selective_scan(u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=True):
-        return SelectiveScan.apply(u, delta, A, B, C, D, delta_bias, delta_softplus, nrows, backnrows, ssoflex)
+        if u.is_cuda:
+            _require_selective_scan()
+            return SelectiveScan.apply(u, delta, A, B, C, D, delta_bias, delta_softplus, nrows, backnrows, ssoflex)
+        if allow_cpu_fallback_for_build:
+            return _selective_scan_ref_build_only(u, delta, A, B, C, D, delta_bias, delta_softplus)
+        _raise_selective_scan_cpu_runtime_error()
 
     xs = CrossScan.apply(x)
 

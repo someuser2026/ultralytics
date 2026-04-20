@@ -486,7 +486,9 @@ class DetectionModel(BaseModel):
 
             self.model.eval()  # Avoid changing batch statistics until training begins
             m.training = True  # Setting it to True to properly return strides
-            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
+            with _enable_mamba_cpu_fallback_for_build(self.model):
+                stride_outputs = _forward(torch.zeros(1, ch, s, s))
+            m.stride = torch.tensor([s / x.shape[-2] for x in stride_outputs])  # forward
             print("-"*50)
             print("Inside task.py 439")
             print("s:", s)
@@ -2055,6 +2057,23 @@ class Ensemble(torch.nn.ModuleList):
 
 
 # Functions ------------------------------------------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _enable_mamba_cpu_fallback_for_build(model):
+    """Temporarily allow Mamba selective-scan CPU fallback during stride probing."""
+    modules = []
+    for module in model.modules():
+        if hasattr(module, "allow_cpu_fallback_for_build"):
+            modules.append((module, module.allow_cpu_fallback_for_build))
+
+    try:
+        for module, _ in modules:
+            module.allow_cpu_fallback_for_build = True
+        yield
+    finally:
+        for module, previous_value in modules:
+            module.allow_cpu_fallback_for_build = previous_value
 
 
 @contextlib.contextmanager

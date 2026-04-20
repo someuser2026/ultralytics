@@ -34,6 +34,7 @@ class SS2D(nn.Module):
         self.d_state = math.ceil(d_model / 6) if d_state == "auto" else d_state  # 20240109
         self.d_conv = d_conv
         self.K = 4
+        self.allow_cpu_fallback_for_build = False
 
         # tags for forward_type ==============================
         def checkpostfix(tag, value):
@@ -169,6 +170,7 @@ class SS2D(nn.Module):
             out_norm_shape=getattr(self, "out_norm_shape", "v0"),
             delta_softplus=True, force_fp32=force_fp32,
             SelectiveScan=SelectiveScan, ssoflex=self.training,  # output fp32
+            allow_cpu_fallback_for_build=self.allow_cpu_fallback_for_build,
         )
         if self.ssm_low_rank:
             x = self.out_rank(x)
