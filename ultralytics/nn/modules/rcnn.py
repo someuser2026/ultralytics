@@ -11,6 +11,7 @@ dependencies.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from typing import Iterable
 
 import torch
@@ -30,6 +31,8 @@ __all__ = (
 )
 
 _ROTATED_ROI_ALIGN_CHUNK_SIZE = 256
+_ROTATED_ROI_ALIGN_OFFSET_CACHE_MAXSIZE = 32
+_ROTATED_ROI_ALIGN_OFFSET_CACHE: OrderedDict[tuple[str, int | None, int, int, int], tuple[Tensor, Tensor]] = OrderedDict()
 
 
 def _merge_dict(defaults: dict, override: dict | None) -> dict:
@@ -461,6 +464,29 @@ def _roi_align_multilevel(feats: list[Tensor], rois: Tensor, output_size: int, s
     return pooled
 
 
+def _get_rotated_roi_align_offset_templates(device: torch.device, output_size: int, sampling_ratio_h: int, sampling_ratio_w: int) -> tuple[Tensor, Tensor]:
+    cache_key = (device.type, device.index, output_size, sampling_ratio_h, sampling_ratio_w)
+    cached = _ROTATED_ROI_ALIGN_OFFSET_CACHE.get(cache_key)
+    if cached is not None:
+        _ROTATED_ROI_ALIGN_OFFSET_CACHE.move_to_end(cache_key)
+        return cached
+
+    out_y = torch.arange(output_size, device=device, dtype=torch.float32)
+    out_x = torch.arange(output_size, device=device, dtype=torch.float32)
+    sample_y = (torch.arange(sampling_ratio_h, device=device, dtype=torch.float32) + 0.5) / sampling_ratio_h
+    sample_x = (torch.arange(sampling_ratio_w, device=device, dtype=torch.float32) + 0.5) / sampling_ratio_w
+    y_offsets = (out_y[:, None] + sample_y[None]) / output_size - 0.5
+    x_offsets = (out_x[:, None] + sample_x[None]) / output_size - 0.5
+
+    base_x = x_offsets[None, None, :, None, :]
+    base_y = y_offsets[None, :, None, :, None]
+
+    _ROTATED_ROI_ALIGN_OFFSET_CACHE[cache_key] = (base_x, base_y)
+    if len(_ROTATED_ROI_ALIGN_OFFSET_CACHE) > _ROTATED_ROI_ALIGN_OFFSET_CACHE_MAXSIZE:
+        _ROTATED_ROI_ALIGN_OFFSET_CACHE.popitem(last=False)
+    return base_x, base_y
+
+
 def _rotated_roi_align_fixed(feat: Tensor, rois: Tensor, output_size: int, sampling_ratio_h: int, sampling_ratio_w: int) -> Tensor:
     if rois.numel() == 0:
         return feat.new_zeros((0, feat.shape[1], output_size, output_size))
@@ -474,15 +500,9 @@ def _rotated_roi_align_fixed(feat: Tensor, rois: Tensor, output_size: int, sampl
     bw = bw.clamp(min=1e-6)
     bh = bh.clamp(min=1e-6)
 
-    out_y = torch.arange(output_size, device=feat.device, dtype=torch.float32)
-    out_x = torch.arange(output_size, device=feat.device, dtype=torch.float32)
-    sample_y = (torch.arange(sampling_ratio_h, device=feat.device, dtype=torch.float32) + 0.5) / sampling_ratio_h
-    sample_x = (torch.arange(sampling_ratio_w, device=feat.device, dtype=torch.float32) + 0.5) / sampling_ratio_w
-    y_offsets = (out_y[:, None] + sample_y[None]) / output_size - 0.5
-    x_offsets = (out_x[:, None] + sample_x[None]) / output_size - 0.5
-
-    rel_x = bw[:, None, None, None, None] * x_offsets[None, None, :, None, :]
-    rel_y = bh[:, None, None, None, None] * y_offsets[None, :, None, :, None]
+    x_offsets, y_offsets = _get_rotated_roi_align_offset_templates(feat.device, output_size, sampling_ratio_h, sampling_ratio_w)
+    rel_x = bw[:, None, None, None, None] * x_offsets
+    rel_y = bh[:, None, None, None, None] * y_offsets
     cos_a = torch.cos(angle)[:, None, None, None, None]
     sin_a = torch.sin(angle)[:, None, None, None, None]
     gx = cx[:, None, None, None, None] + rel_x * cos_a - rel_y * sin_a

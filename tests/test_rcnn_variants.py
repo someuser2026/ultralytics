@@ -141,6 +141,49 @@ def test_rotated_roi_align_adaptive_sampling_is_finite():
     assert torch.isfinite(pooled).all()
 
 
+def test_rotated_roi_align_offset_cache_reuses_same_key():
+    import ultralytics.nn.modules.rcnn as rcnn_module
+
+    rcnn_module._ROTATED_ROI_ALIGN_OFFSET_CACHE.clear()
+
+    first = rcnn_module._get_rotated_roi_align_offset_templates(torch.device("cpu"), 7, 2, 2)
+    second = rcnn_module._get_rotated_roi_align_offset_templates(torch.device("cpu"), 7, 2, 2)
+    third = rcnn_module._get_rotated_roi_align_offset_templates(torch.device("cpu"), 7, 3, 2)
+
+    assert len(rcnn_module._ROTATED_ROI_ALIGN_OFFSET_CACHE) == 2
+    assert first[0] is second[0]
+    assert first[1] is second[1]
+    assert third[0] is not first[0]
+    assert third[1] is not first[1]
+
+
+def test_rotated_roi_align_adaptive_sampling_reuses_cached_templates():
+    import ultralytics.nn.modules.rcnn as rcnn_module
+
+    rcnn_module._ROTATED_ROI_ALIGN_OFFSET_CACHE.clear()
+    feat = torch.randn(1, 16, 32, 32)
+    rois = torch.tensor([[24.0, 18.0, 9.0, 11.0, 0.2], [24.0, 18.0, 9.0, 11.0, 0.2]], dtype=torch.float32)
+
+    pooled = rcnn_module._rotated_roi_align_single(feat, rois, output_size=7, sampling_ratio=0)
+
+    assert pooled.shape == (2, 16, 7, 7)
+    assert len(rcnn_module._ROTATED_ROI_ALIGN_OFFSET_CACHE) == 1
+
+
+def test_rotated_roi_align_offset_cache_is_bounded(monkeypatch):
+    import ultralytics.nn.modules.rcnn as rcnn_module
+
+    rcnn_module._ROTATED_ROI_ALIGN_OFFSET_CACHE.clear()
+    monkeypatch.setattr(rcnn_module, "_ROTATED_ROI_ALIGN_OFFSET_CACHE_MAXSIZE", 3)
+
+    for sampling_ratio in range(1, 6):
+        rcnn_module._get_rotated_roi_align_offset_templates(torch.device("cpu"), 7, sampling_ratio, sampling_ratio)
+
+    assert len(rcnn_module._ROTATED_ROI_ALIGN_OFFSET_CACHE) == 3
+    assert ("cpu", None, 7, 1, 1) not in rcnn_module._ROTATED_ROI_ALIGN_OFFSET_CACHE
+    assert ("cpu", None, 7, 2, 2) not in rcnn_module._ROTATED_ROI_ALIGN_OFFSET_CACHE
+
+
 def _rcnn_feats(dtype=torch.float32):
     return [
         torch.randn(2, 16, 32, 32, dtype=dtype),
