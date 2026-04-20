@@ -4,6 +4,7 @@ import sys
 import time
 
 import torch
+from torchvision.ops import batched_nms as torchvision_batched_nms
 
 from ultralytics.utils import LOGGER
 from ultralytics.utils.metrics import batch_probiou, box_iou
@@ -328,13 +329,11 @@ class TorchNMS:
         if boxes.numel() == 0:
             return torch.empty((0,), dtype=torch.int64, device=boxes.device)
 
-        # Strategy: offset boxes by class index to prevent cross-class suppression
-        max_coordinate = boxes.max()
-        offsets = idxs.to(boxes) * (max_coordinate + 1)
-        boxes_for_nms = boxes + offsets[:, None]
+        if use_fast_nms:
+            # Preserve the old Fast-NMS path for callers that explicitly request it.
+            max_coordinate = boxes.max()
+            offsets = idxs.to(boxes) * (max_coordinate + 1)
+            boxes_for_nms = boxes + offsets[:, None]
+            return TorchNMS.fast_nms(boxes_for_nms, scores, iou_threshold)
 
-        return (
-            TorchNMS.fast_nms(boxes_for_nms, scores, iou_threshold)
-            if use_fast_nms
-            else TorchNMS.nms(boxes_for_nms, scores, iou_threshold)
-        )
+        return torchvision_batched_nms(boxes, scores, idxs, iou_threshold)
