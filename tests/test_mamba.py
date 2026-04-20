@@ -10,12 +10,16 @@ MAMBA_MODELS = (
     "Mamba-YOLO-B.yaml",
     "Mamba-YOLO-L.yaml",
     "yolo-mamba-seg.yaml",
+    "mamba-hrnet-obb.yaml",
+    "mamba-hrnet-seg.yaml",
 )
 MAMBA_ROOT = Path(__file__).resolve().parents[1] / "ultralytics" / "cfg" / "models" / "mamba-yolo"
 MAMBA_TEST_READY = find_spec("cv2") is not None and find_spec("einops") is not None
 MAMBA_BUILD_CASES = (
     ("Mamba-YOLO-L-obb-demo.yaml", "obb"),
     ("Mamba-YOLO-T.yaml", "detect"),
+    ("mamba-hrnet-obb.yaml", "obb"),
+    ("mamba-hrnet-seg.yaml", "segment"),
 )
 
 
@@ -42,7 +46,10 @@ def test_mamba_model_construction_uses_build_only_cpu_fallback(model_name, task)
 
     model = YOLO(MAMBA_ROOT / model_name, task=task)
 
-    assert torch.equal(model.model.stride.cpu(), torch.tensor([8.0, 16.0, 32.0]))
+    expected_stride = torch.tensor([4.0, 8.0, 16.0, 32.0]) if model_name == "mamba-hrnet-seg.yaml" else torch.tensor(
+        [8.0, 16.0, 32.0]
+    )
+    assert torch.equal(model.model.stride.cpu(), expected_stride)
 
 
 @pytest.mark.skipif(not MAMBA_TEST_READY, reason="cv2 and einops are required to import Mamba-YOLO blocks")

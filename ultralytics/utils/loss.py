@@ -2462,15 +2462,18 @@ class RTDETRDetectionLoss(DETRLoss):
         dn_match_indices = []
         idx_groups = torch.as_tensor([0, *gt_groups[:-1]]).cumsum_(0)
         for i, num_gt in enumerate(gt_groups):
+            device = dn_pos_idx[i].device
             if num_gt > 0:
-                gt_idx = torch.arange(end=num_gt, dtype=torch.long) + idx_groups[i]
+                gt_idx = torch.arange(end=num_gt, device=device, dtype=torch.long) + int(idx_groups[i])
                 gt_idx = gt_idx.repeat(dn_num_group)
                 assert len(dn_pos_idx[i]) == len(gt_idx), (
                     f"Expected the same length, but got {len(dn_pos_idx[i])} and {len(gt_idx)} respectively."
                 )
                 dn_match_indices.append((dn_pos_idx[i], gt_idx))
             else:
-                dn_match_indices.append((torch.zeros([0], dtype=torch.long), torch.zeros([0], dtype=torch.long)))
+                dn_match_indices.append(
+                    (torch.zeros([0], device=device, dtype=torch.long), torch.zeros([0], device=device, dtype=torch.long))
+                )
         return dn_match_indices
 
 

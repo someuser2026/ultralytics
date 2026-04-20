@@ -178,14 +178,15 @@ class RHINOHungarianMatcher(nn.Module):
         **_: Any,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         bs = pred_scores.shape[0]
+        device = pred_bboxes.device
         if sum(gt_groups) == 0:
-            return [(torch.zeros(0, dtype=torch.long), torch.zeros(0, dtype=torch.long)) for _ in range(bs)]
+            return [(torch.zeros(0, dtype=torch.long, device=device), torch.zeros(0, dtype=torch.long, device=device)) for _ in range(bs)]
 
         results = []
         gt_offset = 0
         for batch_idx, num_gt in enumerate(gt_groups):
             if num_gt == 0:
-                results.append((torch.zeros(0, dtype=torch.long), torch.zeros(0, dtype=torch.long)))
+                results.append((torch.zeros(0, dtype=torch.long, device=device), torch.zeros(0, dtype=torch.long, device=device)))
                 continue
             gt_slice = slice(gt_offset, gt_offset + num_gt)
             cost = self.cost_matrix(
