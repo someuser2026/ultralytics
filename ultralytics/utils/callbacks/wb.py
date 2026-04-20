@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import traceback
 from copy import deepcopy
 from pathlib import Path
 
@@ -11,9 +12,9 @@ import yaml
 from PIL import Image
 # from ultralytics.models.yolo.model import YOLO
 
+from ultralytics import YOLO
 from ultralytics.utils import SETTINGS, TESTS_RUNNING, LOGGER
 from ultralytics.utils.torch_utils import model_info_for_loggers
-from ultralytics.models.yolo.model import YOLO
 
 try:
     assert not TESTS_RUNNING  # do not log pytest
@@ -387,7 +388,7 @@ def on_train_epoch_end(trainer):
         _log_plots(trainer.plots, step=trainer.epoch + 1)
 
 
-def _get_val_test_dir(data_spec) -> tuple[bool, Path | None, Path | None]:
+def _get_val_test_dir(data_spec) -> tuple[bool, Path | list[Path] | None, Path | list[Path] | None]:
     """
     Return True iff 'test:' exists in the dataset YAML.
     Handles multiple data specification formats:
@@ -411,8 +412,8 @@ def _get_val_test_dir(data_spec) -> tuple[bool, Path | None, Path | None]:
                     val_dir = data_dict.get("val")
                     return (
                         test_dir is not None and test_dir != "",
-                        Path(data_dict.get("path")) / test_dir if test_dir else None,
-                        Path(data_dict.get("path")) / val_dir if val_dir else None,
+                        _resolve_split_source(data_dict.get("path"), test_dir),
+                        _resolve_split_source(data_dict.get("path"), val_dir),
                     )
 
         # Case 2: data_spec is already a dictionary
@@ -421,8 +422,8 @@ def _get_val_test_dir(data_spec) -> tuple[bool, Path | None, Path | None]:
             val_dir = data_spec.get("val")
             return (
                 test_dir is not None and test_dir != "",
-                Path(data_spec.get("path")) / test_dir if test_dir else None,
-                Path(data_spec.get("path")) / val_dir if val_dir else None,
+                _resolve_split_source(data_spec.get("path"), test_dir),
+                _resolve_split_source(data_spec.get("path"), val_dir),
             )
 
     except Exception as e:
@@ -434,6 +435,20 @@ def _get_val_test_dir(data_spec) -> tuple[bool, Path | None, Path | None]:
     # Optimistic default: if we can't determine, assume test exists
     # This prevents skipping test eval when it might be available
     return False, None, None
+
+
+def _resolve_split_source(dataset_root, split_spec):
+    """Resolve dataset split specs that may be relative paths, absolute paths, or lists of either."""
+    if split_spec in (None, ""):
+        return None
+    if isinstance(split_spec, (list, tuple)):
+        resolved = [_resolve_split_source(dataset_root, item) for item in split_spec]
+        return [item for item in resolved if item is not None]
+
+    split_path = Path(split_spec)
+    if split_path.is_absolute() or dataset_root in (None, ""):
+        return split_path
+    return Path(dataset_root) / split_path
 
 
 def _prediction_task_name(result) -> str:
@@ -451,15 +466,58 @@ def _prediction_task_name(result) -> str:
 
 def _prediction_json_payload(result) -> dict:
     """Build a serializable per-image prediction payload."""
+    speed = getattr(result, "speed", {}) or {}
+    if not isinstance(speed, dict):
+        speed = {}
     return {
         "image_path": str(result.path),
         "image_name": Path(result.path).name,
         "image_stem": Path(result.path).stem,
         "task": _prediction_task_name(result),
         "orig_shape": {"height": int(result.orig_shape[0]), "width": int(result.orig_shape[1])},
-        "speed_ms": {k: None if v is None else float(v) for k, v in result.speed.items()},
-        "predictions": result.summary(normalize=True),
+        "speed_ms": {k: None if v is None else float(v) for k, v in speed.items()},
+        "predictions": _safe_result_summary(result),
     }
+
+
+def _safe_result_summary(result) -> list[dict]:
+    """Return a serializable prediction summary even if Results.summary() fails for a custom result type."""
+    try:
+        summary = result.summary(normalize=True)
+        if isinstance(summary, list):
+            return summary
+    except Exception as e:
+        LOGGER.warning(f"Falling back to manual prediction JSON export for '{result.path}': {e}")
+
+    h, w = result.orig_shape
+    scale_x = float(w) if w else 1.0
+    scale_y = float(h) if h else 1.0
+    predictions = []
+    data = result.obb if result.obb is not None else result.boxes
+    if data is None:
+        return predictions
+
+    is_obb = result.obb is not None
+    for row in data:
+        try:
+            class_id = int(row.cls)
+            conf = round(float(row.conf), 5)
+            coords = (row.xyxyxyxy if is_obb else row.xyxy).squeeze().reshape(-1, 2).tolist()
+            box = {}
+            for i, (x, y) in enumerate(coords, start=1):
+                box[f"x{i}"] = round(float(x) / scale_x, 5)
+                box[f"y{i}"] = round(float(y) / scale_y, 5)
+            predictions.append(
+                {
+                    "name": result.names[class_id],
+                    "class": class_id,
+                    "confidence": conf,
+                    "box": box,
+                }
+            )
+        except Exception as inner_e:
+            LOGGER.warning(f"Skipping malformed prediction row for '{result.path}': {inner_e}")
+    return predictions
 
 
 def _prediction_result_key(result, source_root: Path | None, index: int, used_keys: set[str]) -> str:
@@ -485,7 +543,10 @@ def _save_predictions_json(results, output_dir, source_root=None) -> Path:
     """Save prediction summaries as one aggregate JSON file for the entire split."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    source_root = Path(source_root) if source_root is not None else None
+    if isinstance(source_root, (list, tuple)):
+        source_root = next((Path(item) for item in source_root if item is not None), None)
+    else:
+        source_root = Path(source_root) if source_root is not None else None
     used_keys = set()
     payload = {"count": 0, "predictions": {}}
 
@@ -526,6 +587,22 @@ def _log_predictions(pred_dir, run_name, subset):
         return True
     except Exception as e:
         LOGGER.warning(f"Failed to upload {subset} predictions to wandb. Keeping local directory {pred_dir}. Error: {e}")
+        return False
+
+
+def _export_split_predictions(model, split_source, output_dir, run_name, subset, **predict_kwargs):
+    """Export one split's predictions to JSON and upload them to W&B without aborting train-end cleanup."""
+    if split_source in (None, []):
+        LOGGER.info(f"No '{subset}' path found in data.yaml; skipping {subset} prediction artifact export.")
+        return False
+
+    try:
+        prediction_results = list(model.predict(split_source, True, **predict_kwargs))
+        _save_predictions_json(prediction_results, output_dir, source_root=split_source)
+        return _log_predictions(output_dir, run_name, subset)
+    except Exception as e:
+        LOGGER.warning(f"Failed to export {subset} predictions to wandb: {e}")
+        LOGGER.debug(traceback.format_exc())
         return False
 
 
@@ -579,9 +656,7 @@ def on_train_end(trainer):
 
         if val_dir is not None:
             val_predictions = predictions_dir / "val"
-            val_results = list(best_model.predict(val_dir, True, conf=0.01))
-            _save_predictions_json(val_results, val_predictions, source_root=val_dir)
-            _log_predictions(val_predictions, trainer.args.name, "val")
+            _export_split_predictions(best_model, val_dir, val_predictions, trainer.args.name, "val", conf=0.01)
         else:
             LOGGER.info("No 'val' split found in data.yaml; skipping val prediction artifact export.")
 
@@ -622,9 +697,7 @@ def on_train_end(trainer):
 
             if test_dir is not None:
                 test_predictions = predictions_dir / "test"
-                prediction_results = list(best_model.predict(test_dir, True, conf=0.01, batch=2))
-                _save_predictions_json(prediction_results, test_predictions, source_root=test_dir)
-                _log_predictions(test_predictions, trainer.args.name, "test")
+                _export_split_predictions(best_model, test_dir, test_predictions, trainer.args.name, "test", conf=0.01, batch=2)
             else:
                 LOGGER.info("No 'test' path found in data.yaml; skipping test prediction artifact export.")
 
@@ -636,7 +709,8 @@ def on_train_end(trainer):
             "test_eval_traceback": e,
         }
         # LOGGER.info(error_info)
-        LOGGER.error(e)
+        LOGGER.error(f"Post-train W&B export failed: {e}")
+        LOGGER.debug(traceback.format_exc())
         wb.run.summary.update({"test_eval_failed": True})
     
     try:
