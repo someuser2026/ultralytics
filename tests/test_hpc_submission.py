@@ -66,6 +66,7 @@ def test_hpc_wrappers_submit_local_configs(tmp_path: Path) -> None:
         ["bash", "jobs/train/hpc/bash_scripts_seg/final/final_backbone.sh", "224", "8", "0", "5"],
         ["bash", "jobs/train/hpc/bash_scripts_obb/final_backbone_neck.sh", "224", "16", "0"],
         ["bash", "jobs/train/hpc/bash_scripts_joint/model_sweep_fixed_data_tile.sh", "224", "0", "4", "4", "5", "0"],
+        ["bash", "jobs/train/hpc/bash_scripts_joint/mamba_models_448_pn10075s.sh", "4", "4", "5", "0", "0"],
         ["bash", "jobs/train/hpc/bash_scripts_joint/backbone_sweep.sh", "obb_base", "224", "16", "0"],
         ["bash", "jobs/train/hpc/bash_scripts_joint/neck_sweep.sh", "seg_non512", "224", "8"],
         ["bash", "jobs/train/hpc/bash_scripts_joint/lora_dinov3_1cls_pn10075s.sh", "224", "4", "4", "5", "0"],
@@ -299,6 +300,13 @@ def test_mamba_yolo_submitters_resolve_local_configs(tmp_path: Path) -> None:
             "21",
         ),
         (
+            ["bash", "jobs/train/hpc/bash_scripts_seg/submit_yolo_mamba_seg.sh", "mamba-hrnet-seg", "448", "8", "pn10075s", "0"],
+            "segment",
+            "mamba_yolo_segment",
+            "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml",
+            "21",
+        ),
+        (
             [
                 "bash",
                 "jobs/train/hpc/bash_scripts_obb/submit_mamba_yolo_obb.sh",
@@ -312,6 +320,13 @@ def test_mamba_yolo_submitters_resolve_local_configs(tmp_path: Path) -> None:
             "mamba_yolo_obb",
             "ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-L-obb-demo.yaml",
             "0",
+        ),
+        (
+            ["bash", "jobs/train/hpc/bash_scripts_obb/submit_mamba_yolo_obb.sh", "mamba-hrnet-obb", "448", "8", "21", "0"],
+            "obb",
+            "mamba_yolo_obb",
+            "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-obb.yaml",
+            "21",
         ),
     ]
 

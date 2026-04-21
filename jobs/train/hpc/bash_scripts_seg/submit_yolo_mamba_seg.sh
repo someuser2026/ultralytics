@@ -13,11 +13,14 @@ Usage:
 Examples:
   bash jobs/train/hpc/bash_scripts_seg/submit_yolo_mamba_seg.sh
   bash jobs/train/hpc/bash_scripts_seg/submit_yolo_mamba_seg.sh yolo-mamba-seg 224 8 pn10075s 1
+  bash jobs/train/hpc/bash_scripts_seg/submit_yolo_mamba_seg.sh mamba-hrnet-seg 448 8 pn10075s 0
   bash jobs/train/hpc/bash_scripts_seg/submit_yolo_mamba_seg.sh ultralytics/cfg/models/mamba-yolo/yolo-mamba-seg.yaml 256 4 0 0
 
 Supported aliases:
   yolo-mamba-seg
   yolo_mamba_seg
+  mamba-hrnet-seg
+  mamba_hrnet_seg
 
 Optional environment overrides:
   EPOCHS=100
@@ -126,6 +129,10 @@ resolve_config() {
   case "$model_or_config" in
     yolo-mamba-seg|yolo-mamba-seg.yaml|yolo_mamba_seg|yolo_mamba_seg.yaml)
       printf 'ultralytics/cfg/models/mamba-yolo/yolo-mamba-seg.yaml\n'
+      return 0
+      ;;
+    mamba-hrnet-seg|mamba-hrnet-seg.yaml|mamba_hrnet_seg|mamba_hrnet_seg.yaml)
+      printf 'ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml\n'
       return 0
       ;;
   esac
