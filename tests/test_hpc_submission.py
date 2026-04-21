@@ -412,6 +412,80 @@ def test_mamba_yolo_submitters_resolve_local_configs(tmp_path: Path) -> None:
     assert len(_parse_call_log(qsub_log)) == len(cases)
 
 
+def test_rhino_submitter_resolves_local_configs(tmp_path: Path) -> None:
+    """Smoke-test the RHINO submitter with aliases, paths, and dry-run flows."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{\n"
+        "  echo CALL\n"
+        "  for arg in \"$@\"; do\n"
+        "    printf '%s\\n' \"$arg\"\n"
+        "  done\n"
+        "  echo END\n"
+        "} >> \"$QSUB_LOG\"\n",
+    )
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["QSUB_LOG"] = str(qsub_log)
+
+    subprocess.run(
+        ["bash", "jobs/train/hpc/bash_scripts_obb/submit_rhino.sh", "rhino-r50-obb", "448", "4", "pn10075s", "0"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+    subprocess.run(
+        [
+            "bash",
+            "jobs/train/hpc/bash_scripts_obb/submit_rhino.sh",
+            str(REPO_ROOT / "ultralytics/cfg/models/rhino/rhino-dinov3-augfpn-obb.yaml"),
+            "448",
+            "4",
+            "0",
+            "0",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+    dry_run = subprocess.run(
+        ["bash", "jobs/train/hpc/bash_scripts_obb/submit_rhino.sh", "rhino-dinov3-augfpn-obb", "448", "4", "21", "1"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == 2
+
+    alias_vars = _parse_varlist(calls[0])
+    path_vars = _parse_varlist(calls[1])
+
+    for call, vars_map in zip(calls, [alias_vars, path_vars]):
+        assert call[-1] == "jobs/train/hpc/planet_full.pbs"
+        assert vars_map["TASK"] == "obb"
+        assert vars_map["PROJECT"] == "rhino_obb"
+        assert "/Users/manishagupta/Desktop/PhD/Code" not in vars_map["CONFIG_YAML"]
+        assert Path(REPO_ROOT / vars_map["CONFIG_YAML"]).is_file()
+
+    assert alias_vars["CONFIG_YAML"] == "ultralytics/cfg/models/rhino/rhino-r50-obb.yaml"
+    assert alias_vars["MULTISPECTRAL"] == "21"
+    assert path_vars["CONFIG_YAML"] == "ultralytics/cfg/models/rhino/rhino-dinov3-augfpn-obb.yaml"
+    assert path_vars["MULTISPECTRAL"] == "0"
+
+    assert "[DRY RUN] qsub -V -v" in dry_run.stdout
+    assert len(_parse_call_log(qsub_log)) == 2
+
+
 def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
     """Smoke-test the PBS wrapper with stubbed micromamba and yolo commands."""
     bin_dir = tmp_path / "bin"
