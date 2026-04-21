@@ -21,11 +21,11 @@ MS_DESC="Planet+Nearmap (100+75 collapsed, single class)"
 
 BATCH_OBB="${1:-8}"
 BATCH_SEG="${2:-8}"
-EPOCHS="${3:-80}"
+EPOCHS="${3:-40}"
 SEED="${4:-0}"
 DRY_RUN="${5:-0}"
 
-PBS_SCRIPT="jobs/train/hpc/planet_full_generalgpu2.pbs"
+PBS_SCRIPT="jobs/train/hpc/planet_full_2hr_walltime.pbs"
 
 require_file() {
   local path="$1"
