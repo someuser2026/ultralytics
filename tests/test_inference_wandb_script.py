@@ -193,6 +193,14 @@ def test_build_run_context_falls_back_without_args_yaml(inference_module, tmp_pa
     assert context["imgsz"] == 640
 
 
+def test_build_run_context_raises_when_task_cannot_be_inferred(inference_module, tmp_path: Path):
+    _, weights_path = write_run_layout(tmp_path)
+    data_yaml, _, _ = write_dataset_yaml(tmp_path / "dataset")
+
+    with pytest.raises(ValueError, match="Could not infer task"):
+        inference_module.build_run_context(weights_path, data_yaml, model_task=None)
+
+
 def test_load_data_split_sources_supports_relative_absolute_and_lists(inference_module, tmp_path: Path):
     dataset_root = tmp_path / "dataset"
     absolute_test = tmp_path / "absolute" / "test"
@@ -258,6 +266,23 @@ def test_initialize_wandb_run_raises_on_failed_resume(inference_module, tmp_path
 
     with pytest.raises(RuntimeError, match="Failed to resume W&B run 'abc123'"):
         inference_module.initialize_wandb_run(context, wandb_run_id="abc123", wandb_module=fake_wandb)
+
+
+def test_log_run_context_prints_resolved_details(inference_module, tmp_path: Path, monkeypatch):
+    _, weights_path = write_run_layout(tmp_path)
+    data_yaml, _, _ = write_dataset_yaml(tmp_path / "dataset")
+    context = inference_module.build_run_context(weights_path, data_yaml, model_task="segment")
+    messages = []
+    monkeypatch.setattr(inference_module.LOGGER, "info", lambda message: messages.append(str(message)))
+
+    inference_module.log_run_context(context, "demo_run_inference", resumed_original_run=False)
+
+    output = "\n".join(messages)
+    assert "Standalone W&B Inference Export" in output
+    assert "Model weights:" in output
+    assert "Task: segment" in output
+    assert "W&B run name: demo_run_inference" in output
+    assert str(context["run_dir"] / "predictions" / "val") in output
 
 
 def test_run_inference_exports_logs_active_run_artifacts_and_preserves_local_exports(inference_module, tmp_path: Path):

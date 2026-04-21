@@ -32,9 +32,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional original W&B run ID to resume instead of creating a sibling inference run.",
     )
-    parser.add_argument("--device", type=str, default=None, help="Optional device override, e.g. 0 or cpu.")
+    parser.add_argument("--device", type=str, default=0, help="Optional device override, e.g. 0 or cpu.")
     parser.add_argument("--batch", type=int, default=None, help="Optional batch-size override.")
-    parser.add_argument("--imgsz", type=int, default=None, help="Optional image-size override.")
+    parser.add_argument("--imgsz", type=int, default=448, help="Optional image-size override.")
     parser.add_argument("--conf", type=float, default=0.01, help="Confidence threshold for prediction export.")
     return parser.parse_args(argv)
 
@@ -92,7 +92,11 @@ def build_run_context(
     saved_args = saved_args or load_saved_args(run_dir)
     project_value = saved_args.get("project")
     project_path = Path(project_value) if project_value not in (None, "") else run_dir.parent
-    task = saved_args.get("task") or model_task or "detect"
+    task = saved_args.get("task") or model_task
+    if task in (None, ""):
+        raise ValueError(
+            f"Could not infer task for run '{run_name}'. Expected 'task' in {run_dir / 'args.yaml'} or model.task."
+        )
 
     context = {
         "weights_path": weights_path,
@@ -109,6 +113,39 @@ def build_run_context(
     }
     context["wandb_project"] = clean_wandb_project_name(project_path, task)
     return context
+
+
+def format_context_value(value: Any) -> str:
+    """Format resolved context values for readable console output."""
+    if value is None:
+        return "null"
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(item) for item in value)
+    return str(value)
+
+
+def log_run_context(context: dict[str, Any], active_run_name: str, *, resumed_original_run: bool) -> None:
+    """Print the resolved model and inference context before prediction export starts."""
+    LOGGER.info("=========================================")
+    LOGGER.info("Standalone W&B Inference Export")
+    LOGGER.info("=========================================")
+    LOGGER.info(f"Model weights: {context['weights_path']}")
+    LOGGER.info(f"Run directory: {context['run_dir']}")
+    LOGGER.info(f"Source run name: {context['run_name']}")
+    LOGGER.info(f"Task: {context['task']}")
+    LOGGER.info(f"Data YAML: {context['data_path']}")
+    LOGGER.info(f"Project path: {context['project_path']}")
+    LOGGER.info(f"W&B project: {context['wandb_project']}")
+    LOGGER.info(f"W&B run name: {active_run_name}")
+    LOGGER.info(f"Resume original run: {resumed_original_run}")
+    LOGGER.info(f"Device: {format_context_value(context.get('device'))}")
+    LOGGER.info(f"Batch: {format_context_value(context.get('batch'))}")
+    LOGGER.info(f"Image size: {format_context_value(context.get('imgsz'))}")
+    LOGGER.info(f"Confidence: {format_context_value(context.get('conf'))}")
+    LOGGER.info("Local prediction output directories:")
+    LOGGER.info(f"  val:  {context['run_dir'] / 'predictions' / 'val'}")
+    LOGGER.info(f"  test: {context['run_dir'] / 'predictions' / 'test'}")
+    LOGGER.info("=========================================")
 
 
 def resolve_split_source(dataset_root, split_spec):
@@ -381,6 +418,7 @@ def run_inference_exports(args: argparse.Namespace, *, wandb_module=None, model_
             wandb_run_id=args.wandb_run_id,
             wandb_module=wandb_module,
         )
+        log_run_context(context, active_run_name, resumed_original_run=bool(args.wandb_run_id))
         _, val_source, test_source = load_data_split_sources(context["data_path"])
         output_root = context["run_dir"] / "predictions"
         predict_kwargs = build_predict_kwargs(context)
