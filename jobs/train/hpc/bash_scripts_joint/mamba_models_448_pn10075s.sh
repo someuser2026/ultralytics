@@ -21,7 +21,7 @@ MS_DESC="Planet+Nearmap (100+75 collapsed, single class)"
 
 BATCH_OBB="${1:-8}"
 BATCH_SEG="${2:-8}"
-EPOCHS="${3:-100}"
+EPOCHS="${3:-80}"
 SEED="${4:-0}"
 DRY_RUN="${5:-0}"
 
