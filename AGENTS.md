@@ -27,7 +27,6 @@ These are only for reference while porting ideas into `ultralytics/`. They are n
 
 ```bash
 conda activate ultralytics_contrib
-pip install -e .
 ```
 
 ## Useful Checks
