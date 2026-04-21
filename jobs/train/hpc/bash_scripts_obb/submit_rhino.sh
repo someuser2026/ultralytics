@@ -159,7 +159,7 @@ append_if_set() {
 
 resolve_ms "$MULTISPECTRAL_OPT"
 
-EPOCHS="${EPOCHS:-100}"
+EPOCHS="${EPOCHS:-80}"
 TIME_FLOAT="${TIME_FLOAT:-null}"
 DEVICE="${DEVICE:-0}"
 OVERLAP="${OVERLAP:-35}"

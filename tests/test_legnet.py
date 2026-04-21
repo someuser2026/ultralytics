@@ -102,3 +102,29 @@ def test_legnet_analytic_kernels_receive_gradients():
         assert weight.grad is not None
         assert torch.isfinite(weight.grad).all()
         assert weight.grad.abs().sum() > 0
+
+
+@pytest.mark.skipif(not LEGNET_TEST_READY, reason="cv2 and torch are required to import Ultralytics models")
+def test_legnet_scharr_half_precision_stays_finite():
+    """Scharr edge extraction should remain finite under half precision inputs used by AMP."""
+    import torch
+
+    from ultralytics.nn.modules.legnet import Scharr
+
+    scharr = Scharr(4, torch.nn.ReLU).half()
+    cases = (
+        torch.zeros(2, 4, 32, 32, dtype=torch.float16, requires_grad=True),
+        (torch.randn(2, 4, 32, 32) * 400).half().requires_grad_(True),
+    )
+
+    for x in cases:
+        scharr.zero_grad(set_to_none=True)
+        out = scharr(x)
+        assert torch.isfinite(out.float()).all()
+
+        loss = out.float().square().mean()
+        loss.backward()
+
+        assert x.grad is not None
+        assert torch.isfinite(x.grad.float()).all()
+        assert all(p.grad is None or torch.isfinite(p.grad.float()).all() for p in scharr.parameters())

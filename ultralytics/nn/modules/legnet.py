@@ -113,7 +113,11 @@ class Scharr(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         edges_x = self.conv_x(x)
         edges_y = self.conv_y(x)
-        scharr_edge = torch.sqrt(edges_x.pow(2) + edges_y.pow(2))
+        # Accumulate edge energy in fp32 so AMP/half precision does not overflow or hit sqrt(0) gradients.
+        scharr_edge = edges_x.float().square().add_(edges_y.float().square())
+        scharr_edge = scharr_edge.clamp_min_(torch.finfo(torch.float32).eps).sqrt_()
+        if scharr_edge.dtype != x.dtype:
+            scharr_edge = scharr_edge.clamp_max(torch.finfo(x.dtype).max).to(x.dtype)
         scharr_edge = self.act(self.norm(scharr_edge))
         return self.conv_extra(x + scharr_edge)
 
