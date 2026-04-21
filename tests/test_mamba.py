@@ -9,17 +9,27 @@ MAMBA_MODELS = (
     "Mamba-YOLO-T.yaml",
     "Mamba-YOLO-B.yaml",
     "Mamba-YOLO-L.yaml",
+    "Mamba-YOLO-L-obb-demo-edgevss.yaml",
     "yolo-mamba-seg.yaml",
+    "yolo-mamba-seg-edgevss-backbone.yaml",
+    "yolo-mamba-seg-edgevss-all.yaml",
     "mamba-hrnet-obb.yaml",
+    "mamba-hrnet-obb-edgevss.yaml",
     "mamba-hrnet-seg.yaml",
+    "mamba-hrnet-seg-edgevss.yaml",
 )
 MAMBA_ROOT = Path(__file__).resolve().parents[1] / "ultralytics" / "cfg" / "models" / "mamba-yolo"
 MAMBA_TEST_READY = find_spec("cv2") is not None and find_spec("einops") is not None
 MAMBA_BUILD_CASES = (
     ("Mamba-YOLO-L-obb-demo.yaml", "obb"),
+    ("Mamba-YOLO-L-obb-demo-edgevss.yaml", "obb"),
     ("Mamba-YOLO-T.yaml", "detect"),
     ("mamba-hrnet-obb.yaml", "obb"),
+    ("mamba-hrnet-obb-edgevss.yaml", "obb"),
     ("mamba-hrnet-seg.yaml", "segment"),
+    ("yolo-mamba-seg-edgevss-backbone.yaml", "segment"),
+    ("yolo-mamba-seg-edgevss-all.yaml", "segment"),
+    ("mamba-hrnet-seg-edgevss.yaml", "segment"),
 )
 
 
@@ -46,8 +56,10 @@ def test_mamba_model_construction_uses_build_only_cpu_fallback(model_name, task)
 
     model = YOLO(MAMBA_ROOT / model_name, task=task)
 
-    expected_stride = torch.tensor([4.0, 8.0, 16.0, 32.0]) if model_name == "mamba-hrnet-seg.yaml" else torch.tensor(
-        [8.0, 16.0, 32.0]
+    expected_stride = (
+        torch.tensor([4.0, 8.0, 16.0, 32.0])
+        if model_name in {"mamba-hrnet-seg.yaml", "mamba-hrnet-seg-edgevss.yaml"}
+        else torch.tensor([8.0, 16.0, 32.0])
     )
     assert torch.equal(model.model.stride.cpu(), expected_stride)
 

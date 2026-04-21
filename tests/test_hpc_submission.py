@@ -101,6 +101,59 @@ def test_hpc_wrappers_submit_local_configs(tmp_path: Path) -> None:
     assert saw_unfreeze
 
 
+def test_joint_mamba_launcher_includes_edgevss_variants(tmp_path: Path) -> None:
+    """Smoke-test the joint Mamba launcher after adding EdgeVSS variants."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{\n"
+        "  echo CALL\n"
+        "  for arg in \"$@\"; do\n"
+        "    printf '%s\\n' \"$arg\"\n"
+        "  done\n"
+        "  echo END\n"
+        "} >> \"$QSUB_LOG\"\n",
+    )
+    _write_stub(bin_dir / "sleep", "#!/usr/bin/env bash\nexit 0\n")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["QSUB_LOG"] = str(qsub_log)
+
+    subprocess.run(
+        ["bash", "jobs/train/hpc/bash_scripts_joint/mamba_models_448_pn10075s.sh", "4", "4", "5", "0", "0"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == 9
+
+    config_paths = {_parse_varlist(call)["CONFIG_YAML"] for call in calls}
+    expected = {
+        "ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-L-obb-demo.yaml",
+        "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-obb.yaml",
+        "ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-L-obb-demo-edgevss.yaml",
+        "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-obb-edgevss.yaml",
+        "ultralytics/cfg/models/mamba-yolo/yolo-mamba-seg.yaml",
+        "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml",
+        "ultralytics/cfg/models/mamba-yolo/yolo-mamba-seg-edgevss-backbone.yaml",
+        "ultralytics/cfg/models/mamba-yolo/yolo-mamba-seg-edgevss-all.yaml",
+        "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg-edgevss.yaml",
+    }
+
+    assert config_paths == expected
+    for config_yaml in config_paths:
+        assert "/Users/manishagupta/Desktop/PhD/Code" not in config_yaml
+        assert Path(REPO_ROOT / config_yaml).is_file()
+
+
 def test_rotatedfcos_submitter_resolves_local_configs(tmp_path: Path) -> None:
     """Smoke-test the RotatedFCOS submitter with alias, path, and dry-run flows."""
     bin_dir = tmp_path / "bin"

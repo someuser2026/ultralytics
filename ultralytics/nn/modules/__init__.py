@@ -140,7 +140,7 @@ from .rcnn_backbone import ResNetBackbone, UnravelNetBackbone
 from .rpn import AnchorGenerator, RPNHead
 
 try:
-    from .mamba_yolo import SimpleStem, VisionClueMerge, VSSBlock, XSSBlock
+    from .mamba_yolo import EdgeVSSBlock, SimpleStem, VisionClueMerge, VSSBlock, XSSBlock
     _MAMBA_IMPORT_ERROR = None
 except Exception as exc:
     _MAMBA_IMPORT_ERROR = exc
@@ -156,6 +156,7 @@ except Exception as exc:
         _MissingMambaModule.__name__ = name
         return _MissingMambaModule
 
+    EdgeVSSBlock = _missing_mamba_module("EdgeVSSBlock")
     SimpleStem = _missing_mamba_module("SimpleStem")
     VisionClueMerge = _missing_mamba_module("VisionClueMerge")
     VSSBlock = _missing_mamba_module("VSSBlock")
@@ -267,6 +268,7 @@ __all__ = (
     "RHINOOBBDecoder",
     "RTDETROBBDecoder",
     "RTDETRSegmentDecoder",
+    "EdgeVSSBlock",
     "SimpleStem",
     "VisionClueMerge",
     "VSSBlock",

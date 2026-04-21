@@ -65,11 +65,16 @@ SEG_EXTRA=",CLAHE_P=0.0,MOTION_BLUR_P=0.50,MULTI_SPEC_NOISE_P=0.10,UNSHARP_P=0.5
 OBB_MODELS=(
   "o_mamba_l|ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-L-obb-demo.yaml|0"
   "o_mamba_hr|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-obb.yaml|0"
+  "o_mamba_l_edgevss|ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-L-obb-demo-edgevss.yaml|0"
+  "o_mamba_hr_edgevss|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-obb-edgevss.yaml|0"
 )
 
 SEG_MODELS=(
   "s_mamba|ultralytics/cfg/models/mamba-yolo/yolo-mamba-seg.yaml|0"
   "s_mamba_hr|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|0"
+  "s_mamba_edgevss_bb|ultralytics/cfg/models/mamba-yolo/yolo-mamba-seg-edgevss-backbone.yaml|0"
+  "s_mamba_edgevss_all|ultralytics/cfg/models/mamba-yolo/yolo-mamba-seg-edgevss-all.yaml|0"
+  "s_mamba_hr_edgevss|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg-edgevss.yaml|0"
 )
 
 for entry in "${OBB_MODELS[@]}"; do
