@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#PBS -q generalgpu2
+#PBS -q generalgpu12
 #PBS -l select=1:ncpus=6:ngpus=1:mem=32gb
 #PBS -l walltime=11:00:00
 #PBS -M z5428587@ad.unsw.edu.au
