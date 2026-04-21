@@ -257,7 +257,8 @@ class RotatedCdnQueryGenerator:
         noise_part = gt_bboxes_expand.new_zeros(gt_bboxes_expand.shape)
         noise_part[:, :4] = rand_part[:, :4] * gt_bboxes_expand[:, 2:4].repeat(1, 2) * self.box_noise_scale / 2
         noisy_bboxes = gt_bboxes_expand + noise_part
-        noisy_bboxes[:, :4].clamp_(min=0.0, max=1.0)
+        noisy_bboxes[:, :2].clamp_(min=0.0, max=1.0)
+        noisy_bboxes[:, 2:4].clamp_(min=1e-6, max=1.0)
         noisy_bboxes[:, 4:5].clamp_(min=1e-6, max=1 - 1e-6)
         return torch.logit(noisy_bboxes, eps=1e-6)
 
@@ -478,4 +479,3 @@ class RHINOOBBDecoder(RTDETRDecoder):
             return outputs
         y = torch.cat((dec_bboxes.squeeze(0), dec_scores.squeeze(0).sigmoid()), dim=-1)
         return y if self.export else (y, outputs)
-

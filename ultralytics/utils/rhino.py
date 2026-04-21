@@ -33,7 +33,7 @@ def xy_wh_r_2_xy_sigma(xywhr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
 def postprocess_distance(distance: torch.Tensor, fun: str = "log1p", tau: float = 1.0) -> torch.Tensor:
     """Apply RHINO-style nonlinear postprocessing to distances."""
     if fun == "log1p":
-        distance = torch.log1p(distance)
+        distance = torch.log1p(distance.clamp_min(-1 + 1e-7))
     elif fun == "sqrt":
         distance = torch.sqrt(distance.clamp_min(1e-7))
     elif fun == "none":
@@ -363,20 +363,27 @@ class RHINOOBBLoss(RTDETROBBLoss):
                 name_giou: torch.tensor(0.0, device=self.device),
             }
 
+        pred_boxes = pred_bboxes
+        gt_boxes = gt_bboxes
+        if pred_boxes.shape[-1] >= 4:
+            pred_boxes = torch.cat((pred_boxes[..., :2], pred_boxes[..., 2:4].clamp_min(1e-6), pred_boxes[..., 4:]), dim=-1)
+        if gt_boxes.shape[-1] >= 4:
+            gt_boxes = torch.cat((gt_boxes[..., :2], gt_boxes[..., 2:4].clamp_min(1e-6), gt_boxes[..., 4:]), dim=-1)
+
         bbox_dim = 5 if str(self.loss_types.get("bbox", "l1")).lower() in {"l1", "rboxl1", "xywha"} else 4
         loss_bbox = self.loss_gain["bbox"] * F.l1_loss(
-            pred_bboxes[..., :bbox_dim], gt_bboxes[..., :bbox_dim], reduction="sum"
+            pred_boxes[..., :bbox_dim], gt_boxes[..., :bbox_dim], reduction="sum"
         ) / len(gt_bboxes)
 
         giou_type = str(self.loss_types.get("giou", "kld")).lower()
         if giou_type == "probiou":
-            loss_giou = 1.0 - probiou(pred_bboxes[..., :5], gt_bboxes[..., :5])
+            loss_giou = 1.0 - probiou(pred_boxes[..., :5], gt_boxes[..., :5])
         elif giou_type == "hausdorff":
-            loss_giou = hausdorff_distance(pred_bboxes[..., :5], gt_bboxes[..., :5])
+            loss_giou = hausdorff_distance(pred_boxes[..., :5], gt_boxes[..., :5])
         else:
             loss_giou = kld_loss(
-                xy_wh_r_2_xy_sigma(pred_bboxes[..., :5]),
-                xy_wh_r_2_xy_sigma(gt_bboxes[..., :5]),
+                xy_wh_r_2_xy_sigma(pred_boxes[..., :5]),
+                xy_wh_r_2_xy_sigma(gt_boxes[..., :5]),
                 fun="log1p",
                 tau=1.0,
                 alpha=1.0,

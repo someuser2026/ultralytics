@@ -9,7 +9,39 @@ import math
 from typing import List, Tuple
 import torch
 from torch import Tensor, nn
-from torchvision.ops import roi_align, nms
+from torch.nn.modules.utils import _pair
+from torchvision.ops import nms, roi_align as _roi_align_fallback
+
+
+def torchvision_native_roi_align(
+    input: Tensor,
+    rois: Tensor,
+    output_size: int | tuple[int, int],
+    spatial_scale: float = 1.0,
+    sampling_ratio: int = -1,
+    aligned: bool = False,
+) -> Tensor:
+    """Prefer torchvision's registered op over the compiled Python fallback.
+
+    When deterministic algorithms are enabled on CUDA, ``torchvision.ops.roi_align``
+    dispatches to a Python implementation wrapped in ``torch.compile(dynamic=True)``.
+    The adaptive-sampling branch used by Mask R-CNN can then fail during backward
+    compilation with Triton block-size assertions. MMDetection uses compiled ROI
+    extensions directly, so mirror that behavior here when the op is registered.
+    """
+    output_h, output_w = _pair(output_size)
+    if hasattr(torch.ops.torchvision, "roi_align"):
+        return torch.ops.torchvision.roi_align(
+            input, rois, spatial_scale, output_h, output_w, sampling_ratio, aligned
+        )
+    return _roi_align_fallback(
+        input,
+        rois,
+        output_size=(output_h, output_w),
+        spatial_scale=spatial_scale,
+        sampling_ratio=sampling_ratio,
+        aligned=aligned,
+    )
 
 
 def assign_fpn_levels(
@@ -156,7 +188,7 @@ def roi_align_multilevel(
         rois_lvl = rois[idx].clone()
         rois_lvl[:, 1:5] = rois_lvl[:, 1:5] / stride
         
-        pooled_lvl = roi_align(
+        pooled_lvl = torchvision_native_roi_align(
             feat,
             rois_lvl,
             output_size=output_size,

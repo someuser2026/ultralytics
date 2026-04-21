@@ -17,11 +17,11 @@ from typing import Iterable
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torchvision.ops import roi_align
 
 from ultralytics.utils import ops
 from ultralytics.utils.metrics import batch_probiou, box_iou
 from ultralytics.utils.nms import TorchNMS
+from .roi import torchvision_native_roi_align
 
 __all__ = (
     "MaskRCNNHead",
@@ -453,7 +453,7 @@ def _roi_align_multilevel(feats: list[Tensor], rois: Tensor, output_size: int, s
         idx = torch.where(levels == level)[0]
         if idx.numel() == 0:
             continue
-        pooled[idx] = roi_align(
+        pooled[idx] = torchvision_native_roi_align(
             feats[level - 2],
             rois[idx],
             output_size=output_size,

@@ -15,13 +15,13 @@ rhino:
   matcher_costs:
     - {type: focal, weight: 2.0}
     - {type: hausdorff, weight: 5.0, num_points: 4}
-    - {type: gdcost, loss_type: kld, fun: log1p, tau: 1.0, alpha: 1.0, sqrt: false, weight: 2.0}
+    - {type: probiou, weight: 2.0}
   dn_matcher_costs:
     - {type: focal, weight: 2.0}
     - {type: center_l1, weight: 5.0}
-    - {type: gdcost, loss_type: kld, fun: log1p, tau: 1.0, alpha: 1.0, sqrt: false, weight: 2.0}
+    - {type: probiou, weight: 2.0}
   loss_weights: {class: 1.0, bbox: 5.0, giou: 2.0, no_object: 0.1}
-  loss_types: {bbox: l1, giou: kld}
+  loss_types: {bbox: l1, giou: probiou}
 
 backbone:
   - [-1, 1, ResNetLayer, [3, 64, 1, True, 1]]

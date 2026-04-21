@@ -184,6 +184,75 @@ def test_rotated_roi_align_offset_cache_is_bounded(monkeypatch):
     assert ("cpu", None, 7, 2, 2) not in rcnn_module._ROTATED_ROI_ALIGN_OFFSET_CACHE
 
 
+def test_torchvision_native_roi_align_prefers_registered_op(monkeypatch):
+    import ultralytics.nn.modules.roi as roi_module
+
+    calls = {}
+
+    def fake_native(input, rois, spatial_scale, pooled_height, pooled_width, sampling_ratio, aligned):
+        calls["args"] = {
+            "input_shape": tuple(input.shape),
+            "rois_shape": tuple(rois.shape),
+            "spatial_scale": spatial_scale,
+            "pooled_height": pooled_height,
+            "pooled_width": pooled_width,
+            "sampling_ratio": sampling_ratio,
+            "aligned": aligned,
+        }
+        return input.new_zeros((rois.shape[0], input.shape[1], pooled_height, pooled_width))
+
+    def fail_fallback(*args, **kwargs):
+        raise AssertionError("native torchvision ROIAlign op should be preferred when it is registered")
+
+    monkeypatch.setattr(roi_module.torch.ops.torchvision, "roi_align", fake_native)
+    monkeypatch.setattr(roi_module, "_roi_align_fallback", fail_fallback)
+
+    feat = torch.randn(2, 16, 8, 8)
+    rois = torch.tensor([[0.0, 4.0, 4.0, 20.0, 20.0], [1.0, 8.0, 6.0, 24.0, 26.0]], dtype=torch.float32)
+    out = roi_module.torchvision_native_roi_align(feat, rois, output_size=7, spatial_scale=0.25, sampling_ratio=0, aligned=True)
+
+    assert out.shape == (2, 16, 7, 7)
+    assert calls["args"] == {
+        "input_shape": (2, 16, 8, 8),
+        "rois_shape": (2, 5),
+        "spatial_scale": 0.25,
+        "pooled_height": 7,
+        "pooled_width": 7,
+        "sampling_ratio": 0,
+        "aligned": True,
+    }
+
+
+def test_axis_roi_align_multilevel_uses_native_helper(monkeypatch):
+    import ultralytics.nn.modules.rcnn as rcnn_module
+
+    calls = []
+
+    def fake_native(feat, rois, output_size, spatial_scale=1.0, sampling_ratio=-1, aligned=False):
+        calls.append((tuple(feat.shape), tuple(rois.shape), output_size, spatial_scale, sampling_ratio, aligned))
+        return feat.new_zeros((rois.shape[0], feat.shape[1], output_size, output_size))
+
+    monkeypatch.setattr(rcnn_module, "torchvision_native_roi_align", fake_native)
+
+    feats = _rcnn_feats()
+    rois = torch.tensor(
+        [
+            [0.0, 8.0, 8.0, 24.0, 24.0],
+            [0.0, 40.0, 40.0, 96.0, 96.0],
+            [1.0, 72.0, 72.0, 120.0, 120.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    pooled = rcnn_module._roi_align_multilevel(feats[:4], rois, output_size=7, sampling_ratio=0, featmap_strides=(4, 8, 16, 32))
+
+    assert pooled.shape == (3, 16, 7, 7)
+    assert calls
+    assert all(call[2] == 7 for call in calls)
+    assert all(call[4] == 0 for call in calls)
+    assert all(call[5] is True for call in calls)
+
+
 def _rcnn_feats(dtype=torch.float32):
     return [
         torch.randn(2, 16, 32, 32, dtype=dtype),

@@ -148,6 +148,35 @@ def test_rhino_hausdorff_cost_stable():
 
 
 @pytest.mark.skipif(not RHINO_TEST_READY, reason="cv2 and torch are required to import Ultralytics models")
+def test_rhino_probiou_loss_stable_for_small_boxes():
+    from ultralytics.utils.rhino import RHINOOBBLoss
+
+    criterion = RHINOOBBLoss(nc=1, loss_types={"bbox": "l1", "giou": "probiou"})
+    criterion.device = torch.device("cpu")
+
+    pred_boxes = torch.tensor(
+        [
+            [0.50, 0.50, 0.00, 0.00, 0.00],
+            [0.50, 0.50, 1e-9, 1e-9, 0.00],
+            [0.50, 0.50, 0.20, 0.30, 0.10],
+        ],
+        dtype=torch.float32,
+    )
+    gt_boxes = torch.tensor(
+        [
+            [0.50, 0.50, 0.20, 0.20, 0.00],
+            [0.50, 0.50, 0.20, 0.20, 0.00],
+            [0.50, 0.50, 0.20, 0.30, 0.10],
+        ],
+        dtype=torch.float32,
+    )
+
+    losses = criterion._get_loss_bbox(pred_boxes, gt_boxes)
+    assert torch.isfinite(losses["loss_bbox"])
+    assert torch.isfinite(losses["loss_giou"])
+
+
+@pytest.mark.skipif(not RHINO_TEST_READY, reason="cv2 and torch are required to import Ultralytics models")
 def test_rhino_dn_group_assigner_expected_matches():
     from ultralytics.utils.rhino import DNGroupHungarianAssigner
 
