@@ -31,6 +31,7 @@ Here's a compilation of in-depth guides to help you master different aspects of 
 - [YOLO Data Augmentation](yolo-data-augmentation.md) 🚀 NEW: Master the complete range of data augmentation techniques in YOLO, from basic transformations to advanced strategies for improving model robustness and performance.
 - [Model Deployment Options](model-deployment-options.md): Overview of YOLO [model deployment](https://www.ultralytics.com/glossary/model-deployment) formats like ONNX, OpenVINO, and TensorRT, with pros and cons for each to inform your deployment strategy.
 - [Model YAML Configuration Guide](model-yaml-config.md) 🚀 NEW: A comprehensive deep dive into Ultralytics' model architecture definitions. Explore the YAML format, understand the module resolution system, and learn how to integrate custom modules seamlessly.
+- [LEGNet and Mamba-YOLO Backbone Diagrams](backbone-diagrams.md): Stage-by-stage diagrams for the custom LEGNet-small and Mamba-YOLO-L backbones used in this fork.
 - [K-Fold Cross Validation](kfold-cross-validation.md) 🚀 NEW: Learn how to improve model generalization using K-Fold cross-validation technique.
 - [Hyperparameter Tuning](hyperparameter-tuning.md) 🚀 NEW: Discover how to optimize your YOLO models by fine-tuning hyperparameters using the Tuner class and genetic evolution algorithms.
 - [SAHI Tiled Inference](sahi-tiled-inference.md) 🚀 NEW: Comprehensive guide on leveraging SAHI's sliced inference capabilities with YOLO11 for object detection in high-resolution images.

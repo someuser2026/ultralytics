@@ -13,6 +13,10 @@ class RCNN(Model):
 
     def __init__(self, model: str = "mask-rcnn.yaml", task: str | None = None) -> None:
         super().__init__(model=model, task=task)
+        if self.task == "segment":
+            self.overrides["overlap_mask"] = False
+            if hasattr(self.model, "args") and isinstance(self.model.args, dict):
+                self.model.args["overlap_mask"] = False
 
     @property
     def task_map(self) -> dict:

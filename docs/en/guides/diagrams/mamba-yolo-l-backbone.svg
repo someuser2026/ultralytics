@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1960" height="430" viewBox="0 0 1960 430" role="img" aria-labelledby="title desc">
+  <title id="title">Mamba-YOLO-L backbone diagram</title>
+  <desc id="desc">Stage-by-stage diagram of the Mamba-YOLO-L backbone from input through SimpleStem, VSSBlock stacks, VisionClueMerge stages, and SPPF, with P3 to P5 outputs.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#425466"/>
+    </marker>
+    <style>
+      .bg { fill: #f7f9fc; }
+      .title { font: 700 24px Arial, Helvetica, sans-serif; fill: #14213d; }
+      .subtitle { font: 400 13px Arial, Helvetica, sans-serif; fill: #425466; }
+      .legend { font: 400 13px Arial, Helvetica, sans-serif; fill: #243b53; }
+      .box-title { font: 700 16px Arial, Helvetica, sans-serif; fill: #14213d; text-anchor: middle; }
+      .box-text { font: 400 13px Arial, Helvetica, sans-serif; fill: #243b53; text-anchor: middle; }
+      .pill-text { font: 700 13px Arial, Helvetica, sans-serif; fill: #0b1320; text-anchor: middle; }
+      .arrow { stroke: #425466; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #7b8794; stroke-width: 2; stroke-dasharray: 6 5; fill: none; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1960" height="430" rx="18"/>
+  <text class="title" x="40" y="40">Mamba-YOLO-L Backbone</text>
+  <text class="subtitle" x="40" y="66">Alternating VSSBlock stacks and VisionClueMerge downsampling, ending with SPPF at P5/32.</text>
+
+  <rect x="1420" y="24" width="500" height="58" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text class="legend" x="1440" y="49">Legend: raw = literal YAML values. eff = effective values after Ultralytics applies</text>
+  <text class="legend" x="1440" y="69">the local L scale parser: scales.L = [0.67, 0.75, 768].</text>
+
+  <rect x="40" y="170" width="110" height="90" rx="14" fill="#ffffff" stroke="#98a2b3" stroke-width="2"/>
+  <text class="box-title" x="95" y="203">Input</text>
+  <text class="box-text" x="95" y="227">RGB image</text>
+  <text class="box-text" x="95" y="247">3 channels</text>
+
+  <rect x="185" y="145" width="180" height="140" rx="16" fill="#e0f2fe" stroke="#0ea5e9" stroke-width="2.5"/>
+  <text class="box-title" x="275" y="179">SimpleStem</text>
+  <text class="box-text" x="275" y="203">2 x stride-2 conv</text>
+  <text class="box-text" x="275" y="227">128 raw / 96 eff</text>
+  <text class="box-text" x="275" y="251">P2/4</text>
+
+  <rect x="400" y="145" width="190" height="140" rx="16" fill="#ede9fe" stroke="#7c3aed" stroke-width="2.5"/>
+  <text class="box-title" x="495" y="179">VSSBlock stack</text>
+  <text class="box-text" x="495" y="203">x3 raw / x2 eff</text>
+  <text class="box-text" x="495" y="227">96 effective channels</text>
+  <text class="box-text" x="495" y="251">LSBlock + SS2D + RGBlock</text>
+
+  <rect x="625" y="160" width="175" height="110" rx="16" fill="#fde68a" stroke="#d97706" stroke-width="2.5"/>
+  <text class="box-title" x="712.5" y="194">VisionClueMerge</text>
+  <text class="box-text" x="712.5" y="218">2x2 space-to-depth</text>
+  <text class="box-text" x="712.5" y="238">256 raw / 192 eff</text>
+
+  <rect x="835" y="145" width="190" height="140" rx="16" fill="#ede9fe" stroke="#7c3aed" stroke-width="2.5"/>
+  <text class="box-title" x="930" y="179">VSSBlock stack</text>
+  <text class="box-text" x="930" y="203">x3 raw / x2 eff</text>
+  <text class="box-text" x="930" y="227">192 effective channels</text>
+  <text class="box-text" x="930" y="251">P3/8 output stage</text>
+
+  <rect x="1060" y="160" width="175" height="110" rx="16" fill="#fde68a" stroke="#d97706" stroke-width="2.5"/>
+  <text class="box-title" x="1147.5" y="194">VisionClueMerge</text>
+  <text class="box-text" x="1147.5" y="218">2x2 space-to-depth</text>
+  <text class="box-text" x="1147.5" y="238">512 raw / 384 eff</text>
+
+  <rect x="1270" y="145" width="190" height="140" rx="16" fill="#ede9fe" stroke="#7c3aed" stroke-width="2.5"/>
+  <text class="box-title" x="1365" y="179">VSSBlock stack</text>
+  <text class="box-text" x="1365" y="203">x9 raw / x6 eff</text>
+  <text class="box-text" x="1365" y="227">384 effective channels</text>
+  <text class="box-text" x="1365" y="251">P4/16 output stage</text>
+
+  <rect x="1495" y="160" width="175" height="110" rx="16" fill="#fde68a" stroke="#d97706" stroke-width="2.5"/>
+  <text class="box-title" x="1582.5" y="194">VisionClueMerge</text>
+  <text class="box-text" x="1582.5" y="218">2x2 space-to-depth</text>
+  <text class="box-text" x="1582.5" y="238">1024 raw / 576 eff</text>
+
+  <rect x="1705" y="145" width="160" height="140" rx="16" fill="#ede9fe" stroke="#7c3aed" stroke-width="2.5"/>
+  <text class="box-title" x="1785" y="179">VSSBlock</text>
+  <text class="box-title" x="1785" y="199">stack</text>
+  <text class="box-text" x="1785" y="223">x3 raw / x2 eff</text>
+  <text class="box-text" x="1785" y="247">576 effective ch</text>
+
+  <rect x="1890" y="160" width="50" height="110" rx="16" fill="#dbeafe" stroke="#2563eb" stroke-width="2.5"/>
+  <text class="box-title" transform="translate(1915 196)">SPPF</text>
+  <text class="box-text" transform="translate(1915 220)">P5</text>
+  <text class="box-text" transform="translate(1915 240)">576</text>
+
+  <path class="arrow" d="M 150 215 L 185 215"/>
+  <path class="arrow" d="M 365 215 L 400 215"/>
+  <path class="arrow" d="M 590 215 L 625 215"/>
+  <path class="arrow" d="M 800 215 L 835 215"/>
+  <path class="arrow" d="M 1025 215 L 1060 215"/>
+  <path class="arrow" d="M 1235 215 L 1270 215"/>
+  <path class="arrow" d="M 1460 215 L 1495 215"/>
+  <path class="arrow" d="M 1670 215 L 1705 215"/>
+  <path class="arrow" d="M 1865 215 L 1890 215"/>
+
+  <rect x="865" y="325" width="130" height="44" rx="22" fill="#dcfce7" stroke="#16a34a" stroke-width="2.5"/>
+  <text class="pill-text" x="930" y="352">P3/8 to neck</text>
+  <path class="dash" d="M 930 285 L 930 325"/>
+
+  <rect x="1300" y="325" width="130" height="44" rx="22" fill="#dcfce7" stroke="#16a34a" stroke-width="2.5"/>
+  <text class="pill-text" x="1365" y="352">P4/16 to neck</text>
+  <path class="dash" d="M 1365 285 L 1365 325"/>
+
+  <rect x="1825" y="325" width="150" height="44" rx="22" fill="#dcfce7" stroke="#16a34a" stroke-width="2.5"/>
+  <text class="pill-text" x="1900" y="352">P5/32 to neck</text>
+  <path class="dash" d="M 1915 270 L 1915 325"/>
+
+  <text class="legend" x="40" y="398">VSSBlock = 1x1 projection + LSBlock + SS2D selective scan residual + RGBlock MLP residual.</text>
+</svg>

@@ -791,6 +791,12 @@ class Model(torch.nn.Module):
         args = {**overrides, **custom, **kwargs, "mode": "train", "session": self.session}  # prioritizes rightmost args
         if args.get("resume"):
             args["resume"] = self.ckpt_path
+        if self.__class__.__name__ == "RCNN" and self.task == "segment" and args.get("overlap_mask", True):
+            LOGGER.warning(
+                "Mask R-CNN/Cascade Mask R-CNN require per-instance masks. Overriding 'overlap_mask=True' to "
+                "'overlap_mask=False'."
+            )
+            args["overlap_mask"] = False
 
         self.trainer = (trainer or self._smart_load("trainer"))(overrides=args, _callbacks=self.callbacks)
         if not args.get("resume"):  # manually set model only if not resuming

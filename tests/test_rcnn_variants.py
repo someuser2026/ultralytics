@@ -253,6 +253,30 @@ def test_axis_roi_align_multilevel_uses_native_helper(monkeypatch):
     assert all(call[5] is True for call in calls)
 
 
+def test_rcnn_segment_model_defaults_overlap_mask_false():
+    from ultralytics import YOLO
+
+    model = YOLO(str(RCNN_ROOT / "mask_rcnn_r50_fpn.yaml"))
+
+    assert model.overrides["overlap_mask"] is False
+    assert model.model.args["overlap_mask"] is False
+
+
+def test_split_targets_rejects_lossy_overlap_masks():
+    from ultralytics.nn.modules.rcnn import _split_targets
+
+    batch = {
+        "img": torch.rand(1, 3, 64, 64),
+        "batch_idx": torch.tensor([0, 0], dtype=torch.long),
+        "cls": torch.tensor([[0], [0]], dtype=torch.float32),
+        "bboxes": torch.tensor([[0.4, 0.4, 0.2, 0.2], [0.6, 0.6, 0.2, 0.2]], dtype=torch.float32),
+        "masks": torch.ones(1, 8, 8, dtype=torch.float32),
+    }
+
+    with pytest.raises(ValueError, match="overlap_mask=False"):
+        _split_targets(batch, "segment")
+
+
 def _rcnn_feats(dtype=torch.float32):
     return [
         torch.randn(2, 16, 32, 32, dtype=dtype),

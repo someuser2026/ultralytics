@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1760" height="420" viewBox="0 0 1760 420" role="img" aria-labelledby="title desc">
+  <title id="title">LEGNet-small backbone diagram</title>
+  <desc id="desc">Stage-by-stage diagram of the LEGNet-small backbone from input through stem, four BasicStage groups, and DRFD downsamples, with P2 to P5 outputs.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#425466"/>
+    </marker>
+    <style>
+      .bg { fill: #f7f9fc; }
+      .title { font: 700 24px Arial, Helvetica, sans-serif; fill: #14213d; }
+      .subtitle { font: 400 13px Arial, Helvetica, sans-serif; fill: #425466; }
+      .box-title { font: 700 16px Arial, Helvetica, sans-serif; fill: #14213d; text-anchor: middle; }
+      .box-text { font: 400 13px Arial, Helvetica, sans-serif; fill: #243b53; text-anchor: middle; }
+      .pill-text { font: 700 13px Arial, Helvetica, sans-serif; fill: #0b1320; text-anchor: middle; }
+      .note { font: 400 13px Arial, Helvetica, sans-serif; fill: #52606d; }
+      .arrow { stroke: #425466; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #7b8794; stroke-width: 2; stroke-dasharray: 6 5; fill: none; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1760" height="420" rx="18"/>
+  <text class="title" x="40" y="40">LEGNet-small Backbone</text>
+  <text class="subtitle" x="40" y="66">Expanded from the single LWEGNet node in the YAML into Stem -&gt; 4 stages -&gt; 3 DRFD downsamples.</text>
+
+  <rect x="40" y="165" width="110" height="90" rx="14" fill="#ffffff" stroke="#98a2b3" stroke-width="2"/>
+  <text class="box-title" x="95" y="198">Input</text>
+  <text class="box-text" x="95" y="222">RGB image</text>
+  <text class="box-text" x="95" y="242">3 channels</text>
+
+  <rect x="190" y="140" width="210" height="140" rx="16" fill="#e0f2fe" stroke="#0ea5e9" stroke-width="2.5"/>
+  <text class="box-title" x="295" y="174">Stem</text>
+  <text class="box-text" x="295" y="198">LoGFilter</text>
+  <text class="box-text" x="295" y="218">conv_d + Gaussian</text>
+  <text class="box-text" x="295" y="238">DRFD</text>
+  <text class="box-text" x="295" y="262">64 ch, P2/4</text>
+
+  <rect x="440" y="140" width="180" height="140" rx="16" fill="#ede9fe" stroke="#7c3aed" stroke-width="2.5"/>
+  <text class="box-title" x="530" y="174">Stage 1</text>
+  <text class="box-text" x="530" y="198">BasicStage</text>
+  <text class="box-text" x="530" y="218">1 x LFEModule</text>
+  <text class="box-text" x="530" y="238">Scharr edge branch</text>
+  <text class="box-text" x="530" y="262">64 ch, P2/4</text>
+
+  <rect x="660" y="160" width="150" height="100" rx="16" fill="#fde68a" stroke="#d97706" stroke-width="2.5"/>
+  <text class="box-title" x="735" y="195">DRFD</text>
+  <text class="box-text" x="735" y="219">downsample</text>
+  <text class="box-text" x="735" y="239">64 -&gt; 128</text>
+
+  <rect x="850" y="140" width="180" height="140" rx="16" fill="#ede9fe" stroke="#7c3aed" stroke-width="2.5"/>
+  <text class="box-title" x="940" y="174">Stage 2</text>
+  <text class="box-text" x="940" y="198">BasicStage</text>
+  <text class="box-text" x="940" y="218">4 x LFEModule</text>
+  <text class="box-text" x="940" y="238">Gaussian edge branch</text>
+  <text class="box-text" x="940" y="262">128 ch, P3/8</text>
+
+  <rect x="1070" y="160" width="150" height="100" rx="16" fill="#fde68a" stroke="#d97706" stroke-width="2.5"/>
+  <text class="box-title" x="1145" y="195">DRFD</text>
+  <text class="box-text" x="1145" y="219">downsample</text>
+  <text class="box-text" x="1145" y="239">128 -&gt; 256</text>
+
+  <rect x="1260" y="140" width="180" height="140" rx="16" fill="#ede9fe" stroke="#7c3aed" stroke-width="2.5"/>
+  <text class="box-title" x="1350" y="174">Stage 3</text>
+  <text class="box-text" x="1350" y="198">BasicStage</text>
+  <text class="box-text" x="1350" y="218">4 x LFEModule</text>
+  <text class="box-text" x="1350" y="238">Gaussian edge branch</text>
+  <text class="box-text" x="1350" y="262">256 ch, P4/16</text>
+
+  <rect x="1480" y="160" width="150" height="100" rx="16" fill="#fde68a" stroke="#d97706" stroke-width="2.5"/>
+  <text class="box-title" x="1555" y="195">DRFD</text>
+  <text class="box-text" x="1555" y="219">downsample</text>
+  <text class="box-text" x="1555" y="239">256 -&gt; 512</text>
+
+  <rect x="1660" y="140" width="60" height="140" rx="16" fill="#ede9fe" stroke="#7c3aed" stroke-width="2.5"/>
+  <text class="box-title" transform="translate(1690 174)">Stage</text>
+  <text class="box-title" transform="translate(1690 194)">4</text>
+  <text class="box-text" transform="translate(1690 220)">2 x</text>
+  <text class="box-text" transform="translate(1690 240)">LFE</text>
+  <text class="box-text" transform="translate(1690 260)">512</text>
+
+  <path class="arrow" d="M 150 210 L 190 210"/>
+  <path class="arrow" d="M 400 210 L 440 210"/>
+  <path class="arrow" d="M 620 210 L 660 210"/>
+  <path class="arrow" d="M 810 210 L 850 210"/>
+  <path class="arrow" d="M 1030 210 L 1070 210"/>
+  <path class="arrow" d="M 1220 210 L 1260 210"/>
+  <path class="arrow" d="M 1440 210 L 1480 210"/>
+  <path class="arrow" d="M 1630 210 L 1660 210"/>
+
+  <rect x="465" y="320" width="130" height="44" rx="22" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text class="pill-text" x="530" y="347">P2/4</text>
+  <path class="dash" d="M 530 280 L 530 320"/>
+
+  <rect x="875" y="320" width="130" height="44" rx="22" fill="#dcfce7" stroke="#16a34a" stroke-width="2.5"/>
+  <text class="pill-text" x="940" y="347">P3/8 to head</text>
+  <path class="dash" d="M 940 280 L 940 320"/>
+
+  <rect x="1285" y="320" width="130" height="44" rx="22" fill="#dcfce7" stroke="#16a34a" stroke-width="2.5"/>
+  <text class="pill-text" x="1350" y="347">P4/16 to head</text>
+  <path class="dash" d="M 1350 280 L 1350 320"/>
+
+  <rect x="1590" y="320" width="160" height="44" rx="22" fill="#dcfce7" stroke="#16a34a" stroke-width="2.5"/>
+  <text class="pill-text" x="1670" y="347">P5/32 to head</text>
+  <path class="dash" d="M 1690 280 L 1690 320"/>
+
+  <text class="note" x="40" y="392">LFEModule = edge extractor + LFEA attention + pointwise MLP residual. Stage 1 uses Scharr edges; later stages use Gaussian edges.</text>
+</svg>

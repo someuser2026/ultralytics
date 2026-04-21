@@ -73,9 +73,16 @@ def _split_targets(batch: dict, task: str) -> tuple[list[Tensor], list[Tensor], 
                     masks = masks_all[i : i + 1]
                 else:
                     masks = masks_all[idx] if masks_all.shape[0] > i else None
-                if masks is not None and masks.shape[0] == 1 and labels.numel() > 1 and masks.max() > 1:
-                    ids = torch.arange(labels.numel(), device=device).view(-1, 1, 1) + 1
-                    masks = (masks.repeat(labels.numel(), 1, 1) == ids).float()
+                if masks is not None and masks.shape[0] == 1 and labels.numel() > 1:
+                    if masks.max() > 1:
+                        ids = torch.arange(labels.numel(), device=device).view(-1, 1, 1) + 1
+                        masks = (masks.repeat(labels.numel(), 1, 1) == ids).float()
+                    else:
+                        raise ValueError(
+                            "Mask R-CNN/Cascade Mask R-CNN require per-instance masks, but the current batch "
+                            "contains a single overlapped mask for an image with multiple instances. "
+                            "Rerun with overlap_mask=False."
+                        )
                 if masks is not None and masks.shape[-2:] != imgsz:
                     masks = F.interpolate(masks[:, None].float(), size=imgsz, mode="nearest").squeeze(1)
             gt_masks.append(masks)
