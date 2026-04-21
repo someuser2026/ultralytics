@@ -225,7 +225,7 @@ class DRFD(nn.Module):
         return self.fusion(torch.cat([conv, pooled], dim=1))
 
 
-class Stem(nn.Module):
+class EdgeEnhancingStem(nn.Module):
     def __init__(self, in_channels: int, stem_dim: int, act_layer: type[nn.Module]) -> None:
         super().__init__()
         out_c14 = stem_dim // 4
@@ -245,6 +245,10 @@ class Stem(nn.Module):
         x = self.conv_d(x)
         x = self.norm(x + self.gaussian(x))
         return self.drfd(x)
+
+
+class Stem(EdgeEnhancingStem):
+    pass
 
 
 class LWEGNet(nn.Module):

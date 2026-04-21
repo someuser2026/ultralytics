@@ -1,7 +1,7 @@
 from .common_utils_mbyolo import *
-from .legnet import Gaussian, LFEA, Scharr
+from .legnet import EdgeEnhancingStem, Gaussian, LFEA, Scharr
 
-__all__ = ("VSSBlock", "EdgeVSSBlock", "SimpleStem", "VisionClueMerge", "XSSBlock")
+__all__ = ("VSSBlock", "EdgeVSSBlock", "SimpleStem", "EdgeStem", "VisionClueMerge", "XSSBlock")
 
 
 class SS2D(nn.Module):
@@ -479,6 +479,13 @@ class SimpleStem(nn.Module):
 
     def forward(self, x):
         return self.conv(x)
+
+
+class EdgeStem(EdgeEnhancingStem):
+    def __init__(self, inp, embed_dim, ks=3):
+        if ks != 3:
+            raise ValueError(f"EdgeStem only supports ks=3, got ks={ks}.")
+        super().__init__(inp, embed_dim, nn.ReLU)
 
 
 class VisionClueMerge(nn.Module):

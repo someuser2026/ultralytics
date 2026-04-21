@@ -12,7 +12,7 @@ scales:  # [depth, width, max_channels]
 
 backbone:
   # Stem + Stage 1 (single high-resolution branch)
-  - [-1, 1, SimpleStem, [128, 3]]  # 0-P2/4
+  - [-1, 1, EdgeStem, [128, 3]]  # 0-P2/4
   - [-1, 2, EdgeVSSBlock, [128]]  # 1 Stage1-B1
 
   # Transition 1: 1 -> 2 branches

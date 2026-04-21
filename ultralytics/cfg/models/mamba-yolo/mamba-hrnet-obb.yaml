@@ -4,7 +4,7 @@
 # Stage layout: 1 branch -> 2 branches -> 3 branches -> 4 branches.
 # Each branch uses VSSBlock stacks in place of HRNet bottlenecks/basic blocks.
 
-nc: 80  # number of classes
+nc: 1  # number of classes
 scales:  # [depth, width, max_channels]
   T: [0.33, 0.25, 1024]
   B: [0.33, 0.50, 1024]
