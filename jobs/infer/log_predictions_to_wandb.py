@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -249,7 +248,7 @@ def save_predictions_json(results, output_dir: str | Path, source_root=None) -> 
 
 
 def log_predictions(pred_dir: str | Path, run_name: str, subset: str, wandb_module=None) -> bool:
-    """Upload one split's predictions directory to W&B and clean it up on success."""
+    """Upload one split's predictions directory to W&B while keeping the local export on disk."""
     wandb_module = wandb_module or wb
     if wandb_module is None:
         raise RuntimeError("wandb is not installed or unavailable in this environment.")
@@ -267,16 +266,10 @@ def log_predictions(pred_dir: str | Path, run_name: str, subset: str, wandb_modu
         if hasattr(logged_artifact, "wait"):
             logged_artifact.wait()
 
-        shutil.rmtree(pred_dir)
-        try:
-            pred_dir.parent.rmdir()
-        except OSError:
-            pass
-
-        LOGGER.info(f"Uploaded {subset} predictions to wandb and removed local directory: {pred_dir}")
+        LOGGER.info(f"Uploaded {subset} predictions to wandb and kept local directory: {pred_dir}")
         return True
     except Exception as exc:
-        LOGGER.warning(f"Failed to upload {subset} predictions to wandb. Keeping local directory {pred_dir}. Error: {exc}")
+        LOGGER.warning(f"Failed to upload {subset} predictions to wandb. Local directory retained: {pred_dir}. Error: {exc}")
         return False
 
 
@@ -389,7 +382,7 @@ def run_inference_exports(args: argparse.Namespace, *, wandb_module=None, model_
             wandb_module=wandb_module,
         )
         _, val_source, test_source = load_data_split_sources(context["data_path"])
-        output_root = context["run_dir"] / "inference_exports" / active_run_name
+        output_root = context["run_dir"] / "predictions"
         predict_kwargs = build_predict_kwargs(context)
 
         exported_subsets = []

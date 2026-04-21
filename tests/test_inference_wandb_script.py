@@ -260,7 +260,7 @@ def test_initialize_wandb_run_raises_on_failed_resume(inference_module, tmp_path
         inference_module.initialize_wandb_run(context, wandb_run_id="abc123", wandb_module=fake_wandb)
 
 
-def test_run_inference_exports_logs_active_run_artifacts_and_cleans_up(inference_module, tmp_path: Path):
+def test_run_inference_exports_logs_active_run_artifacts_and_preserves_local_exports(inference_module, tmp_path: Path):
     run_dir, weights_path = write_run_layout(tmp_path)
     data_yaml, _, _ = write_dataset_yaml(tmp_path / "dataset")
     (run_dir / "args.yaml").write_text(
@@ -278,8 +278,8 @@ def test_run_inference_exports_logs_active_run_artifacts_and_cleans_up(inference
         "demo_run_inference_predictions_val",
         "demo_run_inference_predictions_test",
     ]
-    assert not (run_dir / "inference_exports" / "demo_run_inference" / "val").exists()
-    assert not (run_dir / "inference_exports" / "demo_run_inference" / "test").exists()
+    assert (run_dir / "predictions" / "val" / "predictions.json").is_file()
+    assert (run_dir / "predictions" / "test" / "predictions.json").is_file()
     assert fake_wandb.run is not None and fake_wandb.run.finished is True
 
 
