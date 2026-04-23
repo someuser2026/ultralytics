@@ -324,6 +324,8 @@ class RHINOOBBLoss(RTDETROBBLoss):
         shoreline_prior_weight: float = 1.0,
         land_water_prior_weight: float = 1.0,
         shoreline_prior_max_dist: float = 128.0,
+        land_water_prior_land_threshold: float = 0.05,
+        land_water_prior_exp_beta: float = 4.0,
     ):
         super().__init__(
             nc=nc,
@@ -339,6 +341,8 @@ class RHINOOBBLoss(RTDETROBBLoss):
             shoreline_prior_weight=shoreline_prior_weight,
             land_water_prior_weight=land_water_prior_weight,
             shoreline_prior_max_dist=shoreline_prior_max_dist,
+            land_water_prior_land_threshold=land_water_prior_land_threshold,
+            land_water_prior_exp_beta=land_water_prior_exp_beta,
         )
         self.matcher = RHINOHungarianMatcher(costs=matcher_costs, use_fl=use_fl, alpha=alpha, gamma=gamma)
         self.dn_assigner = DNGroupHungarianAssigner(
@@ -526,19 +530,15 @@ class RHINOOBBLoss(RTDETROBBLoss):
             final_bboxes[..., [0, 2]] *= width
             final_bboxes[..., [1, 3]] *= height
 
-            match_indices = self.matcher(final_bboxes_norm, final_scores, batch["bboxes"], batch["cls"], batch["gt_groups"])
-            negative_mask = torch.ones(final_scores.shape[:2], dtype=torch.bool, device=final_scores.device)
-            for batch_idx, (src_idx, _) in enumerate(match_indices):
-                negative_mask[batch_idx, src_idx] = False
-
             loss_shoreline_prior, loss_land_water_prior = _compute_obb_spatial_prior_losses(
                 final_bboxes,
                 final_scores.sigmoid().amax(-1),
-                negative_mask,
                 land_water_map,
                 batch.get("shoreline_distance_map"),
                 point_mode=self.shoreline_prior_point_mode,
                 shoreline_prior_max_dist=self.shoreline_prior_max_dist,
+                land_threshold=self.land_water_prior_land_threshold,
+                land_beta=self.land_water_prior_exp_beta,
             )
             loss_shoreline_prior *= self.shoreline_prior_weight
             loss_land_water_prior *= self.land_water_prior_weight

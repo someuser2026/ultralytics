@@ -3763,14 +3763,13 @@ class PrepareAuxiliaryMaskInputs:
 
     @staticmethod
     def _build_land_water_channel(mask: np.ndarray) -> np.ndarray:
-        mask = _ensure_mask_2d(mask)
-        return np.where(mask == 1, 128, np.where(mask == 2, 255, 0)).astype(np.uint8)
+        return _ensure_mask_2d(mask).astype(np.uint8, copy=False)
 
     def _build_shoreline_distance_map(self, shoreline_mask: np.ndarray, land_water_mask: np.ndarray) -> np.ndarray:
         shoreline_mask = (_ensure_mask_2d(shoreline_mask) > 0).astype(np.uint8)
         land_water_mask = _ensure_mask_2d(land_water_mask).astype(np.uint8)
         distance_map = np.zeros(land_water_mask.shape, dtype=np.float32)
-        water_mask = land_water_mask == 2
+        water_mask = np.isin(land_water_mask, (192, 255))
         if not water_mask.any():
             return distance_map
         if shoreline_mask.any():

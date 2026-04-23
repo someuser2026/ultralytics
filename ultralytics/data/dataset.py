@@ -302,17 +302,13 @@ class YOLODataset(BaseDataset):
                 label["shoreline_mask"] = (shoreline_mask > 0).astype(np.uint8)
             if land_water_mask_file:
                 land_water_mask = self._read_png_mask(land_water_mask_file, label["ori_shape"], label["resized_shape"])
-                invalid = ~np.isin(land_water_mask, (0, 128, 255))
+                invalid = ~np.isin(land_water_mask, (0, 64, 128, 192, 255))
                 if invalid.any():
                     raise ValueError(
                         f"Land/water mask '{land_water_mask_file}' contains invalid values: "
                         f"{sorted(np.unique(land_water_mask[invalid]).tolist())}"
                     )
-                label["land_water_mask"] = np.where(
-                    land_water_mask == 128,
-                    1,
-                    np.where(land_water_mask == 255, 2, 0),
-                ).astype(np.uint8)
+                label["land_water_mask"] = land_water_mask.astype(np.uint8, copy=False)
         return self.update_labels_info(label)
 
     def build_transforms(self, hyp: dict | None = None) -> Compose:

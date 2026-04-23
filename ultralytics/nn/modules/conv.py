@@ -25,6 +25,7 @@ __all__ = (
     "Concat",
     "RepConv",
     "Index",
+    "ChannelSplit",
     "DeformableConv2d",
 )
 
@@ -721,6 +722,42 @@ class Index(nn.Module):
             (torch.Tensor): Selected tensor.
         """
         return x[self.index]
+
+
+class ChannelSplit(nn.Module):
+    """Split an input tensor into leading RGB channels and trailing auxiliary channels."""
+
+    def __init__(self, c1: int, rgb_channels: int = 3):
+        """
+        Initialize ChannelSplit.
+
+        Args:
+            c1 (int): Number of input channels.
+            rgb_channels (int): Number of leading channels routed to the RGB branch.
+        """
+        super().__init__()
+        self.c1 = int(c1)
+        self.rgb_channels = int(rgb_channels)
+        self.aux_channels = self.c1 - self.rgb_channels
+        if self.rgb_channels <= 0:
+            raise ValueError(f"ChannelSplit requires rgb_channels > 0, received {self.rgb_channels}.")
+        if self.aux_channels <= 0:
+            raise ValueError(
+                f"ChannelSplit requires input channels > rgb_channels. Received c1={self.c1}, rgb_channels={self.rgb_channels}."
+            )
+        self.channels = [self.rgb_channels, self.aux_channels]
+
+    def forward(self, x: torch.Tensor):
+        """
+        Split the input tensor into RGB and auxiliary tensors.
+
+        Args:
+            x (torch.Tensor): Input tensor shaped (B, C, H, W).
+
+        Returns:
+            (list[torch.Tensor]): [rgb_tensor, aux_tensor]
+        """
+        return [x[:, : self.rgb_channels], x[:, self.rgb_channels :]]
 
 class SE(nn.Module):
     """

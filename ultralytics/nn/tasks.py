@@ -42,6 +42,7 @@ from ultralytics.nn.modules import (
     C3x,
     CBFuse,
     CBLinear,
+    ChannelSplit,
     Classify,
     Concat,
     Conv,
@@ -1413,6 +1414,8 @@ class RTDETROBBModel(RTDETRDetectionModel):
             shoreline_prior_weight=float(_get_cfg_value(model_args, "shoreline_prior_weight", 1.0)),
             land_water_prior_weight=float(_get_cfg_value(model_args, "land_water_prior_weight", 1.0)),
             shoreline_prior_max_dist=float(_get_cfg_value(model_args, "shoreline_prior_max_dist", 128.0)),
+            land_water_prior_land_threshold=float(_get_cfg_value(model_args, "land_water_prior_land_threshold", 0.05)),
+            land_water_prior_exp_beta=float(_get_cfg_value(model_args, "land_water_prior_exp_beta", 4.0)),
         )
 
     def loss(self, batch, preds=None):
@@ -1518,6 +1521,8 @@ class RHINOOBBModel(RTDETROBBModel):
             shoreline_prior_weight=float(_get_cfg_value(model_args, "shoreline_prior_weight", 1.0)),
             land_water_prior_weight=float(_get_cfg_value(model_args, "land_water_prior_weight", 1.0)),
             shoreline_prior_max_dist=float(_get_cfg_value(model_args, "shoreline_prior_max_dist", 128.0)),
+            land_water_prior_land_threshold=float(_get_cfg_value(model_args, "land_water_prior_land_threshold", 0.05)),
+            land_water_prior_exp_beta=float(_get_cfg_value(model_args, "land_water_prior_exp_beta", 4.0)),
         )
 
     def loss(self, batch, preds=None):
@@ -2499,6 +2504,11 @@ def parse_model(d, ch, verbose=True):
             # print("ch:", ch, "idx:", idx, "c1:", c1, "c2:", c2)
             # print("-"*30)
             args = [idx]
+        elif m is ChannelSplit:
+            c1 = ch[f]
+            args = [c1, *args]
+            m_ = m(*args)
+            c2 = m_.channels
         elif m in frozenset({ConvNeXtDownsample, ConvNeXtStem}):
             c1, c2 = ch[f], args[0]
             args = [c1, c2]
@@ -2563,7 +2573,7 @@ def parse_model(d, ch, verbose=True):
             c2 = ch[f]
 
         # Fixed: Move this outside ConvNeXtBlock handling and fix the condition
-        if m not in frozenset({ConvNeXtBlock, LWEGNet, Timm, ResNetBackbone, UnravelNetBackbone, MaskRCNNHead, CascadeMaskRCNNHead, RotatedFasterRCNNHead, OrientedRCNNHead}):
+        if m not in frozenset({ChannelSplit, ConvNeXtBlock, LWEGNet, Timm, ResNetBackbone, UnravelNetBackbone, MaskRCNNHead, CascadeMaskRCNNHead, RotatedFasterRCNNHead, OrientedRCNNHead}):
             # if m in {Segment, YOLOESegment}:
             #     print("[DEBUG] Segment sources f =", f)
             #     print("[DEBUG] Segment in-channels =", [ch[u] for u in f], flush=True)

@@ -10,6 +10,7 @@ __pycache__/
 /LEGNet
 /mmdetection
 /RHINO
+/Mamba-YOLO
 
 # C extensions
 *.so

@@ -164,6 +164,8 @@ CFG_FLOAT_KEYS = frozenset(
         "lora_alpha",
         "shoreline_prior_weight",
         "land_water_prior_weight",
+        "land_water_prior_land_threshold",
+        "land_water_prior_exp_beta",
     }
 )
 CFG_FRACTION_KEYS = frozenset(
@@ -209,6 +211,7 @@ CFG_INT_KEYS = frozenset(
         "save_period",
         "lora_rank",
         "shoreline_prior_max_dist",
+        "dual_input_rgb_channels",
     }
 )
 CFG_BOOL_KEYS = frozenset(
@@ -252,6 +255,7 @@ CFG_BOOL_KEYS = frozenset(
         "use_land_water_input",
         "use_shoreline_prior_loss",
         "use_land_water_prior_loss",
+        "dual_input_backbone",
     }
 )
 

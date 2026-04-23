@@ -60,12 +60,17 @@ overlap_mask: true # (bool) merge instance masks into one mask during training (
 mask_ratio: 8 # (int) mask downsample ratio (segment only)
 use_shoreline_input: false # (bool) append shoreline mask as an additional model input channel
 use_land_water_input: false # (bool) append land/water one-hot mask channels as additional model inputs
-use_shoreline_prior_loss: false # (bool) penalize confident OBB predictions far from shoreline
-use_land_water_prior_loss: false # (bool) penalize confident OBB predictions centered on land
+use_shoreline_prior_loss: false # (bool) penalize confident OBB or segment predictions far from shoreline
+use_land_water_prior_loss: false # (bool) penalize confident OBB or segment predictions that place too much support over land/sand
 shoreline_prior_point_mode: center # (str) point sampled for shoreline prior: center or closest_corner
 shoreline_prior_weight: 1.0 # (float) shoreline prior loss gain
 land_water_prior_weight: 1.0 # (float) land/water prior loss gain
 shoreline_prior_max_dist: 128 # (int) shoreline distance cap in pixels for normalization
+land_water_prior_land_threshold: 0.05 # (float) fraction of valid prediction support allowed over land/sand before land-water prior activates
+land_water_prior_exp_beta: 4.0 # (float) exponential sharpness for land-water prior above threshold
+dual_input_backbone: false # (bool) route RGB and auxiliary channels through parallel backbones when the model YAML supports it
+dual_input_rgb_channels: 3 # (int) number of leading channels reserved for the RGB backbone branch
+dual_input_fusion: concat_proj # (str) feature fusion style for dual-input backbones
 seg_use_mixed_loss: true # (bool) use mixed loss for segmentation
 seg_w_lovasz: 0.0 # (float) weight for lovasz loss for segmentation
 seg_w_dice: 0.0 # (float) weight for dice loss for segmentation
