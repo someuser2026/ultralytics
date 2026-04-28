@@ -696,7 +696,7 @@ class Mosaic(BaseMixTransform):
 
             # Place img in img3
             if i == 0:  # center
-                img3 = np.full((s * 3, s * 3, img.shape[2]), 114, dtype=np.uint8)  # base image with 3 tiles
+                img3 = np.full((s * 3, s * 3, img.shape[2]), 0, dtype=np.uint8)  # base image with 3 tiles
                 shoreline3 = self._init_aux_canvas(shoreline_patch, (s * 3, s * 3))
                 land_water3 = self._init_aux_canvas(land_water_patch, (s * 3, s * 3))
                 h0, w0 = h, w
@@ -767,7 +767,7 @@ class Mosaic(BaseMixTransform):
 
             # Place img in img4
             if i == 0:  # top left
-                img4 = np.full((s * 2, s * 2, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
+                img4 = np.full((s * 2, s * 2, img.shape[2]), 0, dtype=np.uint8)  # base image with 4 tiles
                 shoreline4 = self._init_aux_canvas(shoreline_patch, (s * 2, s * 2))
                 land_water4 = self._init_aux_canvas(land_water_patch, (s * 2, s * 2))
                 x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
@@ -839,7 +839,7 @@ class Mosaic(BaseMixTransform):
 
             # Place img in img9
             if i == 0:  # center
-                img9 = np.full((s * 3, s * 3, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
+                img9 = np.full((s * 3, s * 3, img.shape[2]), 0, dtype=np.uint8)  # base image with 4 tiles
                 shoreline9 = self._init_aux_canvas(shoreline_patch, (s * 3, s * 3))
                 land_water9 = self._init_aux_canvas(land_water_patch, (s * 3, s * 3))
                 h0, w0 = h, w
@@ -1286,9 +1286,9 @@ class RandomPerspective:
         # Affine image
         if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():  # image changed
             if self.perspective:
-                img = cv2.warpPerspective(img, M, dsize=self.size, borderValue=(114, 114, 114))
+                img = cv2.warpPerspective(img, M, dsize=self.size, borderValue=0)
             else:  # affine
-                img = cv2.warpAffine(img, M[:2], dsize=self.size, borderValue=(114, 114, 114))
+                img = cv2.warpAffine(img, M[:2], dsize=self.size, borderValue=0)
             if img.ndim == 2:
                 img = img[..., None]
         return img, M, s
@@ -1760,7 +1760,7 @@ class LetterBox:
             scaleup (bool): If True, allow scaling up. If False, only scale down.
             center (bool): If True, center the placed image. If False, place image in top-left corner.
             stride (int): Stride of the model (e.g., 32 for YOLOv5).
-            padding_value (int): Value for padding the image. Default is 114.
+            padding_value (int): Value for padding the image. Default is 0.
             interpolation (int): Interpolation method for resizing. Default is cv2.INTER_LINEAR.
 
         Attributes:
