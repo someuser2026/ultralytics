@@ -3772,7 +3772,7 @@ class PrepareAuxiliaryMaskInputs:
             return np.clip(distance, 0.0, float(self.shoreline_prior_max_dist)).astype(np.float32)
         else:
             land_water_mask = _ensure_mask_2d(land_water_mask)
-            return np.full(land_water_mask.shape, float(self.shoreline_prior_max_dist), dtype=np.float32)
+            return np.zeros(land_water_mask.shape, dtype=np.float32)
 
     def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
         """Append auxiliary inputs and convert prior-loss maps to tensors before Format."""

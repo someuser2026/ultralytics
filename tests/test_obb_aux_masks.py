@@ -111,6 +111,24 @@ def test_prepare_auxiliary_mask_inputs_builds_channels_and_prior_maps() -> None:
     assert labels["shoreline_distance_map"][0, 2, 4].item() > 0.0  # water away from shoreline is penalized
 
 
+def test_blank_shoreline_mask_produces_zero_distance_map() -> None:
+    """Blank shoreline masks should suppress shoreline prior rather than max it out."""
+    transform = PrepareAuxiliaryMaskInputs(
+        use_shoreline_prior_loss=True,
+        use_land_water_prior_loss=True,
+        shoreline_prior_max_dist=8,
+    )
+    labels = transform(
+        {
+            "img": np.zeros((4, 4, 3), dtype=np.uint8),
+            "shoreline_mask": np.zeros((4, 4), dtype=np.uint8),
+            "land_water_mask": np.full((4, 4), 192, dtype=np.uint8),
+        }
+    )
+
+    assert torch.count_nonzero(labels["shoreline_distance_map"]) == 0
+
+
 def test_auxiliary_mask_channels_follow_geometric_augmentation() -> None:
     """Shoreline and land/water inputs must match the exact geometric transforms applied to the image."""
     shoreline_mask = np.zeros((4, 6), dtype=np.uint8)
