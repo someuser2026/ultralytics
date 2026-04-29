@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 from torchvision.ops import box_iou
 import torch.nn.functional as F
+from torch.nn.parameter import UninitializedParameter
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -466,6 +467,7 @@ class DetectionModel(BaseModel):
         self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
         self.inplace = self.yaml.get("inplace", True)
         self.end2end = getattr(self.model[-1], "end2end", False)
+        self._building_strides = False
 
         # Build strides
         m = self.model[-1]  # Detect()
@@ -490,7 +492,11 @@ class DetectionModel(BaseModel):
             self.model.eval()  # Avoid changing batch statistics until training begins
             m.training = True  # Setting it to True to properly return strides
             with _enable_mamba_cpu_fallback_for_build(self.model):
-                stride_outputs = _forward(torch.zeros(1, ch, s, s))
+                self._building_strides = True
+                try:
+                    stride_outputs = _forward(torch.zeros(1, ch, s, s))
+                finally:
+                    self._building_strides = False
             m.stride = torch.tensor([s / x.shape[-2] for x in stride_outputs])  # forward
             print("-"*50)
             print("Inside task.py 439")
@@ -519,7 +525,46 @@ class DetectionModel(BaseModel):
             self.info()
             LOGGER.info("")
 
-    def _predict_augment(self, x):
+    def _metadata_required(self) -> bool:
+        """Return True when any neck in the current YOLO graph expects metadata modulation."""
+        return any(isinstance(m, BaseNeck) and getattr(m, "metadata_enabled", False) for m in self.model)
+
+    def _resolve_metadata_vec(self, metadata_vec: torch.Tensor | None) -> torch.Tensor | None:
+        """Validate metadata presence when a metadata-conditioned neck is active."""
+        if metadata_vec is None and self._metadata_required() and not self._building_strides:
+            raise ValueError(
+                "This model has metadata-conditioned neck layers and requires batch['metadata_vec'] during train/val/test."
+            )
+        return metadata_vec
+
+    def _predict_once_with_metadata(self, x, metadata_vec=None, profile=False, visualize=False, embed=None):
+        """Run a single YOLO forward pass, routing metadata vectors only into neck modules."""
+        metadata_vec = self._resolve_metadata_vec(metadata_vec)
+        y, dt, embeddings = [], [], []
+        embed = frozenset(embed) if embed is not None else {-1}
+        max_idx = max(embed)
+        for m in self.model:
+            if m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            if profile:
+                self._profile_one_layer(m, x, dt)
+            x = m(x, metadata_vec=metadata_vec) if isinstance(m, BaseNeck) else m(x)
+            y.append(x if m.i in self.save else None)
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+            if m.i in embed:
+                embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))
+                if m.i == max_idx:
+                    return torch.unbind(torch.cat(embeddings, 1), dim=0)
+        return x
+
+    def predict(self, x, profile=False, visualize=False, augment=False, embed=None, metadata_vec=None):
+        """Perform inference while optionally routing per-image metadata into neck modules."""
+        if augment:
+            return self._predict_augment(x, metadata_vec=metadata_vec)
+        return self._predict_once_with_metadata(x, metadata_vec=metadata_vec, profile=profile, visualize=visualize, embed=embed)
+
+    def _predict_augment(self, x, metadata_vec=None):
         """
         Perform augmentations on input image x and return augmented inference and train outputs.
 
@@ -538,7 +583,7 @@ class DetectionModel(BaseModel):
         y = []  # outputs
         for si, fi in zip(s, f):
             xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
-            yi = super().predict(xi)[0]  # forward
+            yi = self._predict_once_with_metadata(xi, metadata_vec=metadata_vec)[0]  # forward
             yi = self._descale_pred(yi, fi, si, img_size)
             y.append(yi)
         y = self._clip_augmented(y)  # clip augmented tails
@@ -589,6 +634,15 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+
+    def loss(self, batch, preds=None):
+        """Compute loss while forwarding metadata sidecars into metadata-conditioned necks."""
+        if getattr(self, "criterion", None) is None:
+            self.criterion = self.init_criterion()
+
+        if preds is None:
+            preds = self.forward(batch["img"], metadata_vec=batch.get("metadata_vec"))
+        return self.criterion(preds, batch)
 
 
 class OBBModel(DetectionModel):
@@ -2581,7 +2635,7 @@ def parse_model(d, ch, verbose=True):
             m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
         
         t = str(m)[8:-2].replace("__main__.", "")  # module type
-        m_.np = sum(x.numel() for x in m_.parameters())  # number params
+        m_.np = sum(0 if isinstance(x, UninitializedParameter) else x.numel() for x in m_.parameters())  # number params
         m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type
         if verbose:
             LOGGER.info(f"{i:>3}{str(f):>20}{n_:>3}{m_.np:10.0f}  {t:<45}{str(args):<30}")  # print

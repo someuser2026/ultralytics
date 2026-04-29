@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import subprocess
@@ -41,6 +42,43 @@ VID_FORMATS = {"asf", "avi", "gif", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "
 FORMATS_HELP_MSG = f"Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID_FORMATS}"
 AUX_MASK_SPLITS = ("train", "val", "test", "minival")
 AUX_MASK_KEYS = ("shoreline_masks", "land_water_masks")
+METADATA_KEY = "metadata"
+DEFAULT_METADATA_FIELDS = (
+    "anomalous_pixels",
+    "clear_confidence_percent",
+    "clear_percent",
+    "cloud_cover",
+    "cloud_percent",
+    "ground_control",
+    "gsd",
+    "heavy_haze_percent",
+    "light_haze_percent",
+    "pixel_resolution",
+    "satellite_azimuth",
+    "shadow_percent",
+    "snow_ice_percent",
+    "sun_azimuth",
+    "sun_elevation",
+    "view_angle",
+    "visible_confidence_percent",
+    "udm2_confidence_mean",
+    "unusable_pixels_percent",
+)
+_METADATA_PERCENT_FIELDS = {
+    "clear_confidence_percent",
+    "clear_percent",
+    "cloud_percent",
+    "heavy_haze_percent",
+    "light_haze_percent",
+    "shadow_percent",
+    "snow_ice_percent",
+    "visible_confidence_percent",
+    "udm2_confidence_mean",
+    "unusable_pixels_percent",
+}
+_METADATA_AZIMUTH_FIELDS = {"satellite_azimuth", "sun_azimuth"}
+_METADATA_DIV90_FIELDS = {"sun_elevation", "view_angle"}
+_METADATA_RAW_FIELDS = {"cloud_cover", "gsd", "pixel_resolution"}
 
 
 def img2label_paths(img_paths: list[str]) -> list[str]:
@@ -107,6 +145,102 @@ def _get_auxiliary_split_spec(spec: Any, split: str) -> str | list[str] | None:
     if isinstance(spec, dict):
         return spec.get(split)
     return _append_split_to_aux_root(spec, split)
+
+
+def build_metadata_root_mappings(data: dict[str, Any]) -> list[dict[str, Path | str]]:
+    """Build longest-prefix image-root to metadata-root mappings from a resolved data dict."""
+    metadata_cfg = data.get(METADATA_KEY)
+    if not metadata_cfg:
+        return []
+
+    mappings = []
+    for split in AUX_MASK_SPLITS:
+        image_roots = _normalize_split_roots(data.get(split))
+        metadata_roots = _normalize_split_roots(_get_auxiliary_split_spec(metadata_cfg, split))
+        if metadata_roots and len(metadata_roots) not in {1, len(image_roots)}:
+            raise ValueError(f"metadata.{split} must define either 1 root or {len(image_roots)} roots to match {split}.")
+        if len(metadata_roots) == 1 and len(image_roots) > 1:
+            metadata_roots *= len(image_roots)
+        for i, image_root in enumerate(image_roots):
+            metadata_root = metadata_roots[i] if i < len(metadata_roots) else None
+            if metadata_root is not None:
+                mappings.append({"split": split, "image_root": image_root, "metadata_root": metadata_root})
+    return sorted(mappings, key=lambda x: len(str(x["image_root"])), reverse=True)
+
+
+def resolve_metadata_path(
+    image_file: str | Path, mappings: list[dict[str, Path | str]], required: bool = False
+) -> dict[str, str | None]:
+    """Resolve a mirrored JSON metadata sidecar path for an image using longest-prefix root matching."""
+    image_path = Path(image_file).resolve()
+    for mapping in mappings:
+        image_root = Path(mapping["image_root"])
+        try:
+            rel = image_path.relative_to(image_root)
+        except ValueError:
+            symlink_candidate = image_root / image_path.name
+            try:
+                if not symlink_candidate.exists() or symlink_candidate.resolve() != image_path:
+                    continue
+            except OSError:
+                continue
+            rel = symlink_candidate.relative_to(image_root)
+
+        metadata_file = str((Path(mapping["metadata_root"]) / rel).with_suffix(".json"))
+        out = {"split": mapping["split"], "metadata_file": metadata_file}
+        if required and not metadata_file:
+            raise FileNotFoundError(f"No metadata root matched image '{image_path}'.")
+        return out
+
+    if required:
+        raise FileNotFoundError(f"Could not match image '{image_path}' to any configured metadata split root.")
+    return {"split": None, "metadata_file": None}
+
+
+def validate_metadata_config(data: dict[str, Any]) -> None:
+    """Validate optional metadata split roots and requested metadata fields."""
+    metadata_cfg = data.get(METADATA_KEY)
+    metadata_fields = data.get("metadata_fields")
+    if metadata_fields and not metadata_cfg:
+        raise SyntaxError("metadata_fields is present but 'metadata:' is missing from data.yaml.")
+    if not metadata_cfg:
+        return
+    if metadata_fields is None:
+        data["metadata_fields"] = list(DEFAULT_METADATA_FIELDS)
+    elif not isinstance(metadata_fields, list) or not metadata_fields:
+        raise SyntaxError("metadata_fields must be a non-empty list when metadata sidecars are configured.")
+    for split in AUX_MASK_SPLITS:
+        if data.get(split) and not metadata_cfg.get(split):
+            raise SyntaxError(f"metadata.{split} is required when the dataset defines a '{split}' split.")
+    build_metadata_root_mappings(data)
+
+
+def encode_metadata_properties(properties: dict[str, Any], fields: list[str] | tuple[str, ...] | None = None) -> np.ndarray:
+    """Encode selected metadata properties into a fixed float vector for FiLM modulation."""
+    fields = tuple(fields or DEFAULT_METADATA_FIELDS)
+    encoded = []
+    for field in fields:
+        if field not in properties:
+            raise KeyError(f"Metadata field '{field}' is missing from JSON properties.")
+        value = properties[field]
+        if value is None:
+            raise ValueError(f"Metadata field '{field}' is null and can not be encoded.")
+        if field == "ground_control":
+            encoded.append(1.0 if bool(value) else 0.0)
+        elif field == "anomalous_pixels":
+            encoded.append(math.log1p(float(value)))
+        elif field in _METADATA_PERCENT_FIELDS:
+            encoded.append(float(value) / 100.0)
+        elif field in _METADATA_AZIMUTH_FIELDS:
+            radians = math.radians(float(value))
+            encoded.extend((math.sin(radians), math.cos(radians)))
+        elif field in _METADATA_DIV90_FIELDS:
+            encoded.append(float(value) / 90.0)
+        elif field in _METADATA_RAW_FIELDS:
+            encoded.append(float(value))
+        else:
+            raise ValueError(f"Metadata field '{field}' is not supported by the v1 encoder.")
+    return np.asarray(encoded, dtype=np.float32)
 
 
 def build_auxiliary_root_mappings(data: dict[str, Any]) -> list[dict[str, Path | str | None]]:
@@ -662,8 +796,16 @@ def check_det_dataset(dataset: str, autodownload: bool = True, hyp: dict = None)
                 for split in AUX_MASK_SPLITS
                 if data.get(split) and (split_spec := _get_auxiliary_split_spec(spec, split))
             }
+    if data.get(METADATA_KEY):
+        spec = data[METADATA_KEY]
+        data[METADATA_KEY] = {
+            split: _resolve_split_entry(path, split_spec)
+            for split in AUX_MASK_SPLITS
+            if data.get(split) and (split_spec := _get_auxiliary_split_spec(spec, split))
+        }
 
     validate_auxiliary_mask_config(data, hyp)
+    validate_metadata_config(data)
 
     # Parse YAML
     val, s = (data.get(x) for x in ("val", "download"))

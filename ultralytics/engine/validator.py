@@ -229,7 +229,7 @@ class BaseValidator:
                 # print("augment:", augment)
                 # print("batch:", batch["img"].shape)
                 # print("-"*50)
-                preds = model(batch["img"], augment=augment)
+                preds = model(batch["img"], augment=augment, metadata_vec=batch.get("metadata_vec"))
 
             # Loss
             with dt[2]:
@@ -408,4 +408,3 @@ class BaseValidator:
     def eval_json(self, stats):
         """Evaluate and return JSON format of prediction statistics."""
         pass
-

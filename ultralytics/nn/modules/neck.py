@@ -56,6 +56,52 @@ def _make_dropout(p: float | None) -> nn.Module:
     return nn.Dropout2d(p) if p and p > 0.0 else nn.Identity()
 
 
+def _disable_metadata_cfg(cfg: dict | None) -> dict:
+    """Return a shallow config copy with metadata conditioning disabled."""
+    cfg = dict(cfg or {})
+    metadata_cfg = dict(cfg.get("metadata_cfg", {}))
+    metadata_cfg["enabled"] = False
+    cfg["metadata_cfg"] = metadata_cfg
+    return cfg
+
+
+class MetadataConditioner(nn.Module):
+    """Map a per-image metadata vector to per-level FiLM parameters or channel gates."""
+
+    def __init__(self, out_channels: int, num_levels: int, cfg: dict):
+        super().__init__()
+        self.mode = cfg.get("mode", "film_affine")
+        self.hidden_dim = int(cfg.get("hidden_dim", 64))
+        dropout = float(cfg.get("dropout", 0.0))
+        if self.mode not in {"film_affine", "film_gate"}:
+            raise ValueError(f"Unsupported metadata modulation mode '{self.mode}'.")
+
+        self.trunk = nn.Sequential(
+            nn.LazyLinear(self.hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+        )
+        out_dim = 2 * out_channels if self.mode == "film_affine" else out_channels
+        self.level_heads = nn.ModuleList(nn.Linear(self.hidden_dim, out_dim) for _ in range(num_levels))
+
+    def forward(self, xs: List[torch.Tensor], metadata_vec: torch.Tensor) -> List[torch.Tensor]:
+        """Apply metadata-driven affine modulation or channel gating to each feature level."""
+        if metadata_vec.ndim != 2:
+            raise ValueError(f"metadata_vec must have shape [B, M], received {tuple(metadata_vec.shape)}.")
+        hidden = self.trunk(metadata_vec)
+        outs = []
+        for x, head in zip(xs, self.level_heads):
+            params = head(hidden).to(device=x.device, dtype=x.dtype)
+            if self.mode == "film_affine":
+                gamma, beta = params.chunk(2, dim=1)
+                x = x * (1.0 + gamma.unsqueeze(-1).unsqueeze(-1)) + beta.unsqueeze(-1).unsqueeze(-1)
+            else:
+                gate = torch.sigmoid(params).unsqueeze(-1).unsqueeze(-1)
+                x = x * gate
+            outs.append(x)
+        return outs
+
+
 # ================================ CONVOLUTIONAL POLICY ================================
 
 class ConvPolicy(nn.Module):
@@ -1059,6 +1105,11 @@ class BaseNeck(nn.Module):
         # Path-specific dropout layers
         self.drop_td = _make_dropout(cfg.get('drop_td', 0.0))
         self.drop_bu = _make_dropout(cfg.get('drop_bu', 0.0))
+        self.metadata_cfg = cfg.get("metadata_cfg", {})
+        self.metadata_enabled = bool(self.metadata_cfg.get("enabled", False))
+        self.metadata_conditioner = (
+            MetadataConditioner(self.out_channels, len(self.in_channels), self.metadata_cfg) if self.metadata_enabled else None
+        )
 
     def _resize_to(self, src: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
         """
@@ -1094,6 +1145,14 @@ class BaseNeck(nn.Module):
             y = attn(y)     # Per-level attention (SE/ECA/CBAM/etc or identity)
             ys.append(y)
         return ys
+
+    def _apply_metadata_modulation(
+        self, xs: List[torch.Tensor], metadata_vec: Optional[torch.Tensor] = None
+    ) -> List[torch.Tensor]:
+        """Apply metadata conditioning if enabled and metadata is available."""
+        if not self.metadata_enabled or metadata_vec is None:
+            return xs
+        return self.metadata_conditioner(xs, metadata_vec)
     
     def _select_flag(self, key: str, role: str, i: int, default: bool = False):
         """
@@ -1205,7 +1264,7 @@ class FPN(BaseNeck):
             for i in range(extra_levels)
         )
 
-    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+    def forward(self, xs: List[torch.Tensor], metadata_vec: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
         """
         Forward pass through FPN.
         
@@ -1219,6 +1278,7 @@ class FPN(BaseNeck):
         """
         # Step 1: Channel alignment and per-level attention
         xs = self._apply_align_and_attn(xs)
+        xs = self._apply_metadata_modulation(xs, metadata_vec)
         L = len(xs)
 
         outs = [None] * L
@@ -1292,9 +1352,11 @@ class PANet(BaseNeck):
     def __init__(self, in_channels: Sequence[int], out_channels: int, cfg: dict):
         super().__init__(in_channels, out_channels, cfg)
         L = len(self.in_channels)
+        self.metadata_enabled = False
+        self.metadata_conditioner = None
 
         # Top-down FPN stage (standard FPN)
-        self.td_fpn = FPN(in_channels, out_channels, cfg)
+        self.td_fpn = FPN(in_channels, out_channels, _disable_metadata_cfg(cfg))
 
         # Bottom-up path: stride-2 convolutions for downsampling
         # self.down = nn.ModuleList([
@@ -1315,7 +1377,7 @@ class PANet(BaseNeck):
         # Bottom-up smoothing convolutions
         self.bu_smooth = nn.ModuleList([smooth_3x3(self.out_channels, self.conv_cfg, dcn=self._dcn("smooth_bu", i)) for i in range(L - 1)])
 
-    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+    def forward(self, xs: List[torch.Tensor], metadata_vec: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
         """
         Forward pass: FPN top-down + bottom-up path augmentation.
         
@@ -1327,7 +1389,7 @@ class PANet(BaseNeck):
         """
         # Step 1: Standard FPN top-down path
         # (alignment and per-level attention handled inside FPN)
-        ys = self.td_fpn(xs)
+        ys = self.td_fpn(xs, metadata_vec=metadata_vec)
         L = len(ys)
 
         # Step 2: Bottom-up path augmentation (fine to coarse)
@@ -1416,7 +1478,7 @@ class PAFPN(BaseNeck):
         self.pre_attn = nn.ModuleList([build_attn(self.attn_cfg.get('per_level'), self.out_channels)
                                        for _ in self.in_channels])
 
-    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+    def forward(self, xs: List[torch.Tensor], metadata_vec: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
         """
         Forward pass: Concat-heavy bidirectional pyramid.
         
@@ -1428,6 +1490,7 @@ class PAFPN(BaseNeck):
         """
         # Step 1: Align channels and apply per-level attention
         xs = [attn(al(x)) for x, al, attn in zip(xs, self.pre_align, self.pre_attn)]
+        xs = self._apply_metadata_modulation(xs, metadata_vec)
         L = len(xs)
 
         # Step 2: Top-down path with concatenation
@@ -1512,6 +1575,8 @@ class BiFPN(BaseNeck):
         cfg["fusion"] = "weighted"
         super().__init__(in_channels, out_channels, cfg)
         self.iterations = max(1, cfg.get("iterations", 1))
+        self.metadata_enabled = False
+        self.metadata_conditioner = None
         
         # First BiFPN layer processes backbone features
         self.fpn = FPN(in_channels, out_channels, cfg)
@@ -1519,11 +1584,11 @@ class BiFPN(BaseNeck):
         # Additional iterations process uniform-channel features
         L = len(in_channels)
         self.extra_stacks = nn.ModuleList([
-            FPN([out_channels] * L, out_channels, cfg)
+            FPN([out_channels] * L, out_channels, _disable_metadata_cfg(cfg))
             for _ in range(self.iterations - 1)
         ])
 
-    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+    def forward(self, xs: List[torch.Tensor], metadata_vec: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
         """
         Forward pass: Iterative bidirectional feature refinement.
         
@@ -1534,7 +1599,7 @@ class BiFPN(BaseNeck):
             Refined features after multiple BiFPN iterations
         """
         # First iteration: process backbone features
-        y = self.fpn(xs)
+        y = self.fpn(xs, metadata_vec=metadata_vec)
         
         # Additional iterations: iterative refinement
         for fpn in self.extra_stacks:
@@ -1576,6 +1641,8 @@ class AugFPN(BaseNeck):
     def __init__(self, in_channels: Sequence[int], out_channels: int, cfg):
         super().__init__(in_channels, out_channels, cfg)
         self.pool_bins = cfg.get("pool_bins", 3)
+        self.metadata_enabled = False
+        self.metadata_conditioner = None
         
         # Base FPN
         self.fpn = FPN(in_channels, out_channels, cfg)
@@ -1585,7 +1652,7 @@ class AugFPN(BaseNeck):
         self.bn = nn.BatchNorm2d(out_channels)
         self.act = nn.SiLU()
 
-    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+    def forward(self, xs: List[torch.Tensor], metadata_vec: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
         """
         Forward pass: FPN + ratio-invariant adaptive pooling + residual augmentation.
         
@@ -1596,7 +1663,7 @@ class AugFPN(BaseNeck):
             Augmented features with global context
         """
         # Step 1: Standard FPN
-        feats = self.fpn(xs)
+        feats = self.fpn(xs, metadata_vec=metadata_vec)
         
         # Step 2: Apply RAP + RFA to each level
         outs = []
@@ -1652,6 +1719,8 @@ class LibraFPN(BaseNeck):
     """
     def __init__(self, in_channels: Sequence[int], out_channels: int, cfg):
         super().__init__(in_channels, out_channels, cfg)
+        self.metadata_enabled = False
+        self.metadata_conditioner = None
         
         # Base FPN
         self.fpn = FPN(in_channels, out_channels, cfg)
@@ -1659,7 +1728,7 @@ class LibraFPN(BaseNeck):
         # Reprojection layers after adding balanced features
         self.reproj = nn.ModuleList([Conv(out_channels, out_channels, k=3, s=1) for _ in in_channels])
 
-    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+    def forward(self, xs: List[torch.Tensor], metadata_vec: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
         """
         Forward pass: FPN + global balanced feature injection.
         
@@ -1670,7 +1739,7 @@ class LibraFPN(BaseNeck):
             Balanced features with global context
         """
         # Step 1: Standard FPN
-        feats = self.fpn(xs)
+        feats = self.fpn(xs, metadata_vec=metadata_vec)
         
         # Step 2: Compute balanced feature at reference scale (median level)
         ref = feats[len(feats) // 2]
@@ -1744,7 +1813,7 @@ class RepFPN(BaseNeck):
         # RepConv smoothing layers
         self.smooth = nn.ModuleList([RepConv(out_channels, out_channels, k=3, s=1) for _ in range(L)])
 
-    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+    def forward(self, xs: List[torch.Tensor], metadata_vec: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
         """
         Forward pass: FPN with reparameterizable convolutions.
         
@@ -1756,6 +1825,7 @@ class RepFPN(BaseNeck):
         """
         # Step 1: Channel alignment
         xs = [al(x) for x, al in zip(xs, self.align)]
+        xs = self._apply_metadata_modulation(xs, metadata_vec)
         L = len(xs)
         
         # Step 2: Top-down FPN with RepConv
@@ -1812,12 +1882,14 @@ class RecursiveFPN(BaseNeck):
         super().__init__(in_channels, out_channels, cfg)
         self.passes = max(1, cfg.get("passes", 2))
         L = len(in_channels)
+        self.metadata_enabled = False
+        self.metadata_conditioner = None
         
         # Single FPN applied multiple times
         self.fpn_first = FPN(in_channels, out_channels, cfg)
-        self.fpn_shared = FPN([out_channels] * L, out_channels, cfg)
+        self.fpn_shared = FPN([out_channels] * L, out_channels, _disable_metadata_cfg(cfg))
 
-    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+    def forward(self, xs: List[torch.Tensor], metadata_vec: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
         """
         Forward pass: Apply FPN multiple times for iterative refinement.
         
@@ -1828,7 +1900,7 @@ class RecursiveFPN(BaseNeck):
             Refined features after multiple FPN passes
         """
         # First pass on backbone features
-        y = self.fpn_first(xs)
+        y = self.fpn_first(xs, metadata_vec=metadata_vec)
         
         # Additional passes on refined features
         for _ in range(self.passes - 1):
@@ -1866,6 +1938,8 @@ class ScaleEqualizingFPN(BaseNeck):
     """
     def __init__(self, in_channels: Sequence[int], out_channels: int, cfg):
         super().__init__(in_channels, out_channels, cfg)
+        self.metadata_enabled = False
+        self.metadata_conditioner = None
         
         # Base FPN
         self.fpn = FPN(in_channels, out_channels, cfg)
@@ -1873,7 +1947,7 @@ class ScaleEqualizingFPN(BaseNeck):
         # Post-processing layers after adding mean feature
         self.post = nn.ModuleList([Conv(out_channels, out_channels, k=3, s=1) for _ in in_channels])
 
-    def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+    def forward(self, xs: List[torch.Tensor], metadata_vec: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
         """
         Forward pass: FPN + cross-level mean feature injection.
         
@@ -1884,7 +1958,7 @@ class ScaleEqualizingFPN(BaseNeck):
             Scale-equalized features with cross-level mean
         """
         # Step 1: Standard FPN
-        feats = self.fpn(xs)
+        feats = self.fpn(xs, metadata_vec=metadata_vec)
         
         # Step 2: Compute cross-level mean at reference scale
         ref = feats[len(feats) // 2]  # Median level as reference

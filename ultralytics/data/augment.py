@@ -3767,18 +3767,12 @@ class PrepareAuxiliaryMaskInputs:
 
     def _build_shoreline_distance_map(self, shoreline_mask: np.ndarray, land_water_mask: np.ndarray) -> np.ndarray:
         shoreline_mask = (_ensure_mask_2d(shoreline_mask) > 0).astype(np.uint8)
-        land_water_mask = _ensure_mask_2d(land_water_mask).astype(np.uint8)
-        distance_map = np.zeros(land_water_mask.shape, dtype=np.float32)
-        water_mask = np.isin(land_water_mask, (192, 255))
-        if not water_mask.any():
-            return distance_map
         if shoreline_mask.any():
             distance = cv2.distanceTransform((shoreline_mask == 0).astype(np.uint8), cv2.DIST_L2, 3)
-            distance = np.clip(distance, 0.0, float(self.shoreline_prior_max_dist)).astype(np.float32)
+            return np.clip(distance, 0.0, float(self.shoreline_prior_max_dist)).astype(np.float32)
         else:
-            distance = np.full(land_water_mask.shape, float(self.shoreline_prior_max_dist), dtype=np.float32)
-        distance_map[water_mask] = distance[water_mask]
-        return distance_map
+            land_water_mask = _ensure_mask_2d(land_water_mask)
+            return np.full(land_water_mask.shape, float(self.shoreline_prior_max_dist), dtype=np.float32)
 
     def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
         """Append auxiliary inputs and convert prior-loss maps to tensors before Format."""

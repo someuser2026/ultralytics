@@ -105,9 +105,9 @@ def test_prepare_auxiliary_mask_inputs_builds_channels_and_prior_maps() -> None:
     assert set(np.unique(labels["img"][..., 4]).tolist()) == {0, 64, 128, 255}
     assert torch.equal(labels["land_water_mask"], torch.from_numpy(land_water_mask[None].astype(np.int64)))
     assert labels["shoreline_distance_map"].shape == (1, 5, 5)
-    assert labels["shoreline_distance_map"][0, 0, 0].item() == 0.0  # no-data ignored
-    assert labels["shoreline_distance_map"][0, 2, 0].item() == 0.0  # land ignored
-    assert labels["shoreline_distance_map"][0, 2, 1].item() == 0.0  # sand ignored
+    assert labels["shoreline_distance_map"][0, 0, 0].item() > 0.0
+    assert labels["shoreline_distance_map"][0, 2, 0].item() > 0.0
+    assert labels["shoreline_distance_map"][0, 2, 1].item() > 0.0
     assert labels["shoreline_distance_map"][0, 2, 4].item() > 0.0  # water away from shoreline is penalized
 
 

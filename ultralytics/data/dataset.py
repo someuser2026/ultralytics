@@ -48,11 +48,14 @@ from .base import BaseDataset
 from .converter import merge_multi_segment
 from .utils import (
     HELP_URL,
+    build_metadata_root_mappings,
     check_file_speeds,
+    encode_metadata_properties,
     get_hash,
     get_auxiliary_mask_flags,
     img2label_paths,
     load_dataset_cache_file,
+    resolve_metadata_path,
     resolve_auxiliary_mask_paths,
     save_dataset_cache_file,
     verify_image,
@@ -108,6 +111,9 @@ class YOLODataset(BaseDataset):
         self.auxiliary_mask_flags = get_auxiliary_mask_flags(self.hyp)
         self.use_auxiliary_masks = self.auxiliary_mask_flags["enabled"]
         self.auxiliary_root_mappings = build_auxiliary_root_mappings(self.data) if self.use_auxiliary_masks else []
+        self.use_metadata = bool(self.data.get("metadata"))
+        self.metadata_fields = list(self.data.get("metadata_fields", [])) if self.use_metadata else []
+        self.metadata_root_mappings = build_metadata_root_mappings(self.data) if self.use_metadata else []
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
         super().__init__(*args, channels=self.data.get("channels", 3), **kwargs)
 
@@ -134,6 +140,18 @@ class YOLODataset(BaseDataset):
             if land_water_file:
                 hash_paths.append(land_water_file)
         return shoreline_files, land_water_files, hash_paths
+
+    def _resolve_metadata_files(self, im_files: list[str]) -> tuple[list[str], list[str]]:
+        """Resolve and validate JSON metadata sidecars for a sequence of image files."""
+        metadata_files, hash_paths = [], []
+        for im_file in im_files:
+            resolved = resolve_metadata_path(im_file, self.metadata_root_mappings, required=True)
+            metadata_file = resolved["metadata_file"]
+            if not metadata_file or not Path(metadata_file).is_file():
+                raise FileNotFoundError(f"Metadata JSON not found for '{im_file}': '{metadata_file}'")
+            metadata_files.append(metadata_file)
+            hash_paths.append(metadata_file)
+        return metadata_files, hash_paths
 
     @staticmethod
     def _read_png_mask(mask_file: str, expected_shape: tuple[int, int], resized_shape: tuple[int, int]) -> np.ndarray:
@@ -214,7 +232,12 @@ class YOLODataset(BaseDataset):
             LOGGER.info("\n".join(msgs))
         if nf == 0:
             LOGGER.warning(f"{self.prefix}No labels found in {path}. {HELP_URL}")
-        x["hash"] = get_hash(self.label_files + self.im_files + getattr(self, "_auxiliary_mask_hash_paths", []))
+        x["hash"] = get_hash(
+            self.label_files
+            + self.im_files
+            + getattr(self, "_auxiliary_mask_hash_paths", [])
+            + getattr(self, "_metadata_hash_paths", [])
+        )
         x["results"] = nf, nm, ne, nc, len(self.im_files)
         x["msgs"] = msgs  # warnings
         save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
@@ -231,13 +254,18 @@ class YOLODataset(BaseDataset):
         """
         self.label_files = img2label_paths(self.im_files)
         self._auxiliary_mask_hash_paths = []
+        self._metadata_hash_paths = []
         if self.use_auxiliary_masks:
             _, _, self._auxiliary_mask_hash_paths = self._resolve_auxiliary_mask_files(self.im_files)
+        if self.use_metadata:
+            _, self._metadata_hash_paths = self._resolve_metadata_files(self.im_files)
         cache_path = Path(self.label_files[0]).parent.with_suffix(".cache")
         try:
             cache, exists = load_dataset_cache_file(cache_path), True  # attempt to load a *.cache file
             assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
-            assert cache["hash"] == get_hash(self.label_files + self.im_files + self._auxiliary_mask_hash_paths)
+            assert cache["hash"] == get_hash(
+                self.label_files + self.im_files + self._auxiliary_mask_hash_paths + self._metadata_hash_paths
+            )
         except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
             cache, exists = self.cache_labels(cache_path), False  # run cache ops
 
@@ -267,6 +295,10 @@ class YOLODataset(BaseDataset):
                     lb["shoreline_mask_file"] = shoreline_file
                 if land_water_file:
                     lb["land_water_mask_file"] = land_water_file
+        if self.use_metadata:
+            metadata_files, _ = self._resolve_metadata_files(self.im_files)
+            for lb, metadata_file in zip(labels, metadata_files):
+                lb["metadata_file"] = metadata_file
 
         # Check if the dataset is all boxes or all segments
         lengths = ((len(lb["cls"]), len(lb["bboxes"]), len(lb["segments"])) for lb in labels)
@@ -309,6 +341,16 @@ class YOLODataset(BaseDataset):
                         f"{sorted(np.unique(land_water_mask[invalid]).tolist())}"
                     )
                 label["land_water_mask"] = land_water_mask.astype(np.uint8, copy=False)
+        if self.use_metadata:
+            metadata_file = label.get("metadata_file")
+            if not metadata_file:
+                raise FileNotFoundError(f"Metadata sidecar missing for image '{label['im_file']}'.")
+            with open(metadata_file, encoding="utf-8") as f:
+                metadata = json.load(f)
+            properties = metadata.get("properties")
+            if not isinstance(properties, dict):
+                raise ValueError(f"Metadata JSON '{metadata_file}' is missing a top-level 'properties' object.")
+            label["metadata_vec"] = torch.from_numpy(encode_metadata_properties(properties, self.metadata_fields))
         return self.update_labels_info(label)
 
     def build_transforms(self, hyp: dict | None = None) -> Compose:
@@ -444,7 +486,7 @@ class YOLODataset(BaseDataset):
         values = list(zip(*[list(b.values()) for b in batch]))
         for i, k in enumerate(keys):
             value = values[i]
-            if k in {"img", "text_feats", "land_water_mask", "shoreline_distance_map"}:
+            if k in {"img", "text_feats", "land_water_mask", "shoreline_distance_map", "metadata_vec"}:
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
