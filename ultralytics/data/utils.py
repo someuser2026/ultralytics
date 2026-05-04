@@ -41,8 +41,10 @@ IMG_FORMATS = {"bmp", "dng", "jpeg", "jpg", "mpo", "png", "tif", "tiff", "webp",
 VID_FORMATS = {"asf", "avi", "gif", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "ts", "wmv", "webm"}  # video suffixes
 FORMATS_HELP_MSG = f"Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID_FORMATS}"
 AUX_MASK_SPLITS = ("train", "val", "test", "minival")
-AUX_MASK_KEYS = ("shoreline_masks", "land_water_masks")
+BAND_KEY = "bands"
 METADATA_KEY = "metadata"
+RGB_BAND_COUNT = 3
+CORE_AUXILIARY_BANDS = frozenset({"shoreline", "land_water", "shoreline_distance", "shoreline_proximity"})
 DEFAULT_METADATA_FIELDS = (
     "anomalous_pixels",
     "clear_confidence_percent",
@@ -135,6 +137,79 @@ def get_auxiliary_mask_flags(hyp: Any = None) -> dict[str, bool]:
             (use_shoreline_input, use_land_water_input, use_shoreline_prior_loss, use_land_water_prior_loss, use_shoreline_aux_loss)
         ),
     }
+
+
+def normalize_bands_config(data: dict[str, Any]) -> None:
+    """Normalize and validate optional multichannel TIFF band metadata from data.yaml."""
+    raw_bands = data.get(BAND_KEY)
+    if raw_bands is None:
+        data[BAND_KEY] = {}
+        return
+    if not isinstance(raw_bands, dict) or not raw_bands:
+        raise SyntaxError("bands must be a non-empty dict when present in data.yaml.")
+
+    normalized = {}
+    seen_names = set()
+    for raw_idx, raw_name in raw_bands.items():
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError) as exc:
+            raise SyntaxError(f"Band key '{raw_idx}' is invalid. bands keys must be integers >= 4.") from exc
+        if idx <= RGB_BAND_COUNT:
+            raise SyntaxError("bands keys must be >= 4 because bands 1, 2, and 3 are reserved for RGB.")
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise SyntaxError(f"Band {idx} must map to a non-empty string name.")
+        name = raw_name.strip()
+        if name in seen_names:
+            raise SyntaxError(f"Duplicate band name '{name}' in bands config.")
+        seen_names.add(name)
+        normalized[idx] = name
+
+    data[BAND_KEY] = dict(sorted(normalized.items()))
+
+
+def get_band_name_to_index(bands: dict[int, str] | None) -> dict[str, int]:
+    """Return a zero-based image-channel lookup from a normalized 1-based bands config."""
+    if not bands:
+        return {}
+    return {name: idx - 1 for idx, name in bands.items()}
+
+
+def validate_bands_config(data: dict[str, Any], hyp: Any = None) -> None:
+    """Validate multichannel TIFF band metadata against the current training or predict flags."""
+    for legacy_key in ("shoreline_masks", "land_water_masks"):
+        if legacy_key in data:
+            raise SyntaxError(f"'{legacy_key}' is no longer supported. Store auxiliary masks in TIFF bands instead.")
+    normalize_bands_config(data)
+    bands = data.get(BAND_KEY, {})
+    band_names = set(bands.values())
+    max_band_index = max(bands, default=RGB_BAND_COUNT)
+
+    raw_channels = data.get("channels")
+    if raw_channels is None:
+        raw_channels = max(RGB_BAND_COUNT, max_band_index)
+    try:
+        raw_channels = int(raw_channels)
+    except (TypeError, ValueError) as exc:
+        raise SyntaxError("channels must be an integer when present in data.yaml.") from exc
+    if raw_channels < max_band_index:
+        raise SyntaxError(f"channels={raw_channels} is invalid because bands require at least {max_band_index} channels.")
+    data["channels"] = raw_channels
+
+    flags = get_auxiliary_mask_flags(hyp)
+    if flags["use_shoreline_input"] and "shoreline" not in band_names:
+        raise SyntaxError("use_shoreline_input requires bands to define 'shoreline'.")
+    if flags["use_land_water_input"] and "land_water" not in band_names:
+        raise SyntaxError("use_land_water_input requires bands to define 'land_water'.")
+    if flags["use_land_water_prior_loss"] and "land_water" not in band_names:
+        raise SyntaxError("use_land_water_prior_loss requires bands to define 'land_water'.")
+    if flags["use_shoreline_prior_loss"]:
+        if "land_water" not in band_names:
+            raise SyntaxError("use_shoreline_prior_loss requires bands to define 'land_water'.")
+        if "shoreline_distance" not in band_names and "shoreline" not in band_names:
+            raise SyntaxError("use_shoreline_prior_loss requires bands to define 'shoreline_distance' or 'shoreline'.")
+    if flags["use_shoreline_aux_loss"] and "shoreline_proximity" not in band_names and "shoreline" not in band_names:
+        raise SyntaxError("shoreline auxiliary loss requires bands to define 'shoreline_proximity' or 'shoreline'.")
 
 
 def _resolve_dataset_path(path: Path, spec: str) -> Path:
@@ -274,96 +349,6 @@ def encode_metadata_properties(properties: dict[str, Any], fields: list[str] | t
         else:
             raise ValueError(f"Metadata field '{field}' is not supported by the v1 encoder.")
     return np.asarray(encoded, dtype=np.float32)
-
-
-def build_auxiliary_root_mappings(data: dict[str, Any]) -> list[dict[str, Path | str | None]]:
-    """Build longest-prefix image-root to auxiliary-root mappings from a resolved data dict."""
-    mappings = []
-    shoreline_cfg = data.get("shoreline_masks")
-    land_water_cfg = data.get("land_water_masks")
-    for split in AUX_MASK_SPLITS:
-        image_roots = _normalize_split_roots(data.get(split))
-        shoreline_roots = _normalize_split_roots(_get_auxiliary_split_spec(shoreline_cfg, split))
-        land_water_roots = _normalize_split_roots(_get_auxiliary_split_spec(land_water_cfg, split))
-        if shoreline_roots and len(shoreline_roots) not in {1, len(image_roots)}:
-            raise ValueError(
-                f"shoreline_masks.{split} must define either 1 root or {len(image_roots)} roots to match {split}."
-            )
-        if land_water_roots and len(land_water_roots) not in {1, len(image_roots)}:
-            raise ValueError(
-                f"land_water_masks.{split} must define either 1 root or {len(image_roots)} roots to match {split}."
-            )
-        if len(shoreline_roots) == 1 and len(image_roots) > 1:
-            shoreline_roots *= len(image_roots)
-        if len(land_water_roots) == 1 and len(image_roots) > 1:
-            land_water_roots *= len(image_roots)
-        for i, image_root in enumerate(image_roots):
-            mappings.append(
-                {
-                    "split": split,
-                    "image_root": image_root,
-                    "shoreline_root": shoreline_roots[i] if i < len(shoreline_roots) else None,
-                    "land_water_root": land_water_roots[i] if i < len(land_water_roots) else None,
-                }
-            )
-    return sorted(mappings, key=lambda x: len(str(x["image_root"])), reverse=True)
-
-
-def resolve_auxiliary_mask_paths(
-    image_file: str | Path,
-    mappings: list[dict[str, Path | str | None]],
-    require_shoreline: bool = False,
-    require_land_water: bool = False,
-) -> dict[str, str | None]:
-    """Resolve shoreline and land/water PNG paths for an image using longest-prefix root matching."""
-    image_path = Path(image_file).resolve()
-    for mapping in mappings:
-        image_root = Path(mapping["image_root"])
-        try:
-            rel = image_path.relative_to(image_root)
-        except ValueError:
-            # Support datasets that store split images as symlinks while image verification/cache resolves each image
-            # to its underlying target path. If the split root contains a symlink with the same basename that points to
-            # the resolved image file, use that split-relative name to resolve the auxiliary masks.
-            symlink_candidate = image_root / image_path.name
-            try:
-                if not symlink_candidate.exists() or symlink_candidate.resolve() != image_path:
-                    continue
-            except OSError:
-                continue
-            rel = symlink_candidate.relative_to(image_root)
-        out = {"split": mapping["split"], "shoreline_mask_file": None, "land_water_mask_file": None}
-        if mapping["shoreline_root"] is not None:
-            out["shoreline_mask_file"] = str((Path(mapping["shoreline_root"]) / rel).with_suffix(".png"))
-        if mapping["land_water_root"] is not None:
-            out["land_water_mask_file"] = str((Path(mapping["land_water_root"]) / rel).with_suffix(".png"))
-        if require_shoreline and not out["shoreline_mask_file"]:
-            raise FileNotFoundError(f"No shoreline mask root matched image '{image_path}'.")
-        if require_land_water and not out["land_water_mask_file"]:
-            raise FileNotFoundError(f"No land/water mask root matched image '{image_path}'.")
-        return out
-    raise FileNotFoundError(f"Could not match image '{image_path}' to any configured dataset split root.")
-
-
-def validate_auxiliary_mask_config(data: dict[str, Any], hyp: Any = None) -> None:
-    """Validate auxiliary-mask split roots against the current training or predict flags."""
-    flags = get_auxiliary_mask_flags(hyp)
-    if not flags["enabled"]:
-        return
-    if flags["require_shoreline"] and not data.get("shoreline_masks"):
-        raise SyntaxError("shoreline masks are required but 'shoreline_masks:' is missing from data.yaml.")
-    if flags["require_land_water"] and not data.get("land_water_masks"):
-        raise SyntaxError("land/water masks are required but 'land_water_masks:' is missing from data.yaml.")
-    for split in AUX_MASK_SPLITS:
-        if not data.get(split):
-            continue
-        if flags["require_shoreline"] and not _get_auxiliary_split_spec(data.get("shoreline_masks"), split):
-            raise SyntaxError(
-                f"shoreline_masks.{split} is required when shoreline inputs, priors, or shoreline aux heads are enabled."
-            )
-        if flags["require_land_water"] and not _get_auxiliary_split_spec(data.get("land_water_masks"), split):
-            raise SyntaxError(f"land_water_masks.{split} is required when land/water inputs or priors are enabled.")
-    build_auxiliary_root_mappings(data)
 
 
 def check_file_speeds(
@@ -730,38 +715,7 @@ def find_dataset_yaml(path: Path) -> Path:
     return files[0]
 
 def compute_channels(channels, hyp):
-    if not hyp:
-        return channels
-    orig_channels = channels
-    if getattr(hyp, "sobel_p", False):
-        orig_channels += 2
-    if getattr(hyp, "canny_p", False):
-        orig_channels += 1
-    if getattr(hyp, "log_p", False):
-        orig_channels += 1
-    if getattr(hyp, "stt_p", False):
-        orig_channels += 3
-    if getattr(hyp, "lbp_p", False):
-        orig_channels += 1
-    if getattr(hyp, "gaussian_pyramid_p", False):
-        orig_channels += 2
-    if getattr(hyp, "laplacian_pyramid_p", False):
-        orig_channels += 2
-    if getattr(hyp, "stl_p", False):
-        orig_channels += 6
-    if getattr(hyp, "dog_p", False):
-        orig_channels += 1
-    if getattr(hyp, "ridge_p", False):
-        orig_channels += 1
-    if getattr(hyp, "gabor_p", False):
-        orig_channels += 1
-    if getattr(hyp, "water_depth_indices_p", False):
-        orig_channels += 4
-    if getattr(hyp, "use_shoreline_input", False):
-        orig_channels += 1
-    if getattr(hyp, "use_land_water_input", False):
-        orig_channels += 1
-    return orig_channels
+    return int(channels)
 
 
 def check_det_dataset(dataset: str, autodownload: bool = True, hyp: dict = None) -> dict[str, Any]:
@@ -810,8 +764,8 @@ def check_det_dataset(dataset: str, autodownload: bool = True, hyp: dict = None)
         data["nc"] = len(data["names"])
 
     data["names"] = check_class_names(data["names"])
-    orig_channels = data.get("channels", 3)  # get image channels, default to 3
-    data["channels"] = compute_channels(orig_channels, hyp)
+    validate_bands_config(data, hyp)
+    data["channels"] = compute_channels(data.get("channels", RGB_BAND_COUNT), hyp)
 
     # Resolve paths
     path = Path(extract_dir or data.get("path") or Path(data.get("yaml_file", "")).parent)  # dataset root
@@ -823,14 +777,6 @@ def check_det_dataset(dataset: str, autodownload: bool = True, hyp: dict = None)
     for k in "train", "val", "test", "minival":
         if data.get(k):  # prepend path
             data[k] = _resolve_split_entry(path, data[k])
-    for k in AUX_MASK_KEYS:
-        if data.get(k):
-            spec = data[k]
-            data[k] = {
-                split: _resolve_split_entry(path, split_spec)
-                for split in AUX_MASK_SPLITS
-                if data.get(split) and (split_spec := _get_auxiliary_split_spec(spec, split))
-            }
     if data.get(METADATA_KEY):
         spec = data[METADATA_KEY]
         data[METADATA_KEY] = {
@@ -839,7 +785,6 @@ def check_det_dataset(dataset: str, autodownload: bool = True, hyp: dict = None)
             if data.get(split) and (split_spec := _get_auxiliary_split_spec(spec, split))
         }
 
-    validate_auxiliary_mask_config(data, hyp)
     validate_metadata_config(data)
 
     # Parse YAML

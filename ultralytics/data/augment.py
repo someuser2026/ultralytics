@@ -25,39 +25,11 @@ from ultralytics.utils.torch_utils import TORCHVISION_0_10, TORCHVISION_0_11, TO
 
 DEFAULT_MEAN = (0.0, 0.0, 0.0)
 DEFAULT_STD = (1.0, 1.0, 1.0)
-AUXILIARY_MASK_KEYS = ("shoreline_mask", "land_water_mask")
 
 
 def _ensure_mask_2d(mask: np.ndarray) -> np.ndarray:
     """Return a HxW mask array regardless of grayscale channel bookkeeping."""
     return mask[..., 0] if mask.ndim == 3 and mask.shape[2] == 1 else mask
-
-
-def _resize_aux_mask(mask: np.ndarray, size: tuple[int, int]) -> np.ndarray:
-    """Resize a sidecar mask with nearest-neighbor interpolation."""
-    mask = _ensure_mask_2d(mask)
-    return cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST)
-
-
-def _pad_aux_mask(mask: np.ndarray, top: int, bottom: int, left: int, right: int) -> np.ndarray:
-    """Pad a sidecar mask with zeros."""
-    mask = _ensure_mask_2d(mask)
-    return cv2.copyMakeBorder(mask, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
-
-
-def _warp_aux_mask(mask: np.ndarray, matrix: np.ndarray, size: tuple[int, int], perspective: bool) -> np.ndarray:
-    """Apply the same affine/perspective transform to a sidecar mask."""
-    mask = _ensure_mask_2d(mask)
-    if perspective:
-        return cv2.warpPerspective(mask, matrix, dsize=size, flags=cv2.INTER_NEAREST, borderValue=0)
-    return cv2.warpAffine(mask, matrix[:2], dsize=size, flags=cv2.INTER_NEAREST, borderValue=0)
-
-
-def _flip_aux_mask(mask: np.ndarray, direction: str) -> np.ndarray:
-    """Flip a sidecar mask vertically or horizontally."""
-    mask = _ensure_mask_2d(mask)
-    flipped = np.flipud(mask) if direction == "vertical" else np.fliplr(mask)
-    return np.ascontiguousarray(flipped)
 
 
 class BaseTransform:
@@ -580,31 +552,6 @@ class Mosaic(BaseMixTransform):
         self.n = n
         self.buffer_enabled = self.dataset.cache != "ram"
 
-    @staticmethod
-    def _init_aux_canvas(mask: np.ndarray | None, shape: tuple[int, int]) -> np.ndarray | None:
-        """Create a zero-valued mosaic canvas for a sidecar mask when present."""
-        if mask is None:
-            return None
-        return np.zeros(shape, dtype=_ensure_mask_2d(mask).dtype)
-
-    @staticmethod
-    def _place_aux_patch(
-        canvas: np.ndarray | None,
-        patch: np.ndarray | None,
-        y1a: int,
-        y2a: int,
-        x1a: int,
-        x2a: int,
-        y1b: int,
-        y2b: int,
-        x1b: int,
-        x2b: int,
-    ) -> None:
-        """Place a cropped sidecar-mask patch onto a mosaic canvas."""
-        if canvas is None or patch is None:
-            return
-        canvas[y1a:y2a, x1a:x2a] = _ensure_mask_2d(patch)[y1b:y2b, x1b:x2b]
-
     def get_indexes(self):
         """
         Return a list of random indexes from the dataset for mosaic augmentation.
@@ -684,21 +631,15 @@ class Mosaic(BaseMixTransform):
         """
         mosaic_labels = []
         s = self.imgsz
-        shoreline3 = None
-        land_water3 = None
         for i in range(3):
             labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
             # Load image
             img = labels_patch["img"]
             h, w = labels_patch.pop("resized_shape")
-            shoreline_patch = labels_patch.get("shoreline_mask")
-            land_water_patch = labels_patch.get("land_water_mask")
 
             # Place img in img3
             if i == 0:  # center
                 img3 = np.full((s * 3, s * 3, img.shape[2]), 0, dtype=np.uint8)  # base image with 3 tiles
-                shoreline3 = self._init_aux_canvas(shoreline_patch, (s * 3, s * 3))
-                land_water3 = self._init_aux_canvas(land_water_patch, (s * 3, s * 3))
                 h0, w0 = h, w
                 c = s, s, s + w, s + h  # xmin, ymin, xmax, ymax (base) coordinates
             elif i == 1:  # right
@@ -712,8 +653,6 @@ class Mosaic(BaseMixTransform):
             src_x1, src_x2 = x1 - padw, x2 - padw
 
             img3[y1:y2, x1:x2] = img[src_y1:src_y2, src_x1:src_x2]  # img3[ymin:ymax, xmin:xmax]
-            self._place_aux_patch(shoreline3, shoreline_patch, y1, y2, x1, x2, src_y1, src_y2, src_x1, src_x2)
-            self._place_aux_patch(land_water3, land_water_patch, y1, y2, x1, x2, src_y1, src_y2, src_x1, src_x2)
             # hp, wp = h, w  # height, width previous for next iteration
 
             # Labels assuming imgsz*2 mosaic size
@@ -722,10 +661,6 @@ class Mosaic(BaseMixTransform):
         final_labels = self._cat_labels(mosaic_labels)
 
         final_labels["img"] = img3[-self.border[0] : self.border[0], -self.border[1] : self.border[1]]
-        if shoreline3 is not None:
-            final_labels["shoreline_mask"] = shoreline3[-self.border[0] : self.border[0], -self.border[1] : self.border[1]]
-        if land_water3 is not None:
-            final_labels["land_water_mask"] = land_water3[-self.border[0] : self.border[0], -self.border[1] : self.border[1]]
         return final_labels
 
     def _mosaic4(self, labels: dict[str, Any]) -> dict[str, Any]:
@@ -754,22 +689,16 @@ class Mosaic(BaseMixTransform):
         """
         mosaic_labels = []
         s = self.imgsz
-        shoreline4 = None
-        land_water4 = None
         yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.border)  # mosaic center x, y
         for i in range(4):
             labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
             # Load image
             img = labels_patch["img"]
             h, w = labels_patch.pop("resized_shape")
-            shoreline_patch = labels_patch.get("shoreline_mask")
-            land_water_patch = labels_patch.get("land_water_mask")
 
             # Place img in img4
             if i == 0:  # top left
                 img4 = np.full((s * 2, s * 2, img.shape[2]), 0, dtype=np.uint8)  # base image with 4 tiles
-                shoreline4 = self._init_aux_canvas(shoreline_patch, (s * 2, s * 2))
-                land_water4 = self._init_aux_canvas(land_water_patch, (s * 2, s * 2))
                 x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
                 x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
             elif i == 1:  # top right
@@ -783,8 +712,6 @@ class Mosaic(BaseMixTransform):
                 x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
 
             img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]  # img4[ymin:ymax, xmin:xmax]
-            self._place_aux_patch(shoreline4, shoreline_patch, y1a, y2a, x1a, x2a, y1b, y2b, x1b, x2b)
-            self._place_aux_patch(land_water4, land_water_patch, y1a, y2a, x1a, x2a, y1b, y2b, x1b, x2b)
             padw = x1a - x1b
             padh = y1a - y1b
 
@@ -792,10 +719,6 @@ class Mosaic(BaseMixTransform):
             mosaic_labels.append(labels_patch)
         final_labels = self._cat_labels(mosaic_labels)
         final_labels["img"] = img4
-        if shoreline4 is not None:
-            final_labels["shoreline_mask"] = shoreline4
-        if land_water4 is not None:
-            final_labels["land_water_mask"] = land_water4
         return final_labels
 
     def _mosaic9(self, labels: dict[str, Any]) -> dict[str, Any]:
@@ -826,22 +749,16 @@ class Mosaic(BaseMixTransform):
         """
         mosaic_labels = []
         s = self.imgsz
-        shoreline9 = None
-        land_water9 = None
         hp, wp = -1, -1  # height, width previous
         for i in range(9):
             labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
             # Load image
             img = labels_patch["img"]
             h, w = labels_patch.pop("resized_shape")
-            shoreline_patch = labels_patch.get("shoreline_mask")
-            land_water_patch = labels_patch.get("land_water_mask")
 
             # Place img in img9
             if i == 0:  # center
                 img9 = np.full((s * 3, s * 3, img.shape[2]), 0, dtype=np.uint8)  # base image with 4 tiles
-                shoreline9 = self._init_aux_canvas(shoreline_patch, (s * 3, s * 3))
-                land_water9 = self._init_aux_canvas(land_water_patch, (s * 3, s * 3))
                 h0, w0 = h, w
                 c = s, s, s + w, s + h  # xmin, ymin, xmax, ymax (base) coordinates
             elif i == 1:  # top
@@ -868,8 +785,6 @@ class Mosaic(BaseMixTransform):
             src_y1, src_y2 = y1 - padh, y1 - padh + (y2 - y1)
             src_x1, src_x2 = x1 - padw, x1 - padw + (x2 - x1)
             img9[y1:y2, x1:x2] = img[src_y1:src_y2, src_x1:src_x2]  # img9[ymin:ymax, xmin:xmax]
-            self._place_aux_patch(shoreline9, shoreline_patch, y1, y2, x1, x2, src_y1, src_y2, src_x1, src_x2)
-            self._place_aux_patch(land_water9, land_water_patch, y1, y2, x1, x2, src_y1, src_y2, src_x1, src_x2)
             hp, wp = h, w  # height, width previous for next iteration
 
             # Labels assuming imgsz*2 mosaic size
@@ -878,10 +793,6 @@ class Mosaic(BaseMixTransform):
         final_labels = self._cat_labels(mosaic_labels)
 
         final_labels["img"] = img9[-self.border[0] : self.border[0], -self.border[1] : self.border[1]]
-        if shoreline9 is not None:
-            final_labels["shoreline_mask"] = shoreline9[-self.border[0] : self.border[0], -self.border[1] : self.border[1]]
-        if land_water9 is not None:
-            final_labels["land_water_mask"] = land_water9[-self.border[0] : self.border[0], -self.border[1] : self.border[1]]
         return final_labels
 
     @staticmethod
@@ -1449,9 +1360,6 @@ class RandomPerspective:
         # M is affine matrix
         # Scale for func:`box_candidates`
         img, M, scale = self.affine_transform(img, border)
-        for key in AUXILIARY_MASK_KEYS:
-            if labels.get(key) is not None:
-                labels[key] = _warp_aux_mask(labels[key], M, self.size, perspective=bool(self.perspective))
 
         bboxes = self.apply_bboxes(instances.bboxes, M)
 
@@ -1591,7 +1499,7 @@ class RandomHSV:
             >>> augmented_img = labels["img"]
         """
         img = labels["img"]
-        if img.shape[-1] != 3:  # only apply to RGB images
+        if img.ndim != 3 or img.shape[-1] < 3:  # only apply when an RGB view is available
             return labels
         if self.hgain or self.sgain or self.vgain:
             dtype = img.dtype  # uint8
@@ -1604,9 +1512,16 @@ class RandomHSV:
             lut_val = np.clip(x * (r[2] + 1), 0, 255).astype(dtype)
             lut_sat[0] = 0  # prevent pure white changing color, introduced in 8.3.79
 
-            hue, sat, val = cv2.split(cv2.cvtColor(img, cv2.COLOR_BGR2HSV))
+            rgb_view = img if img.shape[-1] == 3 else img[..., :3].copy()
+            color_code = cv2.COLOR_BGR2HSV if rgb_view.shape[-1] == 3 and img.shape[-1] == 3 else cv2.COLOR_RGB2HSV
+            hue, sat, val = cv2.split(cv2.cvtColor(rgb_view, color_code))
             im_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val)))
-            cv2.cvtColor(im_hsv, cv2.COLOR_HSV2BGR, dst=img)  # no return needed
+            dst_code = cv2.COLOR_HSV2BGR if img.shape[-1] == 3 else cv2.COLOR_HSV2RGB
+            rgb_view = cv2.cvtColor(im_hsv, dst_code)
+            if img.shape[-1] == 3:
+                img[...] = rgb_view
+            else:
+                img[..., :3] = rgb_view
         return labels
 
 
@@ -1693,17 +1608,11 @@ class RandomFlip:
         if self.direction == "vertical" and random.random() < self.p:
             img = np.flipud(img)
             instances.flipud(h)
-            for key in AUXILIARY_MASK_KEYS:
-                if labels.get(key) is not None:
-                    labels[key] = _flip_aux_mask(labels[key], "vertical")
             if self.flip_idx is not None and instances.keypoints is not None:
                 instances.keypoints = np.ascontiguousarray(instances.keypoints[:, self.flip_idx, :])
         if self.direction == "horizontal" and random.random() < self.p:
             img = np.fliplr(img)
             instances.fliplr(w)
-            for key in AUXILIARY_MASK_KEYS:
-                if labels.get(key) is not None:
-                    labels[key] = _flip_aux_mask(labels[key], "horizontal")
             if self.flip_idx is not None and instances.keypoints is not None:
                 instances.keypoints = np.ascontiguousarray(instances.keypoints[:, self.flip_idx, :])
         labels["img"] = np.ascontiguousarray(img)
@@ -1839,9 +1748,6 @@ class LetterBox:
             img = cv2.resize(img, new_unpad, interpolation=self.interpolation)
             if img.ndim == 2:
                 img = img[..., None]
-            for key in AUXILIARY_MASK_KEYS:
-                if labels.get(key) is not None:
-                    labels[key] = _resize_aux_mask(labels[key], new_unpad)
 
         top, bottom = int(round(dh - 0.1)) if self.center else 0, int(round(dh + 0.1))
         left, right = int(round(dw - 0.1)) if self.center else 0, int(round(dw + 0.1))
@@ -1854,9 +1760,6 @@ class LetterBox:
             pad_img = np.full((h + top + bottom, w + left + right, c), fill_value=self.padding_value, dtype=img.dtype)
             pad_img[top : top + h, left : left + w] = img
             img = pad_img
-        for key in AUXILIARY_MASK_KEYS:
-            if labels.get(key) is not None:
-                labels[key] = _pad_aux_mask(labels[key], top, bottom, left, right)
 
         if labels.get("ratio_pad"):
             labels["ratio_pad"] = (labels["ratio_pad"], (left, top))  # for evaluation
@@ -2207,13 +2110,11 @@ class Albumentations:
         if not self.allow_multi_channel:
             return labels
         orig_dtype = im.dtype
-        aux_mask_keys = [key for key in AUXILIARY_MASK_KEYS if labels.get(key) is not None]
-        aux_masks = [labels[key] for key in aux_mask_keys]
 
         if self.contains_spatial:
             cls = labels["cls"]
             cls_probs = labels.get("cls_probs", np.ones((len(cls), 1), dtype=np.float32))
-            if len(cls) or aux_masks:
+            if len(cls):
                 labels["instances"].convert_bbox("xywh")
                 labels["instances"].normalize(*im.shape[:2][::-1])
                 bboxes = labels["instances"].bboxes
@@ -2226,16 +2127,12 @@ class Albumentations:
                     class_labels=class_labels,
                     cls_probs=prob_labels,
                 )
-                if aux_masks:
-                    transform_inputs["masks"] = aux_masks
                 new = self.transform(**transform_inputs)  # transformed
-                if len(new["class_labels"]) > 0 or (not len(cls) and aux_masks):
+                if len(new["class_labels"]) > 0:
                     labels["img"] = new["image"]
                     labels["cls"] = np.asarray(new["class_labels"], dtype=np.float32).reshape(-1, 1)
                     labels["cls_probs"] = np.asarray(new["cls_probs"], dtype=np.float32).reshape(-1, 1)
                     bboxes = np.array(new["bboxes"], dtype=np.float32)
-                    for key, mask in zip(aux_mask_keys, new.get("masks", ())):
-                        labels[key] = _ensure_mask_2d(mask).astype(labels[key].dtype, copy=False)
                 labels["instances"].update(bboxes=bboxes)
         else:
             labels["img"] = self.transform(image=labels["img"])["image"].astype(orig_dtype)  # transformed
@@ -2688,1050 +2585,12 @@ class RandomUnsharpMask:
         labels["img"] = sharpened
         return labels
 
-# ============================== helpers ======================================
-def _ensure_uint8(img: np.ndarray) -> np.ndarray:
-    """Convert image to uint8 format, scaling if necessary."""
-    if img.dtype == np.uint8:
-        return img
-    elif img.dtype == np.uint16:
-        return (img / 257).astype(np.uint8)
-    x = img.astype(np.float32)
-    if np.issubdtype(img.dtype, np.floating) and x.max() <= 1.0:
-        x *= 255.0
-    return np.clip(x, 0, 255).astype(np.uint8)
-
-def _to_gray(img: np.ndarray, strategy: Literal["luma", "mean"] = "luma") -> np.ndarray:
-    """
-    Convert image to grayscale using specified strategy.
-    
-    Args:
-        img: Input image array
-        strategy: Conversion method - "luma" for weighted RGB or "mean" for simple averaging
-        
-    Returns:
-        Grayscale image as uint8
-    """
-    img_u8 = _ensure_uint8(img)
-    if img_u8.ndim == 3 and img_u8.shape[2] >= 3 and strategy == "luma":
-        return cv2.cvtColor(img_u8[:, :, :3], cv2.COLOR_BGR2GRAY)
-    g = np.mean(img_u8, axis=2) if img_u8.ndim == 3 else img_u8
-    return np.clip(g, 0, 255).astype(np.uint8)
-
-def _match_dtype(img: np.ndarray, ch_u8: np.ndarray) -> np.ndarray:
-    """Match the dtype of a channel to the original image."""
-    if np.issubdtype(img.dtype, np.floating):
-        out = ch_u8.astype(np.float32) / 255.0
-        return out.astype(img.dtype, copy=False)
-    return ch_u8.astype(img.dtype, copy=False)
-
-def _append_channels(img: np.ndarray, chans: list[np.ndarray]) -> np.ndarray:
-    """Append additional channels to an image."""
-    out = img
-    if out.ndim == 2:
-        out = out[..., None]
-    stack = [out]
-    for ch in chans:
-        if ch.ndim == 3 and ch.shape[2] == 1:
-            ch = ch[:, :, 0]
-        ch_u8 = _ensure_uint8(ch)
-        ch_cast = _match_dtype(out, ch_u8)
-        stack.append(ch_cast[..., None] if ch_cast.ndim == 2 else ch_cast)
-    return np.concatenate(stack, axis = 2)
-
-# ============================ core edges =====================================
-class SobelEdges:
-    """
-    Apply Sobel edge detection and append edge channels to the image.
-    
-    This augmentation computes Sobel gradients in x and y directions and can append
-    magnitude, directional gradients, or both magnitude and direction as additional channels.
-    
-    Attributes:
-        p (float): Probability of applying the augmentation. Default is 1.0 (always apply).
-        ksize (int): Size of the Sobel kernel. Must be 1, 3, 5, or 7. Default is 3.
-        out_mode (str): Output mode determining which channels to append:
-            - "mag": Append gradient magnitude (1 channel)
-            - "dxdy": Append x and y gradients (2 channels)
-            - "magdir": Append magnitude and direction (2 channels)
-        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
-    
-    Examples:
-        >>> from ultralytics.data.augment import AddSobelEdges
-        >>> import numpy as np
-        >>> augmenter = AddSobelEdges(p=0.5, ksize=3, out_mode="mag")
-        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        >>> labels = {"img": image}
-        >>> augmented = augmenter(labels)
-        >>> print(augmented["img"].shape)  # Shape will be (100, 100, 4) - original 3 + 1 edge channel
-    """
-    
-    def __init__(
-        self,
-        p: bool = False,
-        ksize: int = 3,
-        out_mode: Literal["mag", "dxdy", "magdir"] = "dxdy",
-        gray_strategy: Literal["luma", "mean"] = "luma"
-    ) -> None:
-        """
-        Initialize AddSobelEdges augmentation.
-        
-        Args:
-            p: Probability of applying the augmentation (0.0 to 1.0).
-            ksize: Sobel kernel size. Must be 1, 3, 5, or 7.
-            out_mode: Output mode - "mag", "dxdy", or "magdir".
-            gray_strategy: Grayscale conversion method - "luma" or "mean".
-        """
-        self.p = p
-        self.ksize = ksize if ksize in (1, 3, 5, 7) else 3
-        self.out_mode = out_mode
-        self.gray_strategy = gray_strategy
-
-    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
-        """
-        Apply Sobel edge detection to the image.
-        
-        Args:
-            labels: Dictionary containing 'img' key with image array.
-            
-        Returns:
-            Dictionary with image having additional edge channels appended.
-        """
-        if not self.p:
-            return labels
-            
-        img = labels["img"]
-        gray = _to_gray(img, self.gray_strategy)
-        
-        dx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=self.ksize)
-        dy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=self.ksize)
-        mag = cv2.magnitude(dx, dy)
-        mag_u8 = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        
-        if self.out_mode == "mag":
-            out_chans = [mag_u8]
-        elif self.out_mode == "dxdy":
-            dx_u8 = cv2.normalize(np.abs(dx), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            dy_u8 = cv2.normalize(np.abs(dy), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            out_chans = [dx_u8, dy_u8]
-        else:  # magdir
-            ang = cv2.phase(dx, dy, angleInDegrees=True)
-            ang_u8 = (ang / 360.0 * 255.0).astype(np.uint8)
-            out_chans = [mag_u8, ang_u8]
-            
-        labels["img"] = _append_channels(img, out_chans)
-        return labels
-
-
-class CannyEdges:
-    """
-    Apply Canny edge detection and append edge map as an additional channel.
-    
-    This augmentation uses the Canny edge detector with optional automatic threshold
-    calculation based on image median intensity.
-    
-    Attributes:
-        p (float): Probability of applying the augmentation. Default is 1.0.
-        auto (bool): If True, automatically calculate thresholds from image median. Default is True.
-        t1 (int): Lower threshold for Canny (used when auto=False). Default is 50.
-        t2 (int): Upper threshold for Canny (used when auto=False). Default is 150.
-        aperture_size (int): Aperture size for Sobel operator. Must be 3, 5, or 7. Default is 3.
-        L2gradient (bool): If True, uses L2 norm for gradient magnitude. Default is True.
-        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
-    
-    Examples:
-        >>> from ultralytics.data.augment import AddCannyEdges
-        >>> import numpy as np
-        >>> augmenter = AddCannyEdges(p=0.8, auto=True)
-        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        >>> labels = {"img": image}
-        >>> augmented = augmenter(labels)
-        >>> print(augmented["img"].shape)  # Shape will be (100, 100, 4)
-    """
-    
-    def __init__(
-        self,
-        p: bool = False,
-        auto: bool = True,
-        t1: int = 50,
-        t2: int = 150,
-        aperture_size: int = 3,
-        L2gradient: bool = True,
-        gray_strategy: Literal["luma", "mean"] = "luma"
-    ) -> None:
-        """
-        Initialize AddCannyEdges augmentation.
-        
-        Args:
-            p: Probability of applying the augmentation (0.0 to 1.0).
-            auto: Enable automatic threshold calculation.
-            t1: Lower Canny threshold (when auto=False).
-            t2: Upper Canny threshold (when auto=False).
-            aperture_size: Sobel aperture size. Must be 3, 5, or 7.
-            L2gradient: Use L2 norm for gradient calculation.
-            gray_strategy: Grayscale conversion method - "luma" or "mean".
-        """
-        self.p = p
-        self.auto = auto
-        self.t1 = int(t1)
-        self.t2 = int(t2)
-        self.aperture_size = aperture_size if aperture_size in (3, 5, 7) else 3
-        self.L2gradient = L2gradient
-        self.gray_strategy = gray_strategy
-
-    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
-        """
-        Apply Canny edge detection to the image.
-        
-        Args:
-            labels: Dictionary containing 'img' key with image array.
-            
-        Returns:
-            Dictionary with image having edge channel appended.
-        """
-        if not self.p:
-            return labels
-            
-        img = labels["img"]
-        gray = _to_gray(img, self.gray_strategy)
-        gb = cv2.GaussianBlur(gray, (3, 3), 0)
-        
-        if self.auto:
-            v = float(np.median(gb))
-            lo = int(max(0, (1 - 0.33) * v))
-            hi = int(min(255, (1 + 0.33) * v))
-        else:
-            lo, hi = self.t1, self.t2
-            
-        edges = cv2.Canny(gb, lo, hi, apertureSize=self.aperture_size, L2gradient=self.L2gradient)
-        labels["img"] = _append_channels(img, [edges])
-        return labels
-
-
-class LoGEdge:
-    """
-    Apply Laplacian of Gaussian (LoG) edge detection and append as a channel.
-    
-    This augmentation combines Gaussian smoothing with Laplacian edge detection,
-    effective for detecting edges at multiple scales.
-    
-    Attributes:
-        p (float): Probability of applying the augmentation. Default is 1.0.
-        sigma (float): Sigma for Gaussian blur before Laplacian. Default is 1.2.
-        scale_abs (bool): If True, take absolute value of Laplacian. Default is True.
-        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
-    
-    Examples:
-        >>> from ultralytics.data.augment import AddLoGEdge
-        >>> import numpy as np
-        >>> augmenter = AddLoGEdge(p=0.7, sigma=1.5)
-        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        >>> labels = {"img": image}
-        >>> augmented = augmenter(labels)
-    """
-    
-    def __init__(
-        self,
-        p: bool = False,
-        sigma: float = 1.2,
-        scale_abs: bool = True,
-        gray_strategy: Literal["luma", "mean"] = "luma"
-    ) -> None:
-        """
-        Initialize AddLoGEdge augmentation.
-        
-        Args:
-            p: Probability of applying the augmentation (0.0 to 1.0).
-            sigma: Gaussian blur sigma value. Higher values detect coarser edges.
-            scale_abs: Take absolute value of Laplacian output.
-            gray_strategy: Grayscale conversion method - "luma" or "mean".
-        """
-        self.p = p
-        self.sigma = float(max(0.1, sigma))
-        self.scale_abs = scale_abs
-        self.gray_strategy = gray_strategy
-        
-    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
-        """
-        Apply LoG edge detection to the image.
-        
-        Args:
-            labels: Dictionary containing 'img' key with image array.
-            
-        Returns:
-            Dictionary with image having LoG edge channel appended.
-        """
-        if not self.p:
-            return labels
-            
-        img = labels["img"]
-        gray = _to_gray(img, self.gray_strategy)
-        k = int(2 * np.ceil(3 * self.sigma) + 1)
-        blur = cv2.GaussianBlur(gray, (k, k), self.sigma)
-        lap = cv2.Laplacian(blur, cv2.CV_32F, ksize=3)
-        
-        if self.scale_abs:
-            lap = np.abs(lap)
-            
-        out = cv2.normalize(lap, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        labels["img"] = _append_channels(img, [out])
-        return labels
-
-
-class StructureTensor:
-    """
-    Compute and append structure tensor components (Jxx, Jyy, Jxy) as channels.
-    
-    The structure tensor captures local gradient information and is useful for
-    detecting corners, edges, and texture orientation.
-    
-    Attributes:
-        p (float): Probability of applying the augmentation. Default is 1.0.
-        sobel_ksize (int): Sobel kernel size. Must be 1, 3, 5, or 7. Default is 3.
-        smooth_sigma (float): Gaussian smoothing sigma for tensor components. Default is 1.0.
-        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
-    
-    Examples:
-        >>> from ultralytics.data.augment import AddStructureTensor
-        >>> import numpy as np
-        >>> augmenter = AddStructureTensor(p=0.6, smooth_sigma=1.5)
-        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        >>> labels = {"img": image}
-        >>> augmented = augmenter(labels)
-        >>> print(augmented["img"].shape)  # Shape will be (100, 100, 6) - original 3 + 3 tensor channels
-    """
-    
-    def __init__(
-        self,
-        p: bool = False,
-        sobel_ksize: int = 3,
-        smooth_sigma: float = 1.0,
-        gray_strategy: Literal["luma", "mean"] = "luma"
-    ) -> None:
-        """
-        Initialize AddStructureTensor augmentation.
-        
-        Args:
-            p: Probability of applying the augmentation (0.0 to 1.0).
-            sobel_ksize: Sobel kernel size. Must be 1, 3, 5, or 7.
-            smooth_sigma: Sigma for Gaussian smoothing of tensor components.
-            gray_strategy: Grayscale conversion method - "luma" or "mean".
-        """
-        self.p = p
-        self.sobel_ksize = sobel_ksize if sobel_ksize in (1, 3, 5, 7) else 3
-        self.sigma = float(max(0, smooth_sigma))
-        self.gray_strategy = gray_strategy
-        
-    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
-        """
-        Compute and append structure tensor channels to the image.
-        
-        Args:
-            labels: Dictionary containing 'img' key with image array.
-            
-        Returns:
-            Dictionary with image having 3 structure tensor channels appended.
-        """
-        if not self.p:
-            return labels
-            
-        img = labels["img"]
-        g = _to_gray(img, self.gray_strategy)
-        dx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=self.sobel_ksize)
-        dy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=self.sobel_ksize)
-        
-        Jxx, Jyy, Jxy = dx * dx, dy * dy, dx * dy
-        
-        if self.sigma > 0:
-            k = int(2 * np.ceil(3 * self.sigma) + 1)
-            Jxx = cv2.GaussianBlur(Jxx, (k, k), self.sigma)
-            Jyy = cv2.GaussianBlur(Jyy, (k, k), self.sigma)
-            Jxy = cv2.GaussianBlur(Jxy, (k, k), self.sigma)
-            
-        chans = [cv2.normalize(x, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8) 
-                 for x in (Jxx, Jyy, Jxy)]
-        labels["img"] = _append_channels(img, chans)
-        return labels
-
-
-class LBP:
-    """
-    Compute and append Local Binary Pattern (LBP) as a texture channel.
-    
-    LBP is a texture descriptor that compares each pixel with its 8 neighbors,
-    creating a binary pattern. Useful for texture classification and analysis.
-    
-    Attributes:
-        p (float): Probability of applying the augmentation. Default is 1.0.
-        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
-    
-    Examples:
-        >>> from ultralytics.data.augment import AddLBP
-        >>> import numpy as np
-        >>> augmenter = AddLBP(p=0.5)
-        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        >>> labels = {"img": image}
-        >>> augmented = augmenter(labels)
-    """
-    
-    def __init__(
-        self,
-        p: bool = False,
-        gray_strategy: Literal["luma", "mean"] = "luma"
-    ) -> None:
-        """
-        Initialize AddLBP augmentation.
-        
-        Args:
-            p: Probability of applying the augmentation (0.0 to 1.0).
-            gray_strategy: Grayscale conversion method - "luma" or "mean".
-        """
-        self.p = p
-        self.gray_strategy = gray_strategy
-        
-    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
-        """
-        Compute and append LBP texture channel to the image.
-        
-        Args:
-            labels: Dictionary containing 'img' key with image array.
-            
-        Returns:
-            Dictionary with image having LBP channel appended.
-        """
-        if not self.p:
-            return labels
-            
-        img = labels["img"]
-        g = _to_gray(img, self.gray_strategy).astype(np.int16)
-        
-        # Compute neighbors via roll
-        def rol(x, dy, dx):
-            return np.roll(np.roll(x, dy, axis=0), dx, axis=1)
-        
-        c = g
-        n = [
-            rol(g, -1, -1), rol(g, -1, 0), rol(g, -1, 1),
-            rol(g, 0, -1),                 rol(g, 0, 1),
-            rol(g, 1, -1),  rol(g, 1, 0),  rol(g, 1, 1)
-        ]
-        
-        lbp = np.zeros_like(g, dtype=np.uint8)
-        for i, ni in enumerate(n):
-            lbp |= ((ni >= c).astype(np.uint8) << i)
-            
-        labels["img"] = _append_channels(img, [lbp])
-        return labels
-
-
-class GaussianPyramid:
-    """
-    Create and append Gaussian pyramid levels as additional channels.
-    
-    Downsamples the image multiple times and upsamples back to original size,
-    creating scale-space representations useful for multi-scale feature detection.
-    
-    Attributes:
-        p (float): Probability of applying the augmentation. Default is 1.0.
-        levels (int): Number of pyramid levels to create. Default is 2.
-        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
-    
-    Examples:
-        >>> from ultralytics.data.augment import AddGaussianPyramid
-        >>> import numpy as np
-        >>> augmenter = AddGaussianPyramid(p=0.5, levels=3)
-        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        >>> labels = {"img": image}
-        >>> augmented = augmenter(labels)
-        >>> print(augmented["img"].shape)  # Shape will be (100, 100, 6) - original 3 + 3 pyramid levels
-    """
-    
-    def __init__(
-        self,
-        p: bool = False,
-        levels: int = 2,
-        gray_strategy: Literal["luma", "mean"] = "luma"
-    ) -> None:
-        """
-        Initialize AddGaussianPyramid augmentation.
-        
-        Args:
-            p: Probability of applying the augmentation (0.0 to 1.0).
-            levels: Number of pyramid levels to create.
-            gray_strategy: Grayscale conversion method - "luma" or "mean".
-        """
-        self.p = p
-        self.levels = max(1, int(levels))
-        self.gray_strategy = gray_strategy
-        
-    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
-        """
-        Create and append Gaussian pyramid channels to the image.
-        
-        Args:
-            labels: Dictionary containing 'img' key with image array.
-            
-        Returns:
-            Dictionary with image having pyramid level channels appended.
-        """
-        if not self.p:
-            return labels
-            
-        img = labels["img"]
-        g0 = _to_gray(img, self.gray_strategy)
-        chans = []
-        g = g0.copy()
-        
-        for i in range(self.levels):
-            g = cv2.pyrDown(g)
-            up = g
-            for _ in range(i + 1):
-                up = cv2.pyrUp(up)
-            up = cv2.resize(up, (g0.shape[1], g0.shape[0]), interpolation=cv2.INTER_LINEAR)
-            chans.append(_ensure_uint8(up))
-            
-        labels["img"] = _append_channels(img, chans)
-        return labels
-
-
-class LaplacianPyramid:
-    """
-    Create and append Laplacian pyramid levels as additional channels.
-    
-    Computes differences between Gaussian pyramid levels, capturing details
-    at different scales. Useful for multi-scale edge and detail detection.
-    
-    Attributes:
-        p (float): Probability of applying the augmentation. Default is 1.0.
-        levels (int): Number of pyramid levels to create. Default is 2.
-        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
-    
-    Examples:
-        >>> from ultralytics.data.augment import AddLaplacianPyramid
-        >>> import numpy as np
-        >>> augmenter = AddLaplacianPyramid(p=0.6, levels=2)
-        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        >>> labels = {"img": image}
-        >>> augmented = augmenter(labels)
-    """
-    
-    def __init__(
-        self,
-        p: bool = False,
-        levels: int = 2,
-        gray_strategy: Literal["luma", "mean"] = "luma"
-    ) -> None:
-        """
-        Initialize AddLaplacianPyramid augmentation.
-        
-        Args:
-            p: Probability of applying the augmentation (0.0 to 1.0).
-            levels: Number of pyramid levels to create.
-            gray_strategy: Grayscale conversion method - "luma" or "mean".
-        """
-        self.p = p
-        self.levels = max(1, int(levels))
-        self.gray_strategy = gray_strategy
-        
-    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
-        """
-        Create and append Laplacian pyramid channels to the image.
-        
-        Args:
-            labels: Dictionary containing 'img' key with image array.
-            
-        Returns:
-            Dictionary with image having Laplacian pyramid channels appended.
-        """
-        if not self.p:
-            return labels
-            
-        img = labels["img"]
-        g0 = _to_gray(img, self.gray_strategy)
-        gp = [g0]
-        
-        for _ in range(self.levels):
-            gp.append(cv2.pyrDown(gp[-1]))
-            
-        chans = []
-        for lvl in range(self.levels):
-            up = cv2.pyrUp(gp[lvl + 1])
-            up = cv2.resize(up, (gp[lvl].shape[1], gp[lvl].shape[0]), interpolation=cv2.INTER_LINEAR)
-            lap = cv2.subtract(gp[lvl], up)
-            lap_u8 = cv2.normalize(lap.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            lap_u8 = cv2.resize(lap_u8, (g0.shape[1], g0.shape[0]), interpolation=cv2.INTER_LINEAR)
-            chans.append(lap_u8)
-            
-        labels["img"] = _append_channels(img, chans)
-        return labels
-
-
-class SteerableFilters:
-    """
-    Apply steerable filters at multiple orientations and append as channels.
-    
-    Computes directional derivatives at K evenly-spaced orientations using
-    steerability: R(θ) = cos(θ)*dx + sin(θ)*dy. Useful for orientation-specific
-    edge and texture detection.
-    
-    Attributes:
-        p (float): Probability of applying the augmentation. Default is 1.0.
-        n_orientations (int): Number of orientations to compute. Default is 6.
-        sobel_ksize (int): Sobel kernel size. Must be 1, 3, 5, or 7. Default is 3.
-        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
-    
-    Examples:
-        >>> from ultralytics.data.augment import AddSteerableFilters
-        >>> import numpy as np
-        >>> augmenter = AddSteerableFilters(p=0.5, n_orientations=8)
-        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        >>> labels = {"img": image}
-        >>> augmented = augmenter(labels)
-        >>> print(augmented["img"].shape)  # Shape will be (100, 100, 11) - original 3 + 8 orientations
-    """
-    
-    def __init__(
-        self,
-        p: bool = False,
-        n_orientations: int = 6,
-        sobel_ksize: int = 3,
-        gray_strategy: Literal["luma", "mean"] = "luma"
-    ) -> None:
-        """
-        Initialize AddSteerableFilters augmentation.
-        
-        Args:
-            p: Probability of applying the augmentation (0.0 to 1.0).
-            n_orientations: Number of orientations to compute.
-            sobel_ksize: Sobel kernel size. Must be 1, 3, 5, or 7.
-            gray_strategy: Grayscale conversion method - "luma" or "mean".
-        """
-        self.p = p
-        self.K = max(1, int(n_orientations))
-        self.ksize = sobel_ksize if sobel_ksize in (1, 3, 5, 7) else 3
-        self.gray_strategy = gray_strategy
-        
-    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
-        """
-        Compute and append steerable filter responses at multiple orientations.
-        
-        Args:
-            labels: Dictionary containing 'img' key with image array.
-            
-        Returns:
-            Dictionary with image having orientation-specific channels appended.
-        """
-        if not self.p:
-            return labels
-            
-        img = labels["img"]
-        g = _to_gray(img, self.gray_strategy)
-        dx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=self.ksize)
-        dy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=self.ksize)
-        
-        chans = []
-        for i in range(self.K):
-            theta = np.pi * i / self.K
-            resp = np.abs(np.cos(theta) * dx + np.sin(theta) * dy)
-            resp_u8 = cv2.normalize(resp, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            chans.append(resp_u8)
-            
-        labels["img"] = _append_channels(img, chans)
-        return labels
-
-
-class Gabor:
-    """
-    Apply Gabor filter and append magnitude response as a channel.
-    
-    Gabor filters are useful for texture analysis and feature extraction,
-    combining frequency and orientation selectivity.
-    
-    Attributes:
-        p (float): Probability of applying the augmentation. Default is 1.0.
-        ksize (int): Gabor kernel size. Default is 21.
-        sigma (float): Standard deviation of Gaussian envelope. Default is 4.0.
-        theta_deg (float): Orientation in degrees. Default is 0.0.
-        lambd (float): Wavelength of sinusoidal factor. Default is 10.0.
-        gamma (float): Spatial aspect ratio. Default is 0.5.
-        psi (float): Phase offset. Default is 0.0.
-        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
-    
-    Examples:
-        >>> from ultralytics.data.augment import AddGabor
-        >>> import numpy as np
-        >>> augmenter = AddGabor(p=0.5, theta_deg=45, lambd=8.0)
-        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        >>> labels = {"img": image}
-        >>> augmented = augmenter(labels)
-    """
-    
-    def __init__(
-        self,
-        p: bool = False,
-        ksize: int = 21,
-        sigma: float = 4.0,
-        theta_deg: float = 0.0,
-        lambd: float = 10.0,
-        gamma: float = 0.5,
-        psi: float = 0.0,
-        gray_strategy: Literal["luma", "mean"] = "luma"
-    ) -> None:
-        """
-        Initialize AddGabor augmentation.
-        
-        Args:
-            p: Probability of applying the augmentation (0.0 to 1.0).
-            ksize: Gabor kernel size. Should be odd.
-            sigma: Standard deviation of Gaussian envelope.
-            theta_deg: Filter orientation in degrees.
-            lambd: Wavelength of the sinusoidal factor.
-            gamma: Spatial aspect ratio (ellipticity).
-            psi: Phase offset in radians.
-            gray_strategy: Grayscale conversion method - "luma" or "mean".
-        """
-        self.p = p
-        self.ksize = int(max(3, ksize) | 1)  # Ensure odd
-        self.sigma = float(sigma)
-        self.theta = np.deg2rad(theta_deg)
-        self.lambd = float(lambd)
-        self.gamma = float(gamma)
-        self.psi = float(psi)
-        self.gray_strategy = gray_strategy
-        
-    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
-        """
-        Apply Gabor filter to the image.
-        
-        Args:
-            labels: Dictionary containing 'img' key with image array.
-            
-        Returns:
-            Dictionary with image having Gabor response channel appended.
-        """
-        if not self.p:
-            return labels
-            
-        img = labels["img"]
-        g = _to_gray(img, self.gray_strategy)
-        k = cv2.getGaborKernel(
-            (self.ksize, self.ksize),
-            self.sigma,
-            self.theta,
-            self.lambd,
-            self.gamma,
-            self.psi,
-            ktype=cv2.CV_32F
-        )
-        resp = cv2.filter2D(g.astype(np.float32), cv2.CV_32F, k)
-        resp = np.abs(resp)
-        out = cv2.normalize(resp, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        labels["img"] = _append_channels(img, [out])
-        return labels
-
-
-class DoG:
-    """
-    Apply Difference of Gaussians (DoG) and append as a channel.
-    
-    DoG approximates the Laplacian of Gaussian and is useful for blob detection
-    and edge enhancement at specific scales.
-    
-    Attributes:
-        p (float): Probability of applying the augmentation. Default is 1.0.
-        sigma1 (float): Sigma for first Gaussian. Default is 1.0.
-        sigma2 (float): Sigma for second Gaussian. Default is 2.0.
-        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
-    
-    Examples:
-        >>> from ultralytics.data.augment import AddDoG
-        >>> import numpy as np
-        >>> augmenter = AddDoG(p=0.6, sigma1=1.0, sigma2=2.5)
-        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        >>> labels = {"img": image}
-        >>> augmented = augmenter(labels)
-    """
-    
-    def __init__(
-        self,
-        p: bool = False,
-        sigma1: float = 1.0,
-        sigma2: float = 2.0,
-        gray_strategy: Literal["luma", "mean"] = "luma"
-    ) -> None:
-        """
-        Initialize AddDoG augmentation.
-        
-        Args:
-            p: Probability of applying the augmentation (0.0 to 1.0).
-            sigma1: Sigma for first (narrower) Gaussian.
-            sigma2: Sigma for second (wider) Gaussian. Should be > sigma1.
-            gray_strategy: Grayscale conversion method - "luma" or "mean".
-        """
-        self.p = p
-        self.s1 = float(sigma1)
-        self.s2 = float(sigma2)
-        if self.s1 >= self.s2:
-            self.s1, self.s2 = self.s2 / 2.0, self.s2
-        self.gray_strategy = gray_strategy
-        
-    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
-        """
-        Apply Difference of Gaussians to the image.
-        
-        Args:
-            labels: Dictionary containing 'img' key with image array.
-            
-        Returns:
-            Dictionary with image having DoG channel appended.
-        """
-        if not self.p:
-            return labels
-            
-        img = labels["img"]
-        g = _to_gray(img, self.gray_strategy)
-        k1 = int(2 * np.ceil(3 * self.s1) + 1)
-        k2 = int(2 * np.ceil(3 * self.s2) + 1)
-        b1 = cv2.GaussianBlur(g, (k1, k1), self.s1)
-        b2 = cv2.GaussianBlur(g, (k2, k2), self.s2)
-        dog = np.abs(b1.astype(np.int16) - b2.astype(np.int16)).astype(np.float32)
-        out = cv2.normalize(dog, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        labels["img"] = _append_channels(img, [out])
-        return labels
-
-
-class RidgeFilters:
-    """
-    Apply Hessian-based ridge detection and append as a channel.
-    
-    Computes ridge strength using eigenvalues of the Hessian matrix,
-    useful for detecting vessel-like structures and ridges in images.
-    
-    Attributes:
-        p (float): Probability of applying the augmentation. Default is 1.0.
-        sigma (float): Sigma for Gaussian pre-smoothing. Default is 1.5.
-        mode (str): Ridge type - "bright" for bright ridges on dark background,
-                    "dark" for dark ridges on bright background.
-        gray_strategy (str): Method for grayscale conversion ("luma" or "mean").
-    
-    Examples:
-        >>> from ultralytics.data.augment import AddRidgeFilters
-        >>> import numpy as np
-        >>> augmenter = AddRidgeFilters(p=0.5, sigma=2.0, mode="bright")
-        >>> image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-        >>> labels = {"img": image}
-        >>> augmented = augmenter(labels)
-    """
-    
-    def __init__(
-        self,
-        p: bool = False,
-        sigma: float = 1.5,
-        mode: Literal["bright", "dark"] = "bright",
-        gray_strategy: Literal["luma", "mean"] = "luma"
-    ) -> None:
-        """
-        Initialize AddRidgeFilters augmentation.
-        
-        Args:
-            p: Probability of applying the augmentation (0.0 to 1.0).
-            sigma: Sigma for Gaussian smoothing before Hessian computation.
-            mode: Ridge polarity - "bright" or "dark".
-            gray_strategy: Grayscale conversion method - "luma" or "mean".
-        """
-        self.p = p
-        self.sigma = float(max(0.1, sigma))
-        self.mode = mode
-        self.gray_strategy = gray_strategy
-        
-    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
-        """
-        Apply ridge detection to the image.
-        
-        Args:
-            labels: Dictionary containing 'img' key with image array.
-            
-        Returns:
-            Dictionary with image having ridge strength channel appended.
-        """
-        if not self.p:
-            return labels
-            
-        img = labels["img"]
-        g = _to_gray(img, self.gray_strategy).astype(np.float32)
-        k = int(2 * np.ceil(3 * self.sigma) + 1)
-        g = cv2.GaussianBlur(g, (k, k), self.sigma)
-        
-        Ixx = cv2.Sobel(g, cv2.CV_32F, 2, 0, ksize=3)
-        Iyy = cv2.Sobel(g, cv2.CV_32F, 0, 2, ksize=3)
-        Ixy = cv2.Sobel(g, cv2.CV_32F, 1, 1, ksize=3)
-        
-        tr = Ixx + Iyy
-        det = Ixx * Iyy - Ixy * Ixy
-        disc = np.sqrt(np.maximum(tr * tr - 4.0 * det, 0.0))
-        lam1 = 0.5 * (tr + disc)
-        lam2 = 0.5 * (tr - disc)
-        
-        if self.mode == "bright":
-            ridge = np.maximum(0.0, -lam2)
-        else:
-            ridge = np.maximum(0.0, lam2)
-            
-        out = cv2.normalize(ridge, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        labels["img"] = _append_channels(img, [out])
-        return labels
-
-class AddWaterDepthIndices:
-    """
-    Compute NDWI, automatically determine a water threshold using Otsu,
-    generate a water mask, compute depth-sensitive indices, and append
-    them as channels.
-    Outputs:
-        - NDWI normalized
-        - Water mask (binary)
-        - Blue/Green ratio (masked)
-        - Depth Proxy ln(B) - ln(G) (masked)
-    Attributes:
-        p (bool): Probability of applying the augmentation.
-        eps (float): Numerical stability constant.
-        clamp_min, clamp_max: Bounds for valid NDWI threshold.
-    """
-    def __init__(
-        self,
-        p: bool = False,
-        eps: float = 1e-6,
-        clamp_min: float = -0.05,
-        clamp_max: float = 0.10
-    ) -> None:
-        """
-        Initialize the AddWaterDepthIndices augmentation.
-
-        Args:
-            p (float): On/off flag for augmentation. Default: False (disabled).
-            eps (float): Epsilon for numerical stability. Default: 1e-6.
-            clamp_min (float): Minimum NDWI threshold bound. Default: -0.05.
-            clamp_max (float): Maximum NDWI threshold bound. Default: 0.10.
-        """
-        self.p = p
-        self.eps = eps
-        self.clamp_min = clamp_min
-        self.clamp_max = clamp_max
-
-    def _compute_ndwi_threshold(self, ndwi: np.ndarray) -> float:
-        """
-        Compute robust NDWI threshold using Otsu on a normalized NDWI histogram,
-        convert back to NDWI scale, and clamp to a realistic range.
-        Args:
-            ndwi: float32 NDWI array.
-        Returns:
-            float NDWI threshold.
-        """
-        # Normalize NDWI to 0–255 for Otsu's method histogram analysis
-        ndwi_norm = cv2.normalize(ndwi, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        
-        # Apply Otsu's thresholding to automatically find optimal threshold value
-        # in [0, 255] space that minimizes within-class variance
-        otsu_val, _ = cv2.threshold(
-            ndwi_norm, 0, 255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
-        
-        # Convert Otsu threshold from normalized [0, 255] space back to actual NDWI value range
-        # Linear inverse mapping: [0, 255] → [ndwi_min, ndwi_max]
-        ndwi_min = float(ndwi.min())
-        ndwi_max = float(ndwi.max())
-        T = ndwi_min + (otsu_val / 255.0) * (ndwi_max - ndwi_min)
-        
-        # Clamp to physically meaningful NDWI range to prevent unrealistic thresholds
-        # Typical water NDWI ranges [0, 0.3]; land/vegetation typically ≤ 0
-        T = float(np.clip(T, self.clamp_min, self.clamp_max))
-        
-        return T
-
-    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
-        """
-        Apply water depth indices augmentation to an image.
-
-        Args:
-            labels (dict): Dictionary containing image data with key 'img'. Expected shape: (H, W, 4)
-                with channels [B, G, R, NIR].
-
-        Returns:
-            dict: Updated labels dict with augmented image (H, W, 8) containing original RGB + NIR
-                plus 4 new channels: [NDWI_norm, water_mask, bg_ratio, depth_proxy].
-
-        Raises:
-            ValueError: If input image has fewer than 4 bands.
-        """
-        # Skip augmentation if disabled (p=False or p=0)
-        if not self.p:
-            return labels
-        
-        img = labels["img"]
-        
-        # Validate input has 4 bands (RGB + NIR)
-        if img.shape[2] < 4:
-            raise ValueError("AddWaterDepthIndices requires 4-band RGB+NIR input")
-        
-        # Extract individual bands and convert to float32 for numerical operations
-        B = img[..., 0].astype(np.float32)  # Blue
-        G = img[..., 1].astype(np.float32)  # Green
-        R = img[..., 2].astype(np.float32)  # Red
-        NIR = img[..., 3].astype(np.float32)  # Near-Infrared
-        
-        # --------------------------
-        # 1. Compute NDWI
-        # --------------------------
-        # NDWI = (G - NIR) / (G + NIR) detects water bodies based on spectral difference
-        # High values indicate water; negative/low values indicate vegetation or land
-        ndwi = (G - NIR) / (G + NIR + self.eps)
-        
-        # Normalize NDWI to [0, 255] for use as a channel and visualization
-        ndwi_norm = cv2.normalize(ndwi, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        
-        # --------------------------
-        # 2. Automatically compute threshold via Otsu
-        # --------------------------
-        # Compute adaptive threshold that best separates water from non-water in histogram
-        T = self._compute_ndwi_threshold(ndwi)
-        
-        # Binary water mask: pixels with NDWI > T are water (255), others are non-water (0)
-        water_mask = (ndwi > T).astype(np.uint8) * 255
-        
-        # Convert water mask to float [0.0, 1.0] for elementwise multiplication masking
-        water_mask_f = water_mask.astype(np.float32) / 255.0
-        
-        # --------------------------
-        # 3. Depth Indices
-        # --------------------------
-        # Blue/Green Ratio: B/G attenuates with water depth due to selective wavelength absorption
-        # Longer wavelengths (green) penetrate deeper, so ratio increases with depth
-        bg = B / (G + self.eps)
-        bg *= water_mask_f  # Mask to water pixels only (zero out land/vegetation)
-        bg_norm = cv2.normalize(bg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        
-        # Depth Proxy ln(B) - ln(G): log-ratio model for bathymetric depth estimation
-        # Based on Beer-Lambert law of light absorption in water
-        depth = np.log(B + self.eps) - np.log(G + self.eps)
-        depth *= water_mask_f  # Mask to water pixels only (zero out land/vegetation)
-        depth_norm = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        
-        # --------------------------
-        # 4. Append channels
-        # --------------------------
-        # Concatenate 4 new channels to original 4-band image, resulting in 8-band output
-        # New channels: [NDWI_norm, water_mask, bg_ratio, depth_proxy]
-        labels["img"] = _append_channels(
-            img,
-            [ndwi_norm, water_mask, bg_norm, depth_norm]
-        )
-        
-        return labels
-
 class PrepareAuxiliaryMaskInputs:
-    """Append optional shoreline/land-water channels and materialize prior-loss tensors."""
+    """Extract shoreline/land-water supervision from configured TIFF bands before Format."""
 
     def __init__(
         self,
+        bands: dict[int, str] | None = None,
         use_shoreline_input: bool = False,
         use_land_water_input: bool = False,
         use_shoreline_prior_loss: bool = False,
@@ -3741,6 +2600,7 @@ class PrepareAuxiliaryMaskInputs:
         shoreline_aux_gaussian_sigma_ratio: float = 0.035,
         shoreline_aux_gaussian_truncate_sigmas: float = 3.0,
     ) -> None:
+        self.band_name_to_index = {name: idx - 1 for idx, name in (bands or {}).items()}
         self.use_shoreline_input = use_shoreline_input
         self.use_land_water_input = use_land_water_input
         self.use_shoreline_prior_loss = use_shoreline_prior_loss
@@ -3751,37 +2611,55 @@ class PrepareAuxiliaryMaskInputs:
         self.shoreline_aux_gaussian_truncate_sigmas = max(float(shoreline_aux_gaussian_truncate_sigmas), 0.0)
 
     @staticmethod
-    def _require_mask(labels: dict[str, Any], key: str, message: str) -> np.ndarray:
-        mask = labels.get(key)
+    def _require_band(mask: np.ndarray | None, message: str) -> np.ndarray:
         if mask is None:
             raise ValueError(message)
         return _ensure_mask_2d(mask)
 
-    @staticmethod
-    def _append_channel(img: np.ndarray, channel: np.ndarray) -> np.ndarray:
+    def _band(self, img: np.ndarray, name: str) -> np.ndarray | None:
+        idx = self.band_name_to_index.get(name)
+        if idx is None:
+            return None
         img = img if img.ndim == 3 else img[..., None]
-        channel = _ensure_mask_2d(channel).astype(img.dtype, copy=False)[..., None]
-        return np.concatenate((img, channel), axis=2)
+        if idx >= img.shape[2]:
+            raise ValueError(
+                f"Configured band '{name}' expects channel index {idx + 1}, but image only has {img.shape[2]} channel(s)."
+            )
+        return img[..., idx]
 
     @staticmethod
-    def _build_binary_channel(mask: np.ndarray) -> np.ndarray:
-        return (_ensure_mask_2d(mask) > 0).astype(np.uint8) * 255
+    def _normalize_shoreline_band(mask: np.ndarray) -> np.ndarray:
+        return (_ensure_mask_2d(mask) > 0).astype(np.uint8)
 
     @staticmethod
-    def _build_land_water_channel(mask: np.ndarray) -> np.ndarray:
-        return _ensure_mask_2d(mask).astype(np.uint8, copy=False)
+    def _normalize_land_water_band(mask: np.ndarray) -> np.ndarray:
+        mask = _ensure_mask_2d(mask).astype(np.uint8, copy=False)
+        invalid = ~np.isin(mask, (0, 64, 128, 192, 255))
+        if invalid.any():
+            raise ValueError(f"land_water band contains invalid values: {sorted(np.unique(mask[invalid]).tolist())}")
+        return mask
+
+    @staticmethod
+    def _normalize_distance_band(mask: np.ndarray) -> np.ndarray:
+        return _ensure_mask_2d(mask).astype(np.float32, copy=False)
+
+    @staticmethod
+    def _normalize_proximity_band(mask: np.ndarray) -> np.ndarray:
+        mask_2d = _ensure_mask_2d(mask)
+        if np.issubdtype(mask_2d.dtype, np.integer):
+            return (mask_2d.astype(np.float32) / 255.0).clip(0.0, 1.0)
+        return mask_2d.astype(np.float32, copy=False).clip(0.0, 1.0)
 
     def _build_shoreline_distance_map(self, shoreline_mask: np.ndarray, land_water_mask: np.ndarray) -> np.ndarray:
-        shoreline_mask = (_ensure_mask_2d(shoreline_mask) > 0).astype(np.uint8)
+        shoreline_mask = self._normalize_shoreline_band(shoreline_mask)
         if shoreline_mask.any():
             distance = cv2.distanceTransform((shoreline_mask == 0).astype(np.uint8), cv2.DIST_L2, 3)
             return np.clip(distance, 0.0, float(self.shoreline_prior_max_dist)).astype(np.float32)
-        else:
-            land_water_mask = _ensure_mask_2d(land_water_mask)
-            return np.zeros(land_water_mask.shape, dtype=np.float32)
+        land_water_mask = _ensure_mask_2d(land_water_mask)
+        return np.zeros(land_water_mask.shape, dtype=np.float32)
 
     def _build_shoreline_proximity_field(self, shoreline_mask: np.ndarray) -> np.ndarray:
-        shoreline_mask = (_ensure_mask_2d(shoreline_mask) > 0).astype(np.uint8)
+        shoreline_mask = self._normalize_shoreline_band(shoreline_mask)
         if not shoreline_mask.any():
             return np.zeros(shoreline_mask.shape, dtype=np.float32)
 
@@ -3794,43 +2672,64 @@ class PrepareAuxiliaryMaskInputs:
         return field
 
     def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
-        """Append auxiliary inputs and convert prior-loss maps to tensors before Format."""
-        shoreline_mask = labels.pop("shoreline_mask", None)
-        land_water_mask = labels.pop("land_water_mask", None)
+        """Materialize prior-loss maps and auxiliary targets from embedded image bands."""
+        img = labels["img"]
+        shoreline_mask = self._band(img, "shoreline")
+        land_water_mask = self._band(img, "land_water")
+        shoreline_distance = self._band(img, "shoreline_distance")
+        shoreline_proximity = self._band(img, "shoreline_proximity")
 
-        if self.use_shoreline_input or self.use_shoreline_prior_loss or self.use_shoreline_aux_loss:
-            shoreline_mask = self._require_mask(
-                {"shoreline_mask": shoreline_mask},
-                "shoreline_mask",
-                "shoreline_mask is required when shoreline input, shoreline prior loss, or shoreline aux loss is enabled.",
+        if self.use_shoreline_input:
+            shoreline_mask = self._require_band(
+                shoreline_mask,
+                "shoreline band is required when shoreline input is enabled.",
             )
-        if self.use_land_water_input or self.use_land_water_prior_loss or self.use_shoreline_prior_loss:
-            land_water_mask = self._require_mask(
-                {"land_water_mask": land_water_mask},
-                "land_water_mask",
-                "land_water_mask is required when land/water input or shoreline/land-water prior loss is enabled.",
+        if self.use_land_water_input:
+            land_water_mask = self._require_band(
+                land_water_mask,
+                "land_water band is required when land/water input is enabled.",
+            )
+        if self.use_land_water_prior_loss or self.use_shoreline_prior_loss:
+            land_water_mask = self._require_band(
+                land_water_mask,
+                "land_water band is required when shoreline/land-water prior loss is enabled.",
+            )
+        if self.use_shoreline_prior_loss and shoreline_distance is None:
+            shoreline_mask = self._require_band(
+                shoreline_mask,
+                "shoreline or shoreline_distance band is required when shoreline prior loss is enabled.",
+            )
+        if self.use_shoreline_aux_loss and shoreline_proximity is None:
+            shoreline_mask = self._require_band(
+                shoreline_mask,
+                "shoreline or shoreline_proximity band is required when shoreline auxiliary loss is enabled.",
             )
 
         if shoreline_mask is not None:
-            shoreline_mask = (shoreline_mask > 0).astype(np.uint8)
+            shoreline_mask = self._normalize_shoreline_band(shoreline_mask)
         if land_water_mask is not None:
-            land_water_mask = land_water_mask.astype(np.uint8, copy=False)
-
-        img = labels["img"]
-        if self.use_shoreline_input and shoreline_mask is not None:
-            img = self._append_channel(img, self._build_binary_channel(shoreline_mask))
-        if self.use_land_water_input and land_water_mask is not None:
-            img = self._append_channel(img, self._build_land_water_channel(land_water_mask))
-        labels["img"] = img
+            land_water_mask = self._normalize_land_water_band(land_water_mask)
 
         if self.use_land_water_prior_loss or self.use_shoreline_prior_loss:
             labels["land_water_mask"] = torch.from_numpy(land_water_mask[None].astype(np.int64, copy=False))
         if self.use_shoreline_prior_loss:
-            shoreline_distance_map = self._build_shoreline_distance_map(shoreline_mask, land_water_mask)
-            labels["shoreline_distance_map"] = torch.from_numpy(shoreline_distance_map[None])
+            shoreline_distance_map = (
+                self._normalize_distance_band(shoreline_distance)
+                if shoreline_distance is not None
+                else self._build_shoreline_distance_map(shoreline_mask, land_water_mask)
+            )
+            labels["shoreline_distance_map"] = torch.from_numpy(
+                shoreline_distance_map[None].astype(np.float32, copy=False)
+            )
         if self.use_shoreline_aux_loss:
-            shoreline_proximity_field = self._build_shoreline_proximity_field(shoreline_mask)
-            labels["shoreline_proximity_field"] = torch.from_numpy(shoreline_proximity_field[None])
+            shoreline_proximity_field = (
+                self._normalize_proximity_band(shoreline_proximity)
+                if shoreline_proximity is not None
+                else self._build_shoreline_proximity_field(shoreline_mask)
+            )
+            labels["shoreline_proximity_field"] = torch.from_numpy(
+                shoreline_proximity_field[None].astype(np.float32, copy=False)
+            )
 
         return labels
 
@@ -4384,18 +3283,6 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             RandomFlip(direction="vertical", p=hyp.flipud, flip_idx=flip_idx),
             RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
-            SobelEdges(getattr(hyp, "sobel_p", False)),
-            CannyEdges(getattr(hyp, "canny_p", False)),
-            LoGEdge(getattr(hyp, "log_p", False)),
-            StructureTensor(getattr(hyp, "stt_p", False)),
-            LBP(getattr(hyp, "lbp_p", False)),
-            GaussianPyramid(getattr(hyp, "gaussian_pyramid_p", False)),
-            LaplacianPyramid(getattr(hyp, "laplacian_pyramid_p", False)),
-            SteerableFilters(getattr(hyp, "stl_p", False)),
-            Gabor(getattr(hyp, "gabor_p", False)),
-            DoG(getattr(hyp, "dog_p", False)),
-            RidgeFilters(getattr(hyp, "ridge_p", False)),
-            AddWaterDepthIndices(getattr(hyp, "water_depth_indices_p", False)),
         ]
     )  # transforms
 

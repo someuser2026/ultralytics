@@ -38,8 +38,8 @@ pytest tests/test_rotated_fcos.py
 ```
 
 ## Smoke-Test Dataset Paths
-- OBB: `/Users/manishagupta/Desktop/PhD/Code/data_processed/Global/Annotated/variants/obb/planet_full_c224_ov35_kf20_n10_seed0`
-- Segment: `/Users/manishagupta/Desktop/PhD/Code/data_processed/Global/Annotated/variants/segment/planet_full_c224_ov35_kf20_n10_seed0`
+- OBB: `/Users/manishagupta/Desktop/PhD/rip-detection/data_processed/Global/Annotated/variants/obb/planet_full_c448_ov35_kf20_10075-single-shoreline4_sample10_seed0`
+- Segment: `/Users/manishagupta/Desktop/PhD/rip-detection/data_processed/Global/Annotated/variants/segment/planet_full_c448_ov35_kf20_10075-single-shoreline4_sample10_seed0`
 
 ## Agent Rules
 - Prefer editing `ultralytics/` over the reference repos.

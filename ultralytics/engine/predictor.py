@@ -46,10 +46,7 @@ import torch
 
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data import load_inference_source
-from ultralytics.data.augment import LetterBox, PrepareAuxiliaryMaskInputs
-from ultralytics.data.utils import build_auxiliary_root_mappings, check_det_dataset, resolve_auxiliary_mask_paths
-from ultralytics.utils.instance import Instances
-from ultralytics.utils.patches import imread
+from ultralytics.data.augment import LetterBox
 from ultralytics.nn.autobackend import AutoBackend
 from ultralytics.utils import DEFAULT_CFG, LOGGER, MACOS, WINDOWS, callbacks, colorstr, ops
 from ultralytics.utils.checks import check_imgsz, check_imshow
@@ -151,124 +148,35 @@ class BasePredictor:
         self.txt_path = None
         self._lock = threading.Lock()  # for automatic thread-safe inference
         self._predict_model_args = None
-        self._predict_auxiliary_root_mappings = None
-        self._predict_aux_transform = None
         callbacks.add_integration_callbacks(self)
 
     def _sync_auxiliary_predict_args_from_model(self) -> None:
-        """Inherit auxiliary-input predict settings from the loaded PyTorch model when available."""
+        """Inherit model args used by prediction setup when available."""
         model = getattr(self.model, "model", None)
         model_args = getattr(model, "args", None)
         self._predict_model_args = model_args
         if model_args is None:
             return
-        for key in ("use_shoreline_input", "use_land_water_input"):
-            if not getattr(self.args, key, False):
-                setattr(self.args, key, bool(getattr(model_args, key, False)))
         if not getattr(self.args, "data", None):
             data = getattr(model_args, "data", None)
             if data:
                 self.args.data = data
 
-    def _auxiliary_input_enabled(self) -> bool:
-        """Return True when prediction needs shoreline or land/water input channels."""
-        return bool(getattr(self.args, "use_shoreline_input", False) or getattr(self.args, "use_land_water_input", False))
-
-    @staticmethod
-    def _load_predict_png_mask(mask_file: str, image_shape: tuple[int, int], label: str) -> np.ndarray:
-        """Load a grayscale PNG sidecar and verify that it matches the source image shape."""
-        mask = imread(mask_file, flags=cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            raise FileNotFoundError(f"{label} mask not found or unreadable: '{mask_file}'")
-        if mask.ndim == 3:
-            mask = mask[..., 0]
-        if mask.shape != image_shape:
-            raise ValueError(f"{label} mask '{mask_file}' has shape {mask.shape}, expected {image_shape}.")
-        return mask
-
-    def _setup_auxiliary_predict_context(self) -> None:
-        """Resolve dataset split roots and prepare the mask-input transform for OBB prediction."""
-        self._predict_auxiliary_root_mappings = None
-        self._predict_aux_transform = None
-        if not self._auxiliary_input_enabled():
+    def _validate_predict_channels(self, images: list[np.ndarray] | torch.Tensor) -> None:
+        """Fail fast when predict sources do not match the model input channel count."""
+        expected = int(getattr(self.model, "ch", 3))
+        if isinstance(images, torch.Tensor):
+            actual = int(images.shape[1])
+            if actual != expected:
+                raise ValueError(f"Predict source has {actual} channel(s), but model expects {expected}.")
             return
-        if getattr(self.model, "task", None) not in {"obb", "segment"}:
-            raise ValueError("Shoreline/land-water input prediction is only supported for OBB and segment models.")
-        if (
-            self.source_type.stream
-            or self.source_type.screenshot
-            or self.source_type.from_img
-            or self.source_type.tensor
-            or any(getattr(self.dataset, "video_flag", [False]))
-        ):
-            raise TypeError(
-                "Mask-input prediction supports only file-based image sources (image file, directory, glob, or txt/csv list)."
-            )
-        if not self.args.data and not isinstance(self.data, dict):
-            raise ValueError("Mask-input prediction requires `data=` so shoreline and land/water mask roots can be resolved.")
-        if not isinstance(self.data, dict):
-            self.data = check_det_dataset(self.args.data, autodownload=False, hyp=self.args)
-        self._predict_auxiliary_root_mappings = build_auxiliary_root_mappings(self.data)
-        self._predict_aux_transform = PrepareAuxiliaryMaskInputs(
-            use_shoreline_input=bool(getattr(self.args, "use_shoreline_input", False)),
-            use_land_water_input=bool(getattr(self.args, "use_land_water_input", False)),
-            use_shoreline_prior_loss=False,
-            use_land_water_prior_loss=False,
-            shoreline_prior_max_dist=int(getattr(self.args, "shoreline_prior_max_dist", 128)),
-        )
 
-    def _prepare_auxiliary_predict_images(self, paths: list[str], images: list[np.ndarray]) -> list[np.ndarray]:
-        """Append shoreline/land-water channels to file-based predict images."""
-        same_shapes = len({x.shape for x in images}) == 1
-        letterbox = LetterBox(
-            self.imgsz,
-            auto=same_shapes
-            and self.args.rect
-            and (self.model.pt or (getattr(self.model, "dynamic", False) and not self.model.imx)),
-            stride=self.model.stride,
-        )
-        prepared = []
-        for path, image in zip(paths, images):
-            resolved = resolve_auxiliary_mask_paths(
-                path,
-                self._predict_auxiliary_root_mappings,
-                require_shoreline=bool(getattr(self.args, "use_shoreline_input", False)),
-                require_land_water=bool(getattr(self.args, "use_land_water_input", False)),
-            )
-            labels = {
-                "img": image,
-                "instances": Instances(
-                    np.zeros((0, 4), dtype=np.float32),
-                    np.zeros((0, 1000, 2), dtype=np.float32),
-                    bbox_format="xywh",
-                    normalized=False,
-                ),
-            }
-            shoreline_mask_file = resolved.get("shoreline_mask_file")
-            land_water_mask_file = resolved.get("land_water_mask_file")
-            if getattr(self.args, "use_shoreline_input", False):
-                if not shoreline_mask_file or not Path(shoreline_mask_file).is_file():
-                    raise FileNotFoundError(f"Shoreline mask not found for '{path}'. Expected '{shoreline_mask_file}'.")
-                labels["shoreline_mask"] = (
-                    self._load_predict_png_mask(shoreline_mask_file, image.shape[:2], "Shoreline") > 0
-                ).astype(np.uint8)
-            if getattr(self.args, "use_land_water_input", False):
-                if not land_water_mask_file or not Path(land_water_mask_file).is_file():
-                    raise FileNotFoundError(
-                        f"Land/water mask not found for '{path}'. Expected '{land_water_mask_file}'."
-                    )
-                land_water_mask = self._load_predict_png_mask(land_water_mask_file, image.shape[:2], "Land/water")
-                invalid = ~np.isin(land_water_mask, (0, 64, 128, 192, 255))
-                if invalid.any():
-                    raise ValueError(
-                        f"Land/water mask '{land_water_mask_file}' contains invalid values: "
-                        f"{sorted(np.unique(land_water_mask[invalid]).tolist())}"
-                    )
-                labels["land_water_mask"] = land_water_mask.astype(np.uint8, copy=False)
-            labels = letterbox(labels=labels)
-            labels = self._predict_aux_transform(labels)
-            prepared.append(labels["img"])
-        return prepared
+        actual_channels = {1 if x.ndim == 2 else int(x.shape[2]) for x in images}
+        if len(actual_channels) != 1:
+            raise ValueError(f"Predict source contains mixed channel counts: {sorted(actual_channels)}.")
+        actual = next(iter(actual_channels))
+        if actual != expected:
+            raise ValueError(f"Predict source has {actual} channel(s), but model expects {expected}.")
 
     def preprocess(self, im: torch.Tensor | list[np.ndarray]) -> torch.Tensor:
         """
@@ -282,12 +190,16 @@ class BasePredictor:
         """
         not_tensor = not isinstance(im, torch.Tensor)
         if not_tensor:
-            im = np.stack(self.pre_transform(im))
+            transformed = self.pre_transform(im)
+            self._validate_predict_channels(transformed)
+            im = np.stack(transformed)
             if im.shape[-1] == 3:
                 im = im[..., ::-1]  # BGR to RGB
             im = im.transpose((0, 3, 1, 2))  # BHWC to BCHW, (n, 3, h, w)
             im = np.ascontiguousarray(im)  # contiguous
             im = torch.from_numpy(im)
+        else:
+            self._validate_predict_channels(im)
 
         im = im.to(self.device)
         im = im.half() if self.model.fp16 else im.float()  # uint8 to fp16/32
@@ -314,8 +226,6 @@ class BasePredictor:
         Returns:
             (list[np.ndarray]): List of transformed images.
         """
-        if self._auxiliary_input_enabled():
-            return self._prepare_auxiliary_predict_images(self.batch[0], im)
         same_shapes = len({x.shape for x in im}) == 1
         letterbox = LetterBox(
             self.imgsz,
@@ -389,7 +299,6 @@ class BasePredictor:
             channels=getattr(self.model, "ch", 3),
         )
         self.source_type = self.dataset.source_type
-        self._setup_auxiliary_predict_context()
         long_sequence = (
             self.source_type.stream
             or self.source_type.screenshot

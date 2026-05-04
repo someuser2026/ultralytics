@@ -114,7 +114,8 @@ class BaseDataset(Dataset):
         self.prefix = prefix
         self.fraction = fraction
         self.channels = self.compute_channels(channels, hyp)
-        self.cv2_flag = cv2.IMREAD_GRAYSCALE if channels == 1 else cv2.IMREAD_COLOR
+        self.raw_channels = self.channels
+        self.cv2_flag = cv2.IMREAD_GRAYSCALE if self.raw_channels == 1 else cv2.IMREAD_COLOR
         self.im_files = self.get_img_files(self.img_path)
         self.labels = self.get_labels()
         self.update_labels(include_class=classes)  # single_cls and include_class
@@ -149,46 +150,7 @@ class BaseDataset(Dataset):
         self.transforms = self.build_transforms(hyp=hyp)
     
     def compute_channels(self, channels, hyp):
-        orig_channels = channels
-        if getattr(hyp, "sobel_p", False):
-            orig_channels += 2
-        if getattr(hyp, "canny_p", False):
-            orig_channels += 1
-        if getattr(hyp, "log_p", False):
-            orig_channels += 1
-        if getattr(hyp, "stt_p", False):
-            orig_channels += 3
-        if getattr(hyp, "lbp_p", False):
-            orig_channels += 1
-        if getattr(hyp, "gaussian_pyramid_p", False):
-            orig_channels += 2
-        if getattr(hyp, "laplacian_pyramid_p", False):
-            orig_channels += 2
-        if getattr(hyp, "stl_p", False):
-            orig_channels += 6
-        if getattr(hyp, "dog_p", False):
-            orig_channels += 1
-        if getattr(hyp, "ridge_p", False):
-            orig_channels += 1
-        if getattr(hyp, "gabor_p", False):
-            orig_channels += 1
-        if getattr(hyp, "water_depth_indices_p", False):
-            orig_channels += 4
-        if getattr(hyp, "use_shoreline_input", False):
-            orig_channels += 1
-        if getattr(hyp, "use_land_water_input", False):
-            orig_channels += 1
-        return orig_channels
-        # if getattr(hyp, "sobel_p", False):
-        #     orig_channels += 2
-        # if getattr(hyp, "sobel_p", False):
-        #     orig_channels += 2
-        # if getattr(hyp, "sobel_p", False):
-        #     orig_channels += 2
-        # if getattr(hyp, "sobel_p", False):
-        #     orig_channels += 2
-        # if getattr(hyp, "sobel_p", False):
-        #     orig_channels += 2
+        return int(channels)
 
 
     def get_img_files(self, img_path: str | list[str]) -> list[str]:
@@ -285,6 +247,11 @@ class BaseDataset(Dataset):
                 im = imread(f, flags=self.cv2_flag)  # BGR
             if im is None:
                 raise FileNotFoundError(f"Image Not Found {f}")
+            actual_channels = 1 if im.ndim == 2 else int(im.shape[2])
+            if actual_channels != self.raw_channels:
+                raise ValueError(
+                    f"{self.prefix}Image '{f}' has {actual_channels} channel(s), expected {self.raw_channels}."
+                )
 
             h0, w0 = im.shape[:2]  # orig hw
             if rect_mode:  # resize long side to imgsz while maintaining aspect ratio

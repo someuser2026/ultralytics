@@ -10,11 +10,10 @@ import torch
 
 from tests import TMP
 from ultralytics.data.augment import PrepareAuxiliaryMaskInputs, RandomFlip
+from ultralytics.data.build import load_inference_source
 from ultralytics.data.utils import (
-    build_auxiliary_root_mappings,
     check_det_dataset,
     get_auxiliary_mask_flags,
-    resolve_auxiliary_mask_paths,
 )
 from ultralytics.engine.predictor import BasePredictor
 from ultralytics.models.yolo.obb.train import on_train_epoch_start as obb_on_train_epoch_start
@@ -27,10 +26,28 @@ from ultralytics.utils.loss import (
     _compute_shoreline_aux_loss,
 )
 
-
-def _write_png(path: Path, array: np.ndarray) -> None:
+def _write_tiff(path: Path, array: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    assert cv2.imwrite(str(path), array)
+    if array.ndim == 2:
+        stack = array[None]
+    else:
+        stack = array.transpose(2, 0, 1)
+    assert cv2.imwritemulti(str(path), stack)
+
+
+def _band_image(
+    shoreline: np.ndarray | None = None,
+    land_water: np.ndarray | None = None,
+    shoreline_distance: np.ndarray | None = None,
+    shoreline_proximity: np.ndarray | None = None,
+) -> np.ndarray:
+    shape = next(x.shape for x in (shoreline, land_water, shoreline_distance, shoreline_proximity) if x is not None)
+    img = np.zeros((*shape, 3), dtype=np.uint8)
+    channels = [img[..., 0], img[..., 1], img[..., 2]]
+    for band in (shoreline, land_water, shoreline_distance, shoreline_proximity):
+        if band is not None:
+            channels.append(band.astype(np.uint8, copy=False))
+    return np.stack(channels, axis=2)
 
 
 def _shoreaux_args(**overrides) -> SimpleNamespace:
@@ -89,36 +106,11 @@ def _build_shoreaux_segment_batch(empty: bool = False) -> dict[str, torch.Tensor
     }
 
 
-def test_auxiliary_mask_path_resolution() -> None:
-    """Resolve shoreline and land/water sidecars by mirrored relative path and stem."""
-    root = TMP / "obb_aux_paths"
-    image_root = root / "images" / "val"
-    shore_root = root / "masks" / "shoreline"
-    land_root = root / "masks" / "land_water"
-    image_path = image_root / "nested" / "sample.jpg"
-    _write_png(image_path, np.zeros((4, 4, 3), dtype=np.uint8))
-
-    data = {
-        "val": str(image_root),
-        "shoreline_masks": str(shore_root),
-        "land_water_masks": str(land_root),
-    }
-    resolved = resolve_auxiliary_mask_paths(image_path, build_auxiliary_root_mappings(data), True, True)
-
-    assert resolved["split"] == "val"
-    assert Path(resolved["shoreline_mask_file"]) == shore_root / "val" / "nested" / "sample.png"
-    assert Path(resolved["land_water_mask_file"]) == land_root / "val" / "nested" / "sample.png"
-
-
-def test_check_det_dataset_accepts_auxiliary_root_folders() -> None:
-    """Dataset parsing should expand auxiliary root folders to split-specific paths."""
+def test_check_det_dataset_normalizes_bands_and_infers_channels() -> None:
+    """Dataset parsing should preserve bands metadata and infer raw channel count from it."""
     root = TMP / "obb_aux_yaml"
     (root / "images" / "train").mkdir(parents=True, exist_ok=True)
     (root / "images" / "val").mkdir(parents=True, exist_ok=True)
-    (root / "masks" / "shoreline" / "train").mkdir(parents=True, exist_ok=True)
-    (root / "masks" / "shoreline" / "val").mkdir(parents=True, exist_ok=True)
-    (root / "masks" / "land_water" / "train").mkdir(parents=True, exist_ok=True)
-    (root / "masks" / "land_water" / "val").mkdir(parents=True, exist_ok=True)
     data_yaml = root / "data.yaml"
     data_yaml.write_text(
         "\n".join(
@@ -126,8 +118,11 @@ def test_check_det_dataset_accepts_auxiliary_root_folders() -> None:
                 f"path: {root}",
                 "train: images/train",
                 "val: images/val",
-                "shoreline_masks: masks/shoreline",
-                "land_water_masks: masks/land_water",
+                "bands:",
+                "  4: shoreline",
+                "  5: land_water",
+                "  6: shoreline_distance",
+                "  7: shoreline_proximity",
                 "names:",
                 "  0: foreground",
                 "",
@@ -138,60 +133,108 @@ def test_check_det_dataset_accepts_auxiliary_root_folders() -> None:
 
     data = check_det_dataset(str(data_yaml), autodownload=False)
 
-    assert Path(data["shoreline_masks"]["train"]) == root / "masks" / "shoreline" / "train"
-    assert Path(data["shoreline_masks"]["val"]) == root / "masks" / "shoreline" / "val"
-    assert Path(data["land_water_masks"]["train"]) == root / "masks" / "land_water" / "train"
-    assert Path(data["land_water_masks"]["val"]) == root / "masks" / "land_water" / "val"
+    assert data["bands"] == {4: "shoreline", 5: "land_water", 6: "shoreline_distance", 7: "shoreline_proximity"}
+    assert data["channels"] == 7
 
 
-def test_prepare_auxiliary_mask_inputs_builds_channels_and_prior_maps() -> None:
-    """Append shoreline plus a single semantic land/water channel and emit prior-loss tensors."""
+def test_check_det_dataset_rejects_reserved_rgb_band_indices() -> None:
+    """Semantic TIFF bands must not overwrite the first three RGB channels."""
+    root = TMP / "obb_aux_yaml_reserved"
+    (root / "images" / "train").mkdir(parents=True, exist_ok=True)
+    (root / "images" / "val").mkdir(parents=True, exist_ok=True)
+    data_yaml = root / "data.yaml"
+    data_yaml.write_text(
+        "\n".join(
+            [
+                f"path: {root}",
+                "train: images/train",
+                "val: images/val",
+                "bands:",
+                "  3: shoreline",
+                "names:",
+                "  0: foreground",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SyntaxError, match="reserved for RGB"):
+        check_det_dataset(str(data_yaml), autodownload=False)
+
+
+def test_check_det_dataset_rejects_channels_smaller_than_bands() -> None:
+    """Raw channel count must cover the highest configured TIFF band."""
+    root = TMP / "obb_aux_yaml_channels"
+    (root / "images" / "train").mkdir(parents=True, exist_ok=True)
+    (root / "images" / "val").mkdir(parents=True, exist_ok=True)
+    data_yaml = root / "data.yaml"
+    data_yaml.write_text(
+        "\n".join(
+            [
+                f"path: {root}",
+                "train: images/train",
+                "val: images/val",
+                "channels: 5",
+                "bands:",
+                "  6: shoreline_distance",
+                "names:",
+                "  0: foreground",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SyntaxError, match="at least 6 channels"):
+        check_det_dataset(str(data_yaml), autodownload=False)
+
+
+def test_prepare_auxiliary_mask_inputs_emit_prior_tensors_from_embedded_bands() -> None:
+    """Embedded TIFF bands should drive prior-loss tensors without appending new image channels."""
     transform = PrepareAuxiliaryMaskInputs(
+        bands={4: "shoreline", 5: "land_water", 6: "shoreline_distance", 7: "shoreline_proximity"},
         use_shoreline_input=True,
         use_land_water_input=True,
         use_shoreline_prior_loss=True,
         use_land_water_prior_loss=True,
+        use_shoreline_aux_loss=True,
         shoreline_prior_max_dist=4,
     )
     shoreline_mask = np.zeros((5, 5), dtype=np.uint8)
-    shoreline_mask[:, 2] = 1
+    shoreline_mask[:, 2] = 255
     land_water_mask = np.full((5, 5), 255, dtype=np.uint8)
     land_water_mask[:, 0] = 64
     land_water_mask[:, 1] = 128
     land_water_mask[0, 0] = 0
+    shoreline_distance = np.tile(np.arange(5, dtype=np.uint8), (5, 1))
+    shoreline_proximity = np.zeros((5, 5), dtype=np.uint8)
+    shoreline_proximity[:, 2] = 255
 
-    labels = transform(
-        {
-            "img": np.zeros((5, 5, 3), dtype=np.uint8),
-            "shoreline_mask": shoreline_mask,
-            "land_water_mask": land_water_mask,
-        }
-    )
+    img = _band_image(shoreline_mask, land_water_mask, shoreline_distance, shoreline_proximity)
+    labels = transform({"img": img})
 
-    assert labels["img"].shape == (5, 5, 5)
-    assert set(np.unique(labels["img"][..., 4]).tolist()) == {0, 64, 128, 255}
+    assert labels["img"].shape == (5, 5, 7)
     assert torch.equal(labels["land_water_mask"], torch.from_numpy(land_water_mask[None].astype(np.int64)))
     assert labels["shoreline_distance_map"].shape == (1, 5, 5)
-    assert labels["shoreline_distance_map"][0, 0, 0].item() > 0.0
-    assert labels["shoreline_distance_map"][0, 2, 0].item() > 0.0
-    assert labels["shoreline_distance_map"][0, 2, 1].item() > 0.0
-    assert labels["shoreline_distance_map"][0, 2, 4].item() > 0.0  # water away from shoreline is penalized
+    assert labels["shoreline_distance_map"].dtype == torch.float32
+    assert torch.equal(labels["shoreline_distance_map"][0], torch.from_numpy(shoreline_distance.astype(np.float32)))
+    assert labels["shoreline_proximity_field"].shape == (1, 5, 5)
+    assert labels["shoreline_proximity_field"].dtype == torch.float32
+    assert labels["shoreline_proximity_field"][0, 0, 2].item() == pytest.approx(1.0, abs=1e-6)
+    assert labels["shoreline_proximity_field"].max().item() == pytest.approx(1.0, abs=1e-6)
 
 
 def test_blank_shoreline_mask_produces_zero_distance_map() -> None:
     """Blank shoreline masks should suppress shoreline prior rather than max it out."""
     transform = PrepareAuxiliaryMaskInputs(
+        bands={4: "shoreline", 5: "land_water"},
         use_shoreline_prior_loss=True,
         use_land_water_prior_loss=True,
         shoreline_prior_max_dist=8,
     )
-    labels = transform(
-        {
-            "img": np.zeros((4, 4, 3), dtype=np.uint8),
-            "shoreline_mask": np.zeros((4, 4), dtype=np.uint8),
-            "land_water_mask": np.full((4, 4), 192, dtype=np.uint8),
-        }
-    )
+    img = _band_image(np.zeros((4, 4), dtype=np.uint8), np.full((4, 4), 192, dtype=np.uint8))
+    labels = transform({"img": img})
 
     assert torch.count_nonzero(labels["shoreline_distance_map"]) == 0
 
@@ -199,14 +242,14 @@ def test_blank_shoreline_mask_produces_zero_distance_map() -> None:
 def test_shoreline_gaussian_field_straight_line_is_peak_on_shore_and_truncated() -> None:
     """Gaussian shoreline targets should peak on-shore, decay smoothly, and zero beyond the truncation radius."""
     transform = PrepareAuxiliaryMaskInputs(
+        bands={4: "shoreline"},
         use_shoreline_aux_loss=True,
         shoreline_aux_gaussian_sigma_ratio=0.20,
         shoreline_aux_gaussian_truncate_sigmas=2.0,
     )
     shoreline_mask = np.zeros((9, 9), dtype=np.uint8)
-    shoreline_mask[:, 4] = 1
-
-    labels = transform({"img": np.zeros((9, 9, 3), dtype=np.uint8), "shoreline_mask": shoreline_mask})
+    shoreline_mask[:, 4] = 255
+    labels = transform({"img": _band_image(shoreline_mask)})
     field = labels["shoreline_proximity_field"][0]
 
     assert field[:, 4].min().item() == pytest.approx(1.0, abs=1e-6)
@@ -216,12 +259,11 @@ def test_shoreline_gaussian_field_straight_line_is_peak_on_shore_and_truncated()
 
 def test_shoreline_gaussian_field_handles_curved_masks() -> None:
     """Gaussian shoreline targets should preserve curved shoreline geometry."""
-    transform = PrepareAuxiliaryMaskInputs(use_shoreline_aux_loss=True)
+    transform = PrepareAuxiliaryMaskInputs(bands={4: "shoreline"}, use_shoreline_aux_loss=True)
     shoreline_mask = np.zeros((11, 11), dtype=np.uint8)
-    shoreline_mask[2:9, 5] = 1
-    shoreline_mask[8, 5:9] = 1
-
-    labels = transform({"img": np.zeros((11, 11, 3), dtype=np.uint8), "shoreline_mask": shoreline_mask})
+    shoreline_mask[2:9, 5] = 255
+    shoreline_mask[8, 5:9] = 255
+    labels = transform({"img": _band_image(shoreline_mask)})
     field = labels["shoreline_proximity_field"][0]
 
     assert field[2, 5].item() == pytest.approx(1.0, abs=1e-6)
@@ -231,25 +273,23 @@ def test_shoreline_gaussian_field_handles_curved_masks() -> None:
 
 def test_blank_shoreline_mask_produces_zero_proximity_field() -> None:
     """Empty shoreline masks should emit an all-zero Gaussian proximity field."""
-    transform = PrepareAuxiliaryMaskInputs(use_shoreline_aux_loss=True)
-    labels = transform({"img": np.zeros((6, 6, 3), dtype=np.uint8), "shoreline_mask": np.zeros((6, 6), dtype=np.uint8)})
+    transform = PrepareAuxiliaryMaskInputs(bands={4: "shoreline"}, use_shoreline_aux_loss=True)
+    labels = transform({"img": _band_image(np.zeros((6, 6), dtype=np.uint8))})
 
     assert torch.count_nonzero(labels["shoreline_proximity_field"]) == 0
 
 
-def test_auxiliary_mask_channels_follow_geometric_augmentation() -> None:
-    """Shoreline and land/water inputs must match the exact geometric transforms applied to the image."""
+def test_auxiliary_bands_follow_geometric_augmentation() -> None:
+    """Embedded shoreline and land/water bands must follow the exact geometric transforms applied to the image."""
     shoreline_mask = np.zeros((4, 6), dtype=np.uint8)
-    shoreline_mask[:, 1] = 1
+    shoreline_mask[:, 1] = 255
     land_water_mask = np.full((4, 6), 255, dtype=np.uint8)
     land_water_mask[:, :1] = 64
     land_water_mask[:, 1:2] = 128
     land_water_mask[0, 0] = 0
-    encoded_land_water = land_water_mask.copy()
-
-    img = np.zeros((4, 6, 3), dtype=np.uint8)
-    img[..., 0] = shoreline_mask * 255
-    img[..., 1] = encoded_land_water
+    shoreline_distance = np.tile(np.arange(6, dtype=np.uint8), (4, 1))
+    shoreline_proximity = shoreline_mask.copy()
+    img = _band_image(shoreline_mask, land_water_mask, shoreline_distance, shoreline_proximity)
     labels = {
         "img": img,
         "instances": Instances(
@@ -258,28 +298,30 @@ def test_auxiliary_mask_channels_follow_geometric_augmentation() -> None:
             bbox_format="xywh",
             normalized=False,
         ),
-        "shoreline_mask": shoreline_mask,
-        "land_water_mask": land_water_mask,
     }
 
     labels = RandomFlip(p=1.0, direction="horizontal")(labels)
-    expected_shoreline = labels["shoreline_mask"].copy()
-    expected_land_water = labels["land_water_mask"].copy()
-    transformed_img = labels["img"].copy()
+    prepared = PrepareAuxiliaryMaskInputs(
+        bands={4: "shoreline", 5: "land_water", 6: "shoreline_distance", 7: "shoreline_proximity"},
+        use_shoreline_prior_loss=True,
+        use_land_water_prior_loss=True,
+        use_shoreline_aux_loss=True,
+    )(labels)
 
-    prepared = PrepareAuxiliaryMaskInputs(use_shoreline_input=True, use_land_water_input=True)(labels)
+    assert prepared["img"].shape == (4, 6, 7)
+    assert torch.equal(
+        prepared["land_water_mask"][0],
+        torch.from_numpy(np.fliplr(land_water_mask).astype(np.int64)),
+    )
+    assert torch.equal(
+        prepared["shoreline_distance_map"][0],
+        torch.from_numpy(np.fliplr(shoreline_distance).astype(np.float32)),
+    )
+    assert prepared["shoreline_proximity_field"][0, :, 4].min().item() == pytest.approx(1.0, abs=1e-6)
 
-    assert prepared["img"].shape == (4, 6, 5)
-    assert np.array_equal(prepared["img"][..., 3], expected_shoreline * 255)
-    assert np.array_equal(prepared["img"][..., 4], expected_land_water.astype(np.uint8))
-    assert np.array_equal(prepared["img"][..., 0], expected_shoreline * 255)
-    assert np.array_equal(prepared["img"][..., 1], expected_land_water.astype(np.uint8))
-    assert np.array_equal(transformed_img[..., 0], prepared["img"][..., 0])
-    assert np.array_equal(transformed_img[..., 1], prepared["img"][..., 1])
 
-
-def test_shoreaux_model_yaml_auto_requires_only_shoreline_masks() -> None:
-    """Shoreline auxiliary heads should auto-enable shoreline targets without requiring land/water masks."""
+def test_shoreaux_model_yaml_auto_requires_only_shoreline_bands() -> None:
+    """Shoreline auxiliary heads should auto-enable shoreline targets without requiring land/water bands."""
     flags = get_auxiliary_mask_flags(
         SimpleNamespace(model="ultralytics/cfg/models/12/yolo12-obb-shoreaux.yaml", use_shoreline_aux_loss=False)
     )
@@ -289,12 +331,11 @@ def test_shoreaux_model_yaml_auto_requires_only_shoreline_masks() -> None:
     assert flags["require_land_water"] is False
 
 
-def test_check_det_dataset_accepts_shoreaux_models_without_land_water_masks() -> None:
-    """Shoreline auxiliary heads should validate datasets that provide only shoreline masks."""
+def test_check_det_dataset_accepts_shoreaux_models_without_land_water_bands() -> None:
+    """Shoreline auxiliary heads should validate datasets that provide only shoreline bands."""
     root = TMP / "shoreaux_yaml"
     for split in ("train", "val"):
         (root / "images" / split).mkdir(parents=True, exist_ok=True)
-        (root / "masks" / "shoreline" / split).mkdir(parents=True, exist_ok=True)
     data_yaml = root / "data.yaml"
     data_yaml.write_text(
         "\n".join(
@@ -302,7 +343,8 @@ def test_check_det_dataset_accepts_shoreaux_models_without_land_water_masks() ->
                 f"path: {root}",
                 "train: images/train",
                 "val: images/val",
-                "shoreline_masks: masks/shoreline",
+                "bands:",
+                "  4: shoreline",
                 "names:",
                 "  0: foreground",
                 "",
@@ -317,8 +359,8 @@ def test_check_det_dataset_accepts_shoreaux_models_without_land_water_masks() ->
         hyp=SimpleNamespace(model="ultralytics/cfg/models/12/yolo12-obb-shoreaux.yaml"),
     )
 
-    assert Path(data["shoreline_masks"]["train"]).name == "train"
-    assert "land_water_masks" not in data
+    assert data["bands"] == {4: "shoreline"}
+    assert data["channels"] == 4
 
 
 def test_spatial_prior_losses_support_threshold_area_and_closest_corner_modes() -> None:
@@ -433,50 +475,35 @@ def test_segment_spatial_prior_losses_cover_all_predictions() -> None:
     assert land_high.item() > 0.0
 
 
-def test_predict_auxiliary_images_append_mask_channels() -> None:
-    """Predict helper appends shoreline and land/water channels for file-based OBB sources."""
+def test_predict_multichannel_tiff_validates_channel_count() -> None:
+    """Predict helpers should accept file-based multichannel TIFFs and reject channel mismatches."""
     root = TMP / "obb_aux_predict"
-    image_root = root / "images" / "val"
-    shore_root = root / "masks" / "shoreline"
-    land_root = root / "masks" / "land_water"
-    image_path = image_root / "sample.jpg"
-    shoreline_path = shore_root / "val" / "sample.png"
-    land_water_path = land_root / "val" / "sample.png"
+    image_path = root / "images" / "val" / "sample.tif"
 
-    image = np.zeros((8, 8, 3), dtype=np.uint8)
     shoreline = np.zeros((8, 8), dtype=np.uint8)
     shoreline[:, 3] = 255
     land_water = np.full((8, 8), 255, dtype=np.uint8)
     land_water[:, :1] = 64
     land_water[:, 1:2] = 128
     land_water[:, 2:3] = 192
-
-    _write_png(image_path, image)
-    _write_png(shoreline_path, shoreline)
-    _write_png(land_water_path, land_water)
+    shoreline_distance = np.tile(np.arange(8, dtype=np.uint8), (8, 1))
+    shoreline_proximity = shoreline.copy()
+    image = _band_image(shoreline, land_water, shoreline_distance, shoreline_proximity)
+    _write_tiff(image_path, image)
 
     predictor = BasePredictor(overrides={"task": "obb", "imgsz": 8, "batch": 1, "rect": False})
-    predictor.model = SimpleNamespace(task="obb", pt=True, dynamic=False, imx=False, stride=32)
+    predictor.model = SimpleNamespace(task="obb", pt=True, dynamic=False, imx=False, stride=32, ch=7)
     predictor.imgsz = (8, 8)
-    predictor.data = {
-        "val": str(image_root),
-        "shoreline_masks": str(shore_root),
-        "land_water_masks": str(land_root),
-    }
-    predictor.args.use_shoreline_input = True
-    predictor.args.use_land_water_input = True
-    predictor.source_type = SimpleNamespace(stream=False, screenshot=False, from_img=False, tensor=False)
-    predictor.dataset = SimpleNamespace(video_flag=[False])
+    predictor.dataset = load_inference_source(str(image_path), batch=1, channels=7)
+    predictor.source_type = predictor.dataset.source_type
+    _, images, _ = next(iter(predictor.dataset))
 
-    predictor._setup_auxiliary_predict_context()
-    prepared = predictor._prepare_auxiliary_predict_images([str(image_path)], [image])[0]
+    prepared = predictor.pre_transform(images)[0]
+    predictor._validate_predict_channels([prepared])
 
-    assert prepared.shape == (8, 8, 5)
-    assert prepared[..., 3].max() == 255  # shoreline
-    assert 64 in np.unique(prepared[..., 4])  # land
-    assert 128 in np.unique(prepared[..., 4])  # land
-    assert 192 in np.unique(prepared[..., 4])  # water
-    assert 255 in np.unique(prepared[..., 4])  # whitewater
+    assert prepared.shape == (8, 8, 7)
+    with pytest.raises(ValueError, match="model expects 7"):
+        predictor._validate_predict_channels([np.zeros((8, 8, 3), dtype=np.uint8)])
 
 
 def test_shoreaux_configs_build_while_standard_configs_remain_unchanged() -> None:

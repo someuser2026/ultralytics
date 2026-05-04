@@ -214,18 +214,6 @@ motion_blur_p: 0.0
 additive_noise_p: 0.0
 multi_spec_noise_p: 0.0
 multi_ch_albu: True
-sobel_p: False
-canny_p: False
-log_p: False
-stt_p: False
-lbp_p: False
-gaussian_pyramid_p: False
-laplacian_pyramid_p: False
-stl_p: False
-gabor_p: False
-dog_p: False
-ridge_p: False
-water_depth_indices_p: False
 
 
 

@@ -108,6 +108,7 @@ class RTDETRDataset(YOLODataset):
             transforms = Compose([])
         transforms.append(
             PrepareAuxiliaryMaskInputs(
+                bands=self.data.get("bands", {}),
                 use_shoreline_input=bool(getattr(hyp, "use_shoreline_input", False)),
                 use_land_water_input=bool(getattr(hyp, "use_land_water_input", False)),
                 use_shoreline_prior_loss=bool(getattr(hyp, "use_shoreline_prior_loss", False)),
