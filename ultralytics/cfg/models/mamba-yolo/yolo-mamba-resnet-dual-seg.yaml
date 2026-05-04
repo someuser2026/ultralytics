@@ -1,0 +1,62 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# Dual-branch segmentation model with a Mamba EdgeVSS RGB backbone and ResNet auxiliary backbone.
+
+nc: 1
+dual_input_backbone: true
+dual_input_rgb_channels: 3
+dual_input_fusion: concat_proj
+scales:
+  n: [0.33, 0.25, 1024]
+  s: [0.33, 0.50, 1024]
+  m: [0.67, 0.75, 768]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.25, 512]
+
+backbone:
+  - [-1, 1, ChannelSplit, [3]] # 0 -> [rgb, aux]
+  - [0, 1, Index, [0]] # 1 rgb input
+  - [0, 1, Index, [1]] # 2 aux input
+
+  # RGB branch: Mamba EdgeVSS backbone from yolo-mamba-seg-edgevss-all.yaml
+  - [1, 1, EdgeStem, [128, 3]] # 3-P2/4
+  - [-1, 3, EdgeVSSBlock, [128]] # 4
+  - [-1, 1, VisionClueMerge, [256]] # 5-P3/8
+  - [-1, 3, EdgeVSSBlock, [256]] # 6 rgb P3
+  - [-1, 1, VisionClueMerge, [512]] # 7-P4/16
+  - [-1, 9, EdgeVSSBlock, [512]] # 8 rgb P4
+  - [-1, 1, VisionClueMerge, [1024]] # 9-P5/32
+  - [-1, 3, EdgeVSSBlock, [1024]] # 10
+  - [-1, 1, SPPF, [1024, 5]] # 11 rgb P5
+
+  # Auxiliary branch: simple ResNet backbone
+  - [2, 1, ResNetBackbone, [resnet50, null, 1, true]] # 12 -> [C2, C3, C4, C5]
+  - [12, 1, Index, [1]] # 13 aux P3/C3
+  - [12, 1, Index, [2]] # 14 aux P4/C4
+  - [12, 1, Index, [3]] # 15 aux P5/C5
+
+  # Fuse same-scale P3/P4/P5 features by concat + 1x1 projection
+  - [[6, 13], 1, Concat, [1]] # 16 fused P3 concat
+  - [-1, 1, Conv, [256, 1, 1]] # 17 fused P3
+  - [[8, 14], 1, Concat, [1]] # 18 fused P4 concat
+  - [-1, 1, Conv, [512, 1, 1]] # 19 fused P4
+  - [[11, 15], 1, Concat, [1]] # 20 fused P5 concat
+  - [-1, 1, Conv, [1024, 1, 1]] # 21 fused P5
+
+head:
+  - [21, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 19], 1, Concat, [1]] # 23 cat fused P4
+  - [-1, 3, EdgeVSSBlock, [512]] # 24
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 17], 1, Concat, [1]] # 26 cat fused P3
+  - [-1, 3, EdgeVSSBlock, [256]] # 27 (P3/8-small)
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 24], 1, Concat, [1]] # 29 cat head P4
+  - [-1, 3, EdgeVSSBlock, [512]] # 30 (P4/16-medium)
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 21], 1, Concat, [1]] # 32 cat head P5
+  - [-1, 3, EdgeVSSBlock, [1024]] # 33 (P5/32-large)
+
+  - [[27, 30, 33], 1, Segment, [nc, 32, 256]] # Segment(P3, P4, P5)
