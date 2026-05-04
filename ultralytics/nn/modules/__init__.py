@@ -90,6 +90,7 @@ from .conv import (
 )
 from .head import (
     OBB,
+    OBBShoreAux,
     RotatedFCOS,
     Classify,
     Detect,
@@ -97,6 +98,7 @@ from .head import (
     Pose,
     RTDETRDecoder,
     Segment,
+    SegmentShoreAux,
     WorldDetect,
     YOLOEDetect,
     YOLOESegment,
@@ -206,6 +208,7 @@ __all__ = (
     "Proto",
     "Detect",
     "Segment",
+    "SegmentShoreAux",
     "Pose",
     "Classify",
     "TransformerEncoderLayer",
@@ -218,6 +221,7 @@ __all__ = (
     "MLP",
     "ResNetLayer",
     "OBB",
+    "OBBShoreAux",
     "RotatedFCOS",
     "WorldDetect",
     "YOLOEDetect",

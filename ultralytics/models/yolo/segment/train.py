@@ -8,6 +8,17 @@ from pathlib import Path
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import SegmentationModel
 from ultralytics.utils import DEFAULT_CFG, RANK
+from ultralytics.utils.torch_utils import unwrap_model
+
+
+def on_train_epoch_start(trainer) -> None:
+    """Linearly ramp the shoreline auxiliary loss weight during early training."""
+    target_weight = float(getattr(trainer.args, "shoreline_aux_weight", 0.20))
+    warmup_epochs = max(int(getattr(trainer.args, "shoreline_aux_warmup_epochs", 10)), 0)
+    active_weight = target_weight if warmup_epochs == 0 else target_weight * min(max(trainer.epoch, 0) / warmup_epochs, 1.0)
+    trainer.args.active_shoreline_aux_weight = active_weight
+    if getattr(trainer, "model", None) is not None:
+        unwrap_model(trainer.model).args.active_shoreline_aux_weight = active_weight
 
 
 class SegmentationTrainer(yolo.detect.DetectionTrainer):
@@ -40,6 +51,8 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
             overrides = {}
         overrides["task"] = "segment"
         super().__init__(cfg, overrides, _callbacks)
+        self.args.active_shoreline_aux_weight = 0.0
+        self.add_callback("on_train_epoch_start", on_train_epoch_start)
 
     def get_model(self, cfg: dict | str | None = None, weights: str | Path | None = None, verbose: bool = True):
         """
@@ -63,7 +76,7 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
 
     def get_validator(self):
         """Return an instance of SegmentationValidator for validation of YOLO model."""
-        self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "shoreline_prior_loss", "land_water_prior_loss"
+        self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "shoreline_prior_loss", "land_water_prior_loss", "shore_aux_loss"
         return yolo.segment.SegmentationValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )

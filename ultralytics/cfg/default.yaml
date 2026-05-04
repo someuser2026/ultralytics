@@ -60,8 +60,15 @@ overlap_mask: true # (bool) merge instance masks into one mask during training (
 mask_ratio: 8 # (int) mask downsample ratio (segment only)
 use_shoreline_input: false # (bool) append shoreline mask as an additional model input channel
 use_land_water_input: false # (bool) append land/water one-hot mask channels as additional model inputs
+use_shoreline_aux_loss: false # (bool) force shoreline Gaussian auxiliary targets for compatible shore-aux heads (useful when training from checkpoints)
 use_shoreline_prior_loss: false # (bool) penalize confident OBB or segment predictions far from shoreline
 use_land_water_prior_loss: false # (bool) penalize confident OBB or segment predictions that place too much support over land/sand
+shoreline_aux_weight: 0.20 # (float) target loss gain for the shoreline Gaussian auxiliary head
+shoreline_aux_warmup_epochs: 10 # (int) epochs used to linearly ramp the shoreline auxiliary loss from 0 to its target gain
+shoreline_aux_gaussian_sigma_ratio: 0.035 # (float) Gaussian sigma as a fraction of the max image dimension for shoreline proximity targets
+shoreline_aux_gaussian_truncate_sigmas: 3.0 # (float) truncate the shoreline Gaussian target outside this many sigmas
+shoreline_aux_bce_weight: 1.0 # (float) BCE-with-logits term weight for the shoreline auxiliary loss
+shoreline_aux_dice_weight: 1.0 # (float) soft Dice term weight for the shoreline auxiliary loss
 shoreline_prior_point_mode: center # (str) point sampled for shoreline prior: center or closest_corner
 shoreline_prior_weight: 1.0 # (float) shoreline prior loss gain
 land_water_prior_weight: 1.0 # (float) land/water prior loss gain

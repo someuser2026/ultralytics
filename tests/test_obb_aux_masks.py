@@ -10,16 +10,83 @@ import torch
 
 from tests import TMP
 from ultralytics.data.augment import PrepareAuxiliaryMaskInputs, RandomFlip
-from ultralytics.data.utils import build_auxiliary_root_mappings, check_det_dataset, resolve_auxiliary_mask_paths
+from ultralytics.data.utils import (
+    build_auxiliary_root_mappings,
+    check_det_dataset,
+    get_auxiliary_mask_flags,
+    resolve_auxiliary_mask_paths,
+)
 from ultralytics.engine.predictor import BasePredictor
+from ultralytics.models.yolo.obb.train import on_train_epoch_start as obb_on_train_epoch_start
+from ultralytics.models.yolo.segment.train import on_train_epoch_start as seg_on_train_epoch_start
 from ultralytics.nn.tasks import OBBModel, SegmentationModel
 from ultralytics.utils.instance import Instances
-from ultralytics.utils.loss import _compute_obb_spatial_prior_losses, _compute_segmentation_spatial_prior_losses
+from ultralytics.utils.loss import (
+    _compute_obb_spatial_prior_losses,
+    _compute_segmentation_spatial_prior_losses,
+    _compute_shoreline_aux_loss,
+)
 
 
 def _write_png(path: Path, array: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     assert cv2.imwrite(str(path), array)
+
+
+def _shoreaux_args(**overrides) -> SimpleNamespace:
+    base = {
+        "box": 7.5,
+        "cls": 0.5,
+        "dfl": 1.5,
+        "angle_mode": "oc",
+        "overlap_mask": False,
+        "mask_ratio": 4,
+        "mask_weight": 1.0,
+        "bgr": 0.0,
+        "seg_use_mixed_loss": False,
+        "use_soft_ignore_band": False,
+        "imgsz": 64,
+        "use_shoreline_prior_loss": False,
+        "use_land_water_prior_loss": False,
+        "shoreline_aux_weight": 0.2,
+        "active_shoreline_aux_weight": 0.2,
+        "shoreline_aux_bce_weight": 1.0,
+        "shoreline_aux_dice_weight": 1.0,
+        "shoreline_aux_warmup_epochs": 10,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _build_shoreaux_obb_batch(empty: bool = False) -> dict[str, torch.Tensor]:
+    field = torch.zeros((1, 1, 64, 64), dtype=torch.float32)
+    if not empty:
+        field[:, :, :, 31:33] = 1.0
+    return {
+        "img": torch.randn(1, 3, 64, 64),
+        "batch_idx": torch.zeros((1, 1), dtype=torch.float32),
+        "cls": torch.zeros((1, 1), dtype=torch.float32),
+        "bboxes": torch.tensor([[0.5, 0.5, 0.25, 0.2, 0.0]], dtype=torch.float32),
+        "cls_probs": torch.ones((1, 1), dtype=torch.float32),
+        "shoreline_proximity_field": field,
+    }
+
+
+def _build_shoreaux_segment_batch(empty: bool = False) -> dict[str, torch.Tensor]:
+    field = torch.zeros((1, 1, 64, 64), dtype=torch.float32)
+    if not empty:
+        field[:, :, :, 31:33] = 1.0
+    masks = torch.zeros((1, 64, 64), dtype=torch.float32)
+    masks[0, 20:44, 18:42] = 1.0
+    return {
+        "img": torch.randn(1, 3, 64, 64),
+        "batch_idx": torch.zeros((1, 1), dtype=torch.float32),
+        "cls": torch.zeros((1, 1), dtype=torch.float32),
+        "bboxes": torch.tensor([[0.5, 0.5, 0.375, 0.375]], dtype=torch.float32),
+        "cls_probs": torch.ones((1, 1), dtype=torch.float32),
+        "masks": masks,
+        "shoreline_proximity_field": field,
+    }
 
 
 def test_auxiliary_mask_path_resolution() -> None:
@@ -129,6 +196,47 @@ def test_blank_shoreline_mask_produces_zero_distance_map() -> None:
     assert torch.count_nonzero(labels["shoreline_distance_map"]) == 0
 
 
+def test_shoreline_gaussian_field_straight_line_is_peak_on_shore_and_truncated() -> None:
+    """Gaussian shoreline targets should peak on-shore, decay smoothly, and zero beyond the truncation radius."""
+    transform = PrepareAuxiliaryMaskInputs(
+        use_shoreline_aux_loss=True,
+        shoreline_aux_gaussian_sigma_ratio=0.20,
+        shoreline_aux_gaussian_truncate_sigmas=2.0,
+    )
+    shoreline_mask = np.zeros((9, 9), dtype=np.uint8)
+    shoreline_mask[:, 4] = 1
+
+    labels = transform({"img": np.zeros((9, 9, 3), dtype=np.uint8), "shoreline_mask": shoreline_mask})
+    field = labels["shoreline_proximity_field"][0]
+
+    assert field[:, 4].min().item() == pytest.approx(1.0, abs=1e-6)
+    assert field[4, 4].item() > field[4, 5].item() > field[4, 6].item()
+    assert field[4, 8].item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_shoreline_gaussian_field_handles_curved_masks() -> None:
+    """Gaussian shoreline targets should preserve curved shoreline geometry."""
+    transform = PrepareAuxiliaryMaskInputs(use_shoreline_aux_loss=True)
+    shoreline_mask = np.zeros((11, 11), dtype=np.uint8)
+    shoreline_mask[2:9, 5] = 1
+    shoreline_mask[8, 5:9] = 1
+
+    labels = transform({"img": np.zeros((11, 11, 3), dtype=np.uint8), "shoreline_mask": shoreline_mask})
+    field = labels["shoreline_proximity_field"][0]
+
+    assert field[2, 5].item() == pytest.approx(1.0, abs=1e-6)
+    assert field[8, 8].item() == pytest.approx(1.0, abs=1e-6)
+    assert field[7, 7].item() > field[5, 0].item()
+
+
+def test_blank_shoreline_mask_produces_zero_proximity_field() -> None:
+    """Empty shoreline masks should emit an all-zero Gaussian proximity field."""
+    transform = PrepareAuxiliaryMaskInputs(use_shoreline_aux_loss=True)
+    labels = transform({"img": np.zeros((6, 6, 3), dtype=np.uint8), "shoreline_mask": np.zeros((6, 6), dtype=np.uint8)})
+
+    assert torch.count_nonzero(labels["shoreline_proximity_field"]) == 0
+
+
 def test_auxiliary_mask_channels_follow_geometric_augmentation() -> None:
     """Shoreline and land/water inputs must match the exact geometric transforms applied to the image."""
     shoreline_mask = np.zeros((4, 6), dtype=np.uint8)
@@ -168,6 +276,49 @@ def test_auxiliary_mask_channels_follow_geometric_augmentation() -> None:
     assert np.array_equal(prepared["img"][..., 1], expected_land_water.astype(np.uint8))
     assert np.array_equal(transformed_img[..., 0], prepared["img"][..., 0])
     assert np.array_equal(transformed_img[..., 1], prepared["img"][..., 1])
+
+
+def test_shoreaux_model_yaml_auto_requires_only_shoreline_masks() -> None:
+    """Shoreline auxiliary heads should auto-enable shoreline targets without requiring land/water masks."""
+    flags = get_auxiliary_mask_flags(
+        SimpleNamespace(model="ultralytics/cfg/models/12/yolo12-obb-shoreaux.yaml", use_shoreline_aux_loss=False)
+    )
+
+    assert flags["use_shoreline_aux_loss"] is True
+    assert flags["require_shoreline"] is True
+    assert flags["require_land_water"] is False
+
+
+def test_check_det_dataset_accepts_shoreaux_models_without_land_water_masks() -> None:
+    """Shoreline auxiliary heads should validate datasets that provide only shoreline masks."""
+    root = TMP / "shoreaux_yaml"
+    for split in ("train", "val"):
+        (root / "images" / split).mkdir(parents=True, exist_ok=True)
+        (root / "masks" / "shoreline" / split).mkdir(parents=True, exist_ok=True)
+    data_yaml = root / "data.yaml"
+    data_yaml.write_text(
+        "\n".join(
+            [
+                f"path: {root}",
+                "train: images/train",
+                "val: images/val",
+                "shoreline_masks: masks/shoreline",
+                "names:",
+                "  0: foreground",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    data = check_det_dataset(
+        str(data_yaml),
+        autodownload=False,
+        hyp=SimpleNamespace(model="ultralytics/cfg/models/12/yolo12-obb-shoreaux.yaml"),
+    )
+
+    assert Path(data["shoreline_masks"]["train"]).name == "train"
+    assert "land_water_masks" not in data
 
 
 def test_spatial_prior_losses_support_threshold_area_and_closest_corner_modes() -> None:
@@ -326,6 +477,120 @@ def test_predict_auxiliary_images_append_mask_channels() -> None:
     assert 128 in np.unique(prepared[..., 4])  # land
     assert 192 in np.unique(prepared[..., 4])  # water
     assert 255 in np.unique(prepared[..., 4])  # whitewater
+
+
+def test_shoreaux_configs_build_while_standard_configs_remain_unchanged() -> None:
+    """Canonical shoreaux configs should build while standard YOLO12 configs keep their original head classes."""
+    obb_model = OBBModel("ultralytics/cfg/models/12/yolo12-obb.yaml", ch=3, nc=1, verbose=False)
+    seg_model = SegmentationModel("ultralytics/cfg/models/12/yolo12-seg.yaml", ch=3, nc=1, verbose=False)
+    shore_obb_model = OBBModel("ultralytics/cfg/models/12/yolo12-obb-shoreaux.yaml", ch=3, nc=1, verbose=False)
+    shore_seg_model = SegmentationModel("ultralytics/cfg/models/12/yolo12-seg-shoreaux.yaml", ch=3, nc=1, verbose=False)
+
+    assert shore_obb_model.model[-1].__class__.__name__ == "OBBShoreAux"
+    assert shore_seg_model.model[-1].__class__.__name__ == "SegmentShoreAux"
+    assert obb_model.model[-1].__class__.__name__ == "OBB"
+    assert seg_model.model[-1].__class__.__name__ == "Segment"
+
+
+def test_shoreaux_heads_return_train_time_aux_logits_and_eval_compatibility() -> None:
+    """Shoreaux heads should emit train-time auxiliary maps without changing eval output contracts."""
+    img = torch.randn(1, 3, 64, 64)
+    obb_model = OBBModel("ultralytics/cfg/models/12/yolo12-obb-shoreaux.yaml", ch=3, nc=1, verbose=False)
+    seg_model = SegmentationModel("ultralytics/cfg/models/12/yolo12-seg-shoreaux.yaml", ch=3, nc=1, verbose=False)
+
+    obb_model.train()
+    seg_model.train()
+    obb_train = obb_model.predict(img)
+    seg_train = seg_model.predict(img)
+
+    assert set(obb_train.keys()) == {"main", "shore_aux_logits"}
+    assert set(seg_train.keys()) == {"main", "shore_aux_logits"}
+    assert obb_train["shore_aux_logits"].shape == (1, 1, 16, 16)
+    assert seg_train["shore_aux_logits"].shape == (1, 1, 16, 16)
+
+    obb_model.eval()
+    seg_model.eval()
+    obb_eval = obb_model.predict(img)
+    seg_eval = seg_model.predict(img)
+
+    assert isinstance(obb_eval, tuple) and len(obb_eval) == 2
+    assert isinstance(seg_eval, tuple) and len(seg_eval) == 2
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_shoreaux_obb_loss_is_finite_for_positive_and_empty_targets(empty: bool) -> None:
+    """OBB shoreline auxiliary loss should remain finite for both positive and empty shoreline targets."""
+    model = OBBModel("ultralytics/cfg/models/12/yolo12-obb-shoreaux.yaml", ch=3, nc=1, verbose=False)
+    model.args = _shoreaux_args()
+
+    loss, loss_items = model(_build_shoreaux_obb_batch(empty=empty))
+
+    assert torch.isfinite(loss).all()
+    assert torch.isfinite(loss_items).all()
+    assert loss_items[-1].item() >= 0.0
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_shoreaux_segment_loss_is_finite_for_positive_and_empty_targets(empty: bool) -> None:
+    """Segment shoreline auxiliary loss should remain finite for both positive and empty shoreline targets."""
+    model = SegmentationModel("ultralytics/cfg/models/12/yolo12-seg-shoreaux.yaml", ch=3, nc=1, verbose=False)
+    model.args = _shoreaux_args()
+
+    loss, loss_items = model(_build_shoreaux_segment_batch(empty=empty))
+
+    assert torch.isfinite(loss).all()
+    assert torch.isfinite(loss_items).all()
+    assert loss_items[-1].item() >= 0.0
+
+
+@pytest.mark.parametrize(
+    ("cfg", "model_cls"),
+    [
+        ("ultralytics/cfg/models/12/yolo12-obb-shoreaux.yaml", OBBModel),
+        ("ultralytics/cfg/models/12/yolo12-seg-shoreaux.yaml", SegmentationModel),
+    ],
+)
+def test_shoreaux_loss_backpropagates_into_shared_features(cfg: str, model_cls) -> None:
+    """The shoreline auxiliary loss should reach shared backbone/neck parameters, not only aux-branch weights."""
+    model = model_cls(cfg, ch=3, nc=1, verbose=False)
+    model.train()
+    preds = model.predict(torch.randn(1, 3, 64, 64))
+    field = torch.zeros((1, 1, 64, 64), dtype=torch.float32)
+    field[:, :, :, 31:33] = 1.0
+
+    loss = _compute_shoreline_aux_loss(preds["shore_aux_logits"], field)
+    loss.backward()
+
+    shared_grad = next(model.model[0].parameters()).grad
+    aux_grad = next(model.model[-1].shore_aux_decoder.parameters()).grad
+    assert shared_grad is not None
+    assert aux_grad is not None
+    assert shared_grad.abs().sum() > 0
+    assert aux_grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("callback", [obb_on_train_epoch_start, seg_on_train_epoch_start])
+def test_shoreaux_weight_schedule_ramps_linearly(callback) -> None:
+    """The shoreline auxiliary loss weight should ramp from zero to the configured target."""
+    model = torch.nn.Linear(1, 1)
+    model.args = SimpleNamespace()
+    trainer = SimpleNamespace(
+        args=SimpleNamespace(shoreline_aux_weight=0.2, shoreline_aux_warmup_epochs=10),
+        model=model,
+        epoch=0,
+    )
+
+    callback(trainer)
+    assert trainer.args.active_shoreline_aux_weight == pytest.approx(0.0)
+    assert model.args.active_shoreline_aux_weight == pytest.approx(0.0)
+
+    trainer.epoch = 5
+    callback(trainer)
+    assert trainer.args.active_shoreline_aux_weight == pytest.approx(0.1)
+
+    trainer.epoch = 10
+    callback(trainer)
+    assert trainer.args.active_shoreline_aux_weight == pytest.approx(0.2)
 
 
 def test_dual_branch_yolo12_models_build_with_aux_channels() -> None:

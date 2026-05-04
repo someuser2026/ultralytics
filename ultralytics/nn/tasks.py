@@ -24,6 +24,7 @@ from ultralytics.nn.modules import (
     C3TR,
     ELAN1,
     OBB,
+    OBBShoreAux,
     RotatedFCOS,
     PSA,
     SPP,
@@ -71,6 +72,7 @@ from ultralytics.nn.modules import (
     RotatedFasterRCNNHead,
     SCDown,
     Segment,
+    SegmentShoreAux,
     EdgeStem,
     EdgeVSSBlock,
     SimpleStem,
@@ -487,7 +489,10 @@ class DetectionModel(BaseModel):
                 """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
                 if self.end2end:
                     return self.forward(x)["one2many"]
-                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB, RotatedFCOS)) else self.forward(x)
+                out = self.forward(x)
+                if isinstance(out, dict):
+                    out = out.get("main", out)
+                return out[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB, RotatedFCOS)) else out
 
             self.model.eval()  # Avoid changing batch statistics until training begins
             m.training = True  # Setting it to True to properly return strides
@@ -2507,14 +2512,14 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, RotatedFCOS, ImagePoolingAttn, v10Detect}#, Mask2FormerHead}
+            {Detect, WorldDetect, YOLOEDetect, Segment, SegmentShoreAux, YOLOESegment, Pose, OBB, OBBShoreAux, RotatedFCOS, ImagePoolingAttn, v10Detect}#, Mask2FormerHead}
         ):
             # print("f:", f)
             # print("ch:", ch)
             args.append([ch[x] for x in f])
-            if m is Segment or m is YOLOESegment:
+            if m in {Segment, SegmentShoreAux, YOLOESegment}:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, RotatedFCOS}:
+            if m in {Detect, YOLOEDetect, Segment, SegmentShoreAux, YOLOESegment, Pose, OBB, OBBShoreAux, RotatedFCOS}:
                 m.legacy = legacy
         elif m in frozenset({RTDETRDecoder, RTDETRSegmentDecoder, RTDETROBBDecoder, RHINOOBBDecoder}):  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])

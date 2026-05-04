@@ -27,7 +27,7 @@ from .utils import bias_init_with_prob, inverse_sigmoid, linear_init
 # from .roi_heads import MaskHead, TwoFCBBoxHead, decode_boxes, encode_boxes, roi_align_pyramid
 # from .rpn import AnchorGenerator, RPNConfig, RPNHead, rpn_inference_single_image
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RotatedFCOS", "RTDETRDecoder", "RTDETRSegmentDecoder", "RTDETROBBDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment", "Mask2FormerHead" #, "CascadeRCNNHead"
+__all__ = "Detect", "Segment", "SegmentShoreAux", "Pose", "Classify", "OBB", "OBBShoreAux", "RotatedFCOS", "RTDETRDecoder", "RTDETRSegmentDecoder", "RTDETROBBDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment", "Mask2FormerHead" #, "CascadeRCNNHead"
 
 
 class LearnableScale(nn.Module):
@@ -262,6 +262,33 @@ class Detect(nn.Module):
         return torch.cat([boxes[i, index // nc], scores[..., None], (index % nc)[..., None].float()], dim=-1)
 
 
+class ShorelineAuxDecoder(nn.Module):
+    """Shared shoreline auxiliary decoder over the YOLO feature pyramid."""
+
+    def __init__(self, ch: tuple = (), hidden: int = 128):
+        super().__init__()
+        if len(ch) == 0:
+            raise ValueError("ShorelineAuxDecoder requires at least one feature map.")
+        self.hidden = hidden
+        self.proj = nn.ModuleList(Conv(c, hidden, 1, 1) for c in ch)
+        self.refine = nn.Sequential(Conv(hidden, hidden, 3), Conv(hidden, hidden, 3))
+        self.out = nn.Conv2d(hidden, 1, 1)
+
+    def forward(self, x: list[torch.Tensor], output_scale_factor: int = 2) -> torch.Tensor:
+        """Fuse projected feature maps to a single shoreline logit map."""
+        ref_h, ref_w = x[0].shape[-2:]
+        fused = self.proj[0](x[0])
+        for i in range(1, len(x)):
+            fused = fused + F.interpolate(
+                self.proj[i](x[i]), size=(ref_h, ref_w), mode="bilinear", align_corners=False
+            )
+        fused = self.refine(fused)
+        logits = self.out(fused)
+        if output_scale_factor > 1:
+            logits = F.interpolate(logits, scale_factor=output_scale_factor, mode="bilinear", align_corners=False)
+        return logits
+
+
 class Segment(Detect):
     """
     YOLO Segment head for segmentation models.
@@ -326,6 +353,27 @@ class Segment(Detect):
         return (torch.cat([x, mc], 1), p) if self.export else (torch.cat([x[0], mc], 1), (x[1], mc, p))
 
 
+class SegmentShoreAux(Segment):
+    """YOLO Segment head with an additional train-time shoreline proximity decoder."""
+
+    def __init__(self, nc: int = 80, nm: int = 32, npr: int = 256, ch: tuple = ()):
+        super().__init__(nc=nc, nm=nm, npr=npr, ch=ch)
+        self.shore_aux_decoder = ShorelineAuxDecoder(ch)
+
+    def _shoreline_aux_scale_factor(self) -> int:
+        if self.stride.numel() and float(self.stride[0].item()) > 0:
+            return max(int(round(float(self.stride[0].item()) / 4.0)), 1)
+        return 2
+
+    def forward(self, x: list[torch.Tensor]) -> tuple | list[torch.Tensor] | dict[str, tuple | torch.Tensor]:
+        """Return standard Segment outputs plus train-time shoreline auxiliary logits."""
+        shore_aux_logits = self.shore_aux_decoder(x, output_scale_factor=self._shoreline_aux_scale_factor())
+        main = super().forward(x)
+        if self.training:
+            return {"main": main, "shore_aux_logits": shore_aux_logits}
+        return main
+
+
 class OBB(Detect):
     """
     YOLO OBB detection head for detection with rotation models.
@@ -386,6 +434,27 @@ class OBB(Detect):
     def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
         """Decode rotated bounding boxes."""
         return dist2rbox(bboxes, self.angle, anchors, dim=1)
+
+
+class OBBShoreAux(OBB):
+    """YOLO OBB head with an additional train-time shoreline proximity decoder."""
+
+    def __init__(self, nc: int = 80, ne: int | dict = 1, ch: tuple = ()):
+        super().__init__(nc=nc, ne=ne, ch=ch)
+        self.shore_aux_decoder = ShorelineAuxDecoder(ch)
+
+    def _shoreline_aux_scale_factor(self) -> int:
+        if self.stride.numel() and float(self.stride[0].item()) > 0:
+            return max(int(round(float(self.stride[0].item()) / 4.0)), 1)
+        return 2
+
+    def forward(self, x: list[torch.Tensor]) -> torch.Tensor | tuple | dict[str, torch.Tensor | tuple]:
+        """Return standard OBB outputs plus train-time shoreline auxiliary logits."""
+        shore_aux_logits = self.shore_aux_decoder(x, output_scale_factor=self._shoreline_aux_scale_factor())
+        main = super().forward(x)
+        if self.training:
+            return {"main": main, "shore_aux_logits": shore_aux_logits}
+        return main
 
 
 class RotatedFCOS(Detect):

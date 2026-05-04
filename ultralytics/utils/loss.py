@@ -950,6 +950,9 @@ class v8SegmentationLoss(v8DetectionLoss):
         self.shoreline_prior_max_dist = float(_get_cfg_value(model.args, "shoreline_prior_max_dist", 128.0))
         self.land_water_prior_land_threshold = float(_get_cfg_value(model.args, "land_water_prior_land_threshold", 0.05))
         self.land_water_prior_exp_beta = float(_get_cfg_value(model.args, "land_water_prior_exp_beta", 4.0))
+        self.shoreline_aux_weight = float(_get_cfg_value(model.args, "shoreline_aux_weight", 0.20))
+        self.shoreline_aux_bce_weight = float(_get_cfg_value(model.args, "shoreline_aux_bce_weight", 1.0))
+        self.shoreline_aux_dice_weight = float(_get_cfg_value(model.args, "shoreline_aux_dice_weight", 1.0))
 
         # cache for weight maps within a forward pass
         # self._weight_map_cache: dict[int, torch.Tensor] = {}
@@ -959,7 +962,8 @@ class v8SegmentationLoss(v8DetectionLoss):
         """Calculate and return the combined loss for detection and segmentation."""
         # self._weight_map_cache.clear()
 
-        loss = torch.zeros(6, device=self.device)  # box, seg, cls, dfl, shoreline_prior, land_water_prior
+        loss = torch.zeros(7, device=self.device)  # box, seg, cls, dfl, shoreline_prior, land_water_prior, shore_aux
+        preds, shore_aux_logits = _split_main_and_aux_preds(preds)
         feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
         batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
@@ -1065,8 +1069,16 @@ class v8SegmentationLoss(v8DetectionLoss):
         loss[3] *= self.hyp.dfl  # dfl gain
         loss[4] *= self.shoreline_prior_weight
         loss[5] *= self.land_water_prior_weight
+        if shore_aux_logits is not None:
+            loss[6] = _compute_shoreline_aux_loss(
+                shore_aux_logits,
+                batch.get("shoreline_proximity_field"),
+                bce_weight=self.shoreline_aux_bce_weight,
+                dice_weight=self.shoreline_aux_dice_weight,
+            )
+        loss[6] *= float(_get_cfg_value(self.hyp, "active_shoreline_aux_weight", self.shoreline_aux_weight))
 
-        return loss * batch_size, loss.detach()  # loss(box, seg, cls, dfl, shoreline_prior, land_water_prior)
+        return loss * batch_size, loss.detach()  # loss(box, seg, cls, dfl, shoreline_prior, land_water_prior, shore_aux)
 
     # @staticmethod
     def single_mask_loss(
@@ -1414,6 +1426,46 @@ def _get_cfg_value(cfg: Any, key: str, default: Any) -> Any:
     return cfg.get(key, default) if isinstance(cfg, dict) else getattr(cfg, key, default)
 
 
+def _split_main_and_aux_preds(preds: Any) -> tuple[Any, torch.Tensor | None]:
+    """Separate standard YOLO predictions from optional shoreline auxiliary logits."""
+    if isinstance(preds, dict):
+        return preds.get("main"), preds.get("shore_aux_logits")
+    return preds, None
+
+
+def _compute_shoreline_aux_loss(
+    shore_aux_logits: torch.Tensor,
+    shoreline_proximity_field: torch.Tensor | None,
+    bce_weight: float = 1.0,
+    dice_weight: float = 1.0,
+) -> torch.Tensor:
+    """Compute BCE + soft Dice over a Gaussian shoreline proximity target."""
+    if shoreline_proximity_field is None:
+        raise ValueError("shoreline_proximity_field is required when shoreline auxiliary logits are present.")
+
+    logits = shore_aux_logits.float()
+    if logits.ndim != 4 or logits.shape[1] != 1:
+        raise ValueError(f"Expected shoreline auxiliary logits with shape [B, 1, H, W], got {tuple(logits.shape)}.")
+
+    target = F.interpolate(
+        shoreline_proximity_field.float(),
+        size=logits.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    ).clamp_(0.0, 1.0)
+
+    logits_2d = logits.squeeze(1)
+    target_2d = target.squeeze(1).to(device=logits_2d.device, dtype=logits_2d.dtype)
+    bce = F.binary_cross_entropy_with_logits(logits_2d, target_2d, reduction="mean")
+
+    non_empty = target_2d.flatten(1).sum(1) > 0
+    dice = logits_2d.new_tensor(0.0)
+    if non_empty.any():
+        dice = dice_loss_with_logits(logits_2d[non_empty], target_2d[non_empty]).mean()
+
+    return float(bce_weight) * bce + float(dice_weight) * dice
+
+
 def _points_to_grid(points: torch.Tensor, height: int, width: int) -> torch.Tensor:
     """Convert pixel coordinates to grid_sample coordinates with align_corners=False."""
     if width > 1:
@@ -1673,6 +1725,9 @@ class v8OBBLoss(v8DetectionLoss):
         self.land_water_prior_exp_beta = float(_get_cfg_value(model.args, "land_water_prior_exp_beta", 4.0))
         self.land_water_prior_land_threshold = float(_get_cfg_value(model.args, "land_water_prior_land_threshold", 0.05))
         self.land_water_prior_exp_beta = float(_get_cfg_value(model.args, "land_water_prior_exp_beta", 4.0))
+        self.shoreline_aux_weight = float(_get_cfg_value(model.args, "shoreline_aux_weight", 0.20))
+        self.shoreline_aux_bce_weight = float(_get_cfg_value(model.args, "shoreline_aux_bce_weight", 1.0))
+        self.shoreline_aux_dice_weight = float(_get_cfg_value(model.args, "shoreline_aux_dice_weight", 1.0))
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets for oriented bounding box detection."""
@@ -1693,7 +1748,8 @@ class v8OBBLoss(v8DetectionLoss):
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the loss for oriented bounding box detection."""
-        loss = torch.zeros(5, device=self.device)  # box, cls, dfl, shoreline_prior, land_water_prior
+        loss = torch.zeros(6, device=self.device)  # box, cls, dfl, shoreline_prior, land_water_prior, shore_aux
+        preds, shore_aux_logits = _split_main_and_aux_preds(preds)
         feats, pred_angle = preds if isinstance(preds[0], list) else preds[1]
         batch_size = pred_angle.shape[0]  # batch size, number of masks, mask height, mask width
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
@@ -1779,8 +1835,16 @@ class v8OBBLoss(v8DetectionLoss):
         loss[2] *= self.hyp.dfl  # dfl gain
         loss[3] *= self.shoreline_prior_weight
         loss[4] *= self.land_water_prior_weight
+        if shore_aux_logits is not None:
+            loss[5] = _compute_shoreline_aux_loss(
+                shore_aux_logits,
+                batch.get("shoreline_proximity_field"),
+                bce_weight=self.shoreline_aux_bce_weight,
+                dice_weight=self.shoreline_aux_dice_weight,
+            )
+        loss[5] *= float(_get_cfg_value(self.hyp, "active_shoreline_aux_weight", self.shoreline_aux_weight))
 
-        return loss * batch_size, loss.detach()  # loss(box, cls, dfl, shoreline_prior, land_water_prior)
+        return loss * batch_size, loss.detach()  # loss(box, cls, dfl, shoreline_prior, land_water_prior, shore_aux)
 
     def bbox_decode(
         self, anchor_points: torch.Tensor, pred_dist: torch.Tensor, pred_angle: torch.Tensor

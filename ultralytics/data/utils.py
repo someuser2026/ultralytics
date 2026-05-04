@@ -87,20 +87,53 @@ def img2label_paths(img_paths: list[str]) -> list[str]:
     return [sb.join(x.rsplit(sa, 1)).rsplit(".", 1)[0] + ".txt" for x in img_paths]
 
 
+def _model_uses_shoreline_aux_loss(model_spec: Any) -> bool:
+    """Return True when the selected model YAML uses a shoreline auxiliary YOLO head."""
+    if isinstance(model_spec, dict):
+        cfg = model_spec
+    elif isinstance(model_spec, (str, Path)):
+        spec = str(model_spec)
+        if not spec.endswith((".yaml", ".yml")):
+            return False
+        resolved = check_file(spec, suffix=(".yaml", ".yml"), download=False, hard=False)
+        yaml_path = Path(resolved or spec)
+        if not yaml_path.is_file():
+            return False
+        cfg = YAML.load(yaml_path)
+    else:
+        return False
+
+    if bool(cfg.get("use_shoreline_aux_loss", False)):
+        return True
+
+    head = cfg.get("head") or []
+    if not head:
+        return False
+    last = head[-1]
+    return isinstance(last, (list, tuple)) and len(last) >= 3 and last[2] in {"OBBShoreAux", "SegmentShoreAux"}
+
+
 def get_auxiliary_mask_flags(hyp: Any = None) -> dict[str, bool]:
     """Return mask-input and prior-loss requirements derived from the current args/config."""
     use_shoreline_input = bool(getattr(hyp, "use_shoreline_input", False))
     use_land_water_input = bool(getattr(hyp, "use_land_water_input", False))
     use_shoreline_prior_loss = bool(getattr(hyp, "use_shoreline_prior_loss", False))
     use_land_water_prior_loss = bool(getattr(hyp, "use_land_water_prior_loss", False))
+    model_spec = hyp.get("model") if isinstance(hyp, dict) else getattr(hyp, "model", None)
+    use_shoreline_aux_loss = bool(getattr(hyp, "use_shoreline_aux_loss", False)) or _model_uses_shoreline_aux_loss(
+        model_spec
+    )
     return {
         "use_shoreline_input": use_shoreline_input,
         "use_land_water_input": use_land_water_input,
         "use_shoreline_prior_loss": use_shoreline_prior_loss,
         "use_land_water_prior_loss": use_land_water_prior_loss,
-        "require_shoreline": use_shoreline_input or use_shoreline_prior_loss,
+        "use_shoreline_aux_loss": use_shoreline_aux_loss,
+        "require_shoreline": use_shoreline_input or use_shoreline_prior_loss or use_shoreline_aux_loss,
         "require_land_water": use_land_water_input or use_land_water_prior_loss or use_shoreline_prior_loss,
-        "enabled": any((use_shoreline_input, use_land_water_input, use_shoreline_prior_loss, use_land_water_prior_loss)),
+        "enabled": any(
+            (use_shoreline_input, use_land_water_input, use_shoreline_prior_loss, use_land_water_prior_loss, use_shoreline_aux_loss)
+        ),
     }
 
 
@@ -325,7 +358,9 @@ def validate_auxiliary_mask_config(data: dict[str, Any], hyp: Any = None) -> Non
         if not data.get(split):
             continue
         if flags["require_shoreline"] and not _get_auxiliary_split_spec(data.get("shoreline_masks"), split):
-            raise SyntaxError(f"shoreline_masks.{split} is required when shoreline inputs or priors are enabled.")
+            raise SyntaxError(
+                f"shoreline_masks.{split} is required when shoreline inputs, priors, or shoreline aux heads are enabled."
+            )
         if flags["require_land_water"] and not _get_auxiliary_split_spec(data.get("land_water_masks"), split):
             raise SyntaxError(f"land_water_masks.{split} is required when land/water inputs or priors are enabled.")
     build_auxiliary_root_mappings(data)

@@ -3736,13 +3736,19 @@ class PrepareAuxiliaryMaskInputs:
         use_land_water_input: bool = False,
         use_shoreline_prior_loss: bool = False,
         use_land_water_prior_loss: bool = False,
+        use_shoreline_aux_loss: bool = False,
         shoreline_prior_max_dist: int = 128,
+        shoreline_aux_gaussian_sigma_ratio: float = 0.035,
+        shoreline_aux_gaussian_truncate_sigmas: float = 3.0,
     ) -> None:
         self.use_shoreline_input = use_shoreline_input
         self.use_land_water_input = use_land_water_input
         self.use_shoreline_prior_loss = use_shoreline_prior_loss
         self.use_land_water_prior_loss = use_land_water_prior_loss
+        self.use_shoreline_aux_loss = use_shoreline_aux_loss
         self.shoreline_prior_max_dist = max(int(shoreline_prior_max_dist), 1)
+        self.shoreline_aux_gaussian_sigma_ratio = max(float(shoreline_aux_gaussian_sigma_ratio), 1e-6)
+        self.shoreline_aux_gaussian_truncate_sigmas = max(float(shoreline_aux_gaussian_truncate_sigmas), 0.0)
 
     @staticmethod
     def _require_mask(labels: dict[str, Any], key: str, message: str) -> np.ndarray:
@@ -3774,16 +3780,29 @@ class PrepareAuxiliaryMaskInputs:
             land_water_mask = _ensure_mask_2d(land_water_mask)
             return np.zeros(land_water_mask.shape, dtype=np.float32)
 
+    def _build_shoreline_proximity_field(self, shoreline_mask: np.ndarray) -> np.ndarray:
+        shoreline_mask = (_ensure_mask_2d(shoreline_mask) > 0).astype(np.uint8)
+        if not shoreline_mask.any():
+            return np.zeros(shoreline_mask.shape, dtype=np.float32)
+
+        distance = cv2.distanceTransform((shoreline_mask == 0).astype(np.uint8), cv2.DIST_L2, 3).astype(np.float32)
+        sigma_px = max(self.shoreline_aux_gaussian_sigma_ratio * float(max(shoreline_mask.shape)), 1e-6)
+        field = np.exp(-(distance**2) / (2.0 * sigma_px**2)).astype(np.float32)
+        truncate_radius = self.shoreline_aux_gaussian_truncate_sigmas * sigma_px
+        if truncate_radius > 0:
+            field[distance > truncate_radius] = 0.0
+        return field
+
     def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
         """Append auxiliary inputs and convert prior-loss maps to tensors before Format."""
         shoreline_mask = labels.pop("shoreline_mask", None)
         land_water_mask = labels.pop("land_water_mask", None)
 
-        if self.use_shoreline_input or self.use_shoreline_prior_loss:
+        if self.use_shoreline_input or self.use_shoreline_prior_loss or self.use_shoreline_aux_loss:
             shoreline_mask = self._require_mask(
                 {"shoreline_mask": shoreline_mask},
                 "shoreline_mask",
-                "shoreline_mask is required when shoreline input or shoreline prior loss is enabled.",
+                "shoreline_mask is required when shoreline input, shoreline prior loss, or shoreline aux loss is enabled.",
             )
         if self.use_land_water_input or self.use_land_water_prior_loss or self.use_shoreline_prior_loss:
             land_water_mask = self._require_mask(
@@ -3809,6 +3828,9 @@ class PrepareAuxiliaryMaskInputs:
         if self.use_shoreline_prior_loss:
             shoreline_distance_map = self._build_shoreline_distance_map(shoreline_mask, land_water_mask)
             labels["shoreline_distance_map"] = torch.from_numpy(shoreline_distance_map[None])
+        if self.use_shoreline_aux_loss:
+            shoreline_proximity_field = self._build_shoreline_proximity_field(shoreline_mask)
+            labels["shoreline_proximity_field"] = torch.from_numpy(shoreline_proximity_field[None])
 
         return labels
 

@@ -401,7 +401,12 @@ class YOLODataset(BaseDataset):
                 use_land_water_input=bool(getattr(hyp, "use_land_water_input", False)),
                 use_shoreline_prior_loss=bool(getattr(hyp, "use_shoreline_prior_loss", False)),
                 use_land_water_prior_loss=bool(getattr(hyp, "use_land_water_prior_loss", False)),
+                use_shoreline_aux_loss=bool(self.auxiliary_mask_flags.get("use_shoreline_aux_loss", False)),
                 shoreline_prior_max_dist=int(getattr(hyp, "shoreline_prior_max_dist", 128)),
+                shoreline_aux_gaussian_sigma_ratio=float(getattr(hyp, "shoreline_aux_gaussian_sigma_ratio", 0.035)),
+                shoreline_aux_gaussian_truncate_sigmas=float(
+                    getattr(hyp, "shoreline_aux_gaussian_truncate_sigmas", 3.0)
+                ),
             )
         )
         transforms.append(
@@ -486,7 +491,7 @@ class YOLODataset(BaseDataset):
         values = list(zip(*[list(b.values()) for b in batch]))
         for i, k in enumerate(keys):
             value = values[i]
-            if k in {"img", "text_feats", "land_water_mask", "shoreline_distance_map", "metadata_vec"}:
+            if k in {"img", "text_feats", "land_water_mask", "shoreline_distance_map", "shoreline_proximity_field", "metadata_vec"}:
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
