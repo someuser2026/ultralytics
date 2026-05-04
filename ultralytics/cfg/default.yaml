@@ -64,6 +64,7 @@ use_shoreline_aux_loss: false # (bool) force shoreline Gaussian auxiliary target
 use_shoreline_prior_loss: false # (bool) penalize confident OBB or segment predictions far from shoreline
 use_land_water_prior_loss: false # (bool) penalize confident OBB or segment predictions that place too much support over land/sand
 shoreline_aux_weight: 0.20 # (float) target loss gain for the shoreline Gaussian auxiliary head
+active_shoreline_aux_weight: 0.0 # (float) placeholder only do not use. active weight during warmpup for aux heads
 shoreline_aux_warmup_epochs: 10 # (int) epochs used to linearly ramp the shoreline auxiliary loss from 0 to its target gain
 shoreline_aux_gaussian_sigma_ratio: 0.035 # (float) Gaussian sigma as a fraction of the max image dimension for shoreline proximity targets
 shoreline_aux_gaussian_truncate_sigmas: 3.0 # (float) truncate the shoreline Gaussian target outside this many sigmas
