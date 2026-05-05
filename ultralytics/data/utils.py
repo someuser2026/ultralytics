@@ -35,6 +35,7 @@ from ultralytics.utils import (
 from ultralytics.utils.checks import check_file, check_font, is_ascii
 from ultralytics.utils.downloads import download, safe_download, unzip_file
 from ultralytics.utils.ops import segments2boxes
+from ultralytics.utils.patches import read_tiff
 
 HELP_URL = "See https://docs.ultralytics.com/datasets for dataset formatting guidance."
 IMG_FORMATS = {"bmp", "dng", "jpeg", "jpg", "mpo", "png", "tif", "tiff", "webp", "pfm", "heic"}  # image suffixes
@@ -42,9 +43,12 @@ VID_FORMATS = {"asf", "avi", "gif", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "
 FORMATS_HELP_MSG = f"Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID_FORMATS}"
 AUX_MASK_SPLITS = ("train", "val", "test", "minival")
 BAND_KEY = "bands"
+BAND_SCALE_FACTORS_KEY = "band_scale_factors"
 METADATA_KEY = "metadata"
 RGB_BAND_COUNT = 3
+DEFAULT_BAND_SCALE_FACTOR = 255.0
 CORE_AUXILIARY_BANDS = frozenset({"shoreline", "land_water", "shoreline_distance", "shoreline_proximity"})
+CATEGORICAL_AUXILIARY_BANDS = frozenset({"shoreline", "land_water"})
 DEFAULT_METADATA_FIELDS = (
     "anomalous_pixels",
     "clear_confidence_percent",
@@ -175,6 +179,186 @@ def get_band_name_to_index(bands: dict[int, str] | None) -> dict[str, int]:
     return {name: idx - 1 for idx, name in bands.items()}
 
 
+def normalize_band_scale_factors_config(data: dict[str, Any]) -> None:
+    """Normalize and validate optional per-band input scale divisors from data.yaml."""
+    raw_scale_factors = data.get(BAND_SCALE_FACTORS_KEY)
+    if not raw_scale_factors:
+        data[BAND_SCALE_FACTORS_KEY] = {}
+        return
+    if not isinstance(raw_scale_factors, dict):
+        raise SyntaxError("band_scale_factors must be a dict when present in data.yaml.")
+
+    channels = int(data.get("channels", RGB_BAND_COUNT))
+    normalized = {}
+    for raw_idx, raw_scale in raw_scale_factors.items():
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError) as exc:
+            raise SyntaxError(
+                f"Band scale factor key '{raw_idx}' is invalid. band_scale_factors keys must be integers >= 1."
+            ) from exc
+        if idx < 1 or idx > channels:
+            raise SyntaxError(
+                f"band_scale_factors key {idx} is invalid because channels={channels}. "
+                "Scale-factor keys must be within [1, channels]."
+            )
+        try:
+            scale = float(raw_scale)
+        except (TypeError, ValueError) as exc:
+            raise SyntaxError(f"band_scale_factors[{idx}] must be a positive numeric value.") from exc
+        if not math.isfinite(scale) or scale <= 0:
+            raise SyntaxError(f"band_scale_factors[{idx}] must be a positive finite numeric value.")
+        normalized[idx] = scale
+
+    data[BAND_SCALE_FACTORS_KEY] = dict(sorted(normalized.items()))
+
+
+def get_channel_scale_factors(channels: int, band_scale_factors: dict[int, float] | None = None) -> np.ndarray:
+    """Return per-channel input divisors for tensor normalization."""
+    scales = np.full(int(channels), DEFAULT_BAND_SCALE_FACTOR, dtype=np.float32)
+    for idx, scale in (band_scale_factors or {}).items():
+        channel_idx = int(idx) - 1
+        if 0 <= channel_idx < len(scales):
+            scales[channel_idx] = float(scale)
+    return scales
+
+
+def get_categorical_band_indices(bands: dict[int, str] | None, channels: int | None = None) -> set[int]:
+    """Return zero-based indices for embedded TIFF bands that must use nearest-neighbor geometry."""
+    max_channels = None if channels is None else int(channels)
+    indices = set()
+    for idx, name in (bands or {}).items():
+        channel_idx = int(idx) - 1
+        if name in CATEGORICAL_AUXILIARY_BANDS and (max_channels is None or channel_idx < max_channels):
+            indices.add(channel_idx)
+    return indices
+
+
+def _channel_padding_values(channels: int, dtype: np.dtype, padding_value: int | float = 0) -> np.ndarray:
+    """Return per-channel padding values, preserving RGB fill and zero-filling non-RGB bands."""
+    values = np.zeros(int(channels), dtype=dtype)
+    values[: min(3, int(channels))] = padding_value
+    return values
+
+
+def resize_image_with_band_roles(
+    img: np.ndarray,
+    size: tuple[int, int],
+    bands: dict[int, str] | None = None,
+    interpolation: int = cv2.INTER_LINEAR,
+) -> np.ndarray:
+    """Resize an image while using nearest-neighbor interpolation for categorical embedded bands."""
+    if img.ndim == 2:
+        return cv2.resize(img, size, interpolation=interpolation)
+
+    channels = int(img.shape[2])
+    nearest = get_categorical_band_indices(bands, channels)
+    if channels <= 4 and not nearest:
+        resized = cv2.resize(img, size, interpolation=interpolation)
+        return resized[..., None] if resized.ndim == 2 else resized
+
+    resized_channels = []
+    for channel_idx in range(channels):
+        channel_interp = cv2.INTER_NEAREST if channel_idx in nearest else interpolation
+        resized_channels.append(cv2.resize(img[..., channel_idx], size, interpolation=channel_interp))
+    return np.stack(resized_channels, axis=-1).astype(img.dtype, copy=False)
+
+
+def warp_image_with_band_roles(
+    img: np.ndarray,
+    matrix: np.ndarray,
+    dsize: tuple[int, int],
+    bands: dict[int, str] | None = None,
+    perspective: bool = False,
+    interpolation: int = cv2.INTER_LINEAR,
+    border_value: int | float = 0,
+) -> np.ndarray:
+    """Apply affine/perspective geometry while preserving categorical embedded-band values."""
+    if img.ndim == 2:
+        warp = cv2.warpPerspective if perspective else cv2.warpAffine
+        matrix_arg = matrix if perspective else matrix[:2]
+        return warp(img, matrix_arg, dsize=dsize, flags=interpolation, borderValue=border_value)
+
+    channels = int(img.shape[2])
+    nearest = get_categorical_band_indices(bands, channels)
+    if channels == 3 and not nearest:
+        warp = cv2.warpPerspective if perspective else cv2.warpAffine
+        matrix_arg = matrix if perspective else matrix[:2]
+        warped = warp(
+            img,
+            matrix_arg,
+            dsize=dsize,
+            flags=interpolation,
+            borderValue=(border_value,) * 3,
+        )
+        return warped[..., None] if warped.ndim == 2 else warped
+
+    padding_values = _channel_padding_values(channels, img.dtype, padding_value=border_value)
+    warped_channels = []
+    for channel_idx in range(channels):
+        channel_interp = cv2.INTER_NEAREST if channel_idx in nearest else interpolation
+        channel_border = padding_values[channel_idx].item()
+        if perspective:
+            warped = cv2.warpPerspective(
+                img[..., channel_idx],
+                matrix,
+                dsize=dsize,
+                flags=channel_interp,
+                borderValue=channel_border,
+            )
+        else:
+            warped = cv2.warpAffine(
+                img[..., channel_idx],
+                matrix[:2],
+                dsize=dsize,
+                flags=channel_interp,
+                borderValue=channel_border,
+            )
+        warped_channels.append(warped)
+    return np.stack(warped_channels, axis=-1).astype(img.dtype, copy=False)
+
+
+def pad_image_with_band_roles(
+    img: np.ndarray,
+    top: int,
+    bottom: int,
+    left: int,
+    right: int,
+    padding_value: int | float = 0,
+) -> np.ndarray:
+    """Pad RGB channels with the requested image value and non-RGB channels with zero."""
+    if img.ndim == 2:
+        return cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=padding_value)
+
+    h, w, channels = img.shape
+    if channels == 3:
+        return cv2.copyMakeBorder(
+            img,
+            top,
+            bottom,
+            left,
+            right,
+            cv2.BORDER_CONSTANT,
+            value=(padding_value,) * 3,
+        )
+
+    pad_img = np.empty((h + top + bottom, w + left + right, channels), dtype=img.dtype)
+    pad_img[...] = _channel_padding_values(channels, img.dtype, padding_value=padding_value).reshape(1, 1, channels)
+    pad_img[top : top + h, left : left + w] = img
+    return pad_img
+
+
+def make_image_canvas_with_band_roles(
+    shape: tuple[int, int, int],
+    dtype: np.dtype,
+    padding_value: int | float = 0,
+) -> np.ndarray:
+    """Allocate an image canvas with RGB fill and zero-filled non-RGB bands."""
+    canvas = np.empty(shape, dtype=dtype)
+    canvas[...] = _channel_padding_values(shape[2], dtype, padding_value=padding_value).reshape(1, 1, shape[2])
+    return canvas
+
+
 def validate_bands_config(data: dict[str, Any], hyp: Any = None) -> None:
     """Validate multichannel TIFF band metadata against the current training or predict flags."""
     for legacy_key in ("shoreline_masks", "land_water_masks"):
@@ -195,6 +379,7 @@ def validate_bands_config(data: dict[str, Any], hyp: Any = None) -> None:
     if raw_channels < max_band_index:
         raise SyntaxError(f"channels={raw_channels} is invalid because bands require at least {max_band_index} channels.")
     data["channels"] = raw_channels
+    normalize_band_scale_factors_config(data)
 
     flags = get_auxiliary_mask_flags(hyp)
     if flags["use_shoreline_input"] and "shoreline" not in band_names:
@@ -456,19 +641,31 @@ def exif_size(img: Image.Image) -> tuple[int, int]:
     return s
 
 
+def _verify_tiff_image_file(im_file: str) -> tuple[tuple[int, int], str]:
+    """Return TIFF image shape and format without using PIL verification."""
+    im = read_tiff(im_file)
+    shape = im.shape[:2]
+    image_format = Path(im_file).suffix[1:].lower()
+    return shape, image_format
+
+
 def verify_image(args: tuple) -> tuple:
     """Verify one image."""
     (im_file, cls), prefix = args
     # Number (found, corrupt), message
     nf, nc, msg = 0, 0, ""
     try:
-        im = Image.open(im_file)
-        im.verify()  # PIL verify
-        shape = exif_size(im)  # image size
-        shape = (shape[1], shape[0])  # hw
+        if str(im_file).lower().endswith((".tif", ".tiff")):
+            shape, image_format = _verify_tiff_image_file(im_file)
+        else:
+            with Image.open(im_file) as im:
+                im.verify()  # PIL verify
+                shape = exif_size(im)  # image size
+                shape = (shape[1], shape[0])  # hw
+                image_format = im.format.lower()
         assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
-        assert im.format.lower() in IMG_FORMATS, f"Invalid image format {im.format}. {FORMATS_HELP_MSG}"
-        if im.format.lower() in {"jpg", "jpeg"}:
+        assert image_format in IMG_FORMATS, f"Invalid image format {image_format}. {FORMATS_HELP_MSG}"
+        if image_format in {"jpg", "jpeg"}:
             with open(im_file, "rb") as f:
                 f.seek(-2, 2)
                 if f.read() != b"\xff\xd9":  # corrupt JPEG
@@ -489,13 +686,17 @@ def verify_image_label(args: tuple) -> list:
     cls_probs = np.zeros((0, 1), dtype=np.float32)
     try:
         # Verify images
-        im = Image.open(im_file)
-        im.verify()  # PIL verify
-        shape = exif_size(im)  # image size
-        shape = (shape[1], shape[0])  # hw
+        if str(im_file).lower().endswith((".tif", ".tiff")):
+            shape, image_format = _verify_tiff_image_file(im_file)
+        else:
+            with Image.open(im_file) as im:
+                im.verify()  # PIL verify
+                shape = exif_size(im)  # image size
+                shape = (shape[1], shape[0])  # hw
+                image_format = im.format.lower()
         assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
-        assert im.format.lower() in IMG_FORMATS, f"invalid image format {im.format}. {FORMATS_HELP_MSG}"
-        if im.format.lower() in {"jpg", "jpeg"}:
+        assert image_format in IMG_FORMATS, f"invalid image format {image_format}. {FORMATS_HELP_MSG}"
+        if image_format in {"jpg", "jpeg"}:
             with open(im_file, "rb") as f:
                 f.seek(-2, 2)
                 if f.read() != b"\xff\xd9":  # corrupt JPEG

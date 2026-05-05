@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,19 +8,33 @@ import cv2
 import numpy as np
 import pytest
 import torch
+import tifffile
 
 from tests import TMP
-from ultralytics.data.augment import PrepareAuxiliaryMaskInputs, RandomFlip
+from ultralytics.data.augment import (
+    Albumentations,
+    LetterBox,
+    Mosaic,
+    PrepareAuxiliaryMaskInputs,
+    RandomFlip,
+    RandomPerspective,
+    RandomUnsharpMask,
+)
 from ultralytics.data.build import load_inference_source
+from ultralytics.data.dataset import YOLODataset
 from ultralytics.data.utils import (
     check_det_dataset,
     get_auxiliary_mask_flags,
+    verify_image,
+    verify_image_label,
 )
 from ultralytics.engine.predictor import BasePredictor
 from ultralytics.models.yolo.obb.train import on_train_epoch_start as obb_on_train_epoch_start
 from ultralytics.models.yolo.segment.train import on_train_epoch_start as seg_on_train_epoch_start
+from ultralytics.models.yolo.model import YOLO
 from ultralytics.nn.tasks import OBBModel, SegmentationModel
 from ultralytics.utils.instance import Instances
+from ultralytics.utils.patches import imread
 from ultralytics.utils.loss import (
     _compute_obb_spatial_prior_losses,
     _compute_segmentation_spatial_prior_losses,
@@ -28,11 +43,7 @@ from ultralytics.utils.loss import (
 
 def _write_tiff(path: Path, array: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if array.ndim == 2:
-        stack = array[None]
-    else:
-        stack = array.transpose(2, 0, 1)
-    assert cv2.imwritemulti(str(path), stack)
+    tifffile.imwrite(path, array, metadata={"axes": "YX" if array.ndim == 2 else "YXS"})
 
 
 def _band_image(
@@ -40,14 +51,38 @@ def _band_image(
     land_water: np.ndarray | None = None,
     shoreline_distance: np.ndarray | None = None,
     shoreline_proximity: np.ndarray | None = None,
+    dtype: np.dtype = np.uint8,
 ) -> np.ndarray:
     shape = next(x.shape for x in (shoreline, land_water, shoreline_distance, shoreline_proximity) if x is not None)
-    img = np.zeros((*shape, 3), dtype=np.uint8)
+    img = np.zeros((*shape, 3), dtype=dtype)
     channels = [img[..., 0], img[..., 1], img[..., 2]]
     for band in (shoreline, land_water, shoreline_distance, shoreline_proximity):
         if band is not None:
-            channels.append(band.astype(np.uint8, copy=False))
+            channels.append(band.astype(dtype, copy=False))
     return np.stack(channels, axis=2)
+
+
+AUX_BANDS = {4: "shoreline", 5: "land_water", 6: "shoreline_distance", 7: "shoreline_proximity"}
+
+
+def _empty_instances() -> Instances:
+    return Instances(
+        np.zeros((0, 4), dtype=np.float32),
+        np.zeros((0, 1000, 2), dtype=np.float32),
+        bbox_format="xywh",
+        normalized=False,
+    )
+
+
+def _empty_labels(img: np.ndarray) -> dict:
+    return {
+        "img": img,
+        "cls": np.zeros((0, 1), dtype=np.float32),
+        "instances": _empty_instances(),
+        "im_file": "sample.tif",
+        "ori_shape": img.shape[:2],
+        "resized_shape": img.shape[:2],
+    }
 
 
 def _shoreaux_args(**overrides) -> SimpleNamespace:
@@ -137,6 +172,40 @@ def test_check_det_dataset_normalizes_bands_and_infers_channels() -> None:
     assert data["channels"] == 7
 
 
+def test_check_det_dataset_normalizes_band_scale_factors() -> None:
+    """Dataset parsing should normalize per-band input scale divisors from YAML."""
+    root = TMP / "obb_aux_yaml_scale_factors"
+    (root / "images" / "train").mkdir(parents=True, exist_ok=True)
+    (root / "images" / "val").mkdir(parents=True, exist_ok=True)
+    data_yaml = root / "data.yaml"
+    data_yaml.write_text(
+        "\n".join(
+            [
+                f"path: {root}",
+                "train: images/train",
+                "val: images/val",
+                "channels: 7",
+                "bands:",
+                "  4: shoreline",
+                "  5: land_water",
+                "  6: shoreline_distance",
+                "  7: shoreline_proximity",
+                "band_scale_factors:",
+                "  '6': 103",
+                "  '7': 65535",
+                "names:",
+                "  0: foreground",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    data = check_det_dataset(str(data_yaml), autodownload=False)
+
+    assert data["band_scale_factors"] == {6: 103.0, 7: 65535.0}
+
+
 def test_check_det_dataset_rejects_reserved_rgb_band_indices() -> None:
     """Semantic TIFF bands must not overwrite the first three RGB channels."""
     root = TMP / "obb_aux_yaml_reserved"
@@ -223,6 +292,24 @@ def test_prepare_auxiliary_mask_inputs_emit_prior_tensors_from_embedded_bands() 
     assert labels["shoreline_proximity_field"].dtype == torch.float32
     assert labels["shoreline_proximity_field"][0, 0, 2].item() == pytest.approx(1.0, abs=1e-6)
     assert labels["shoreline_proximity_field"].max().item() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_prepare_auxiliary_mask_inputs_use_configured_proximity_scale_factor() -> None:
+    """Configured band scale factors should normalize shoreline proximity fields from uint16 TIFF bands."""
+    transform = PrepareAuxiliaryMaskInputs(
+        bands={4: "shoreline_proximity"},
+        band_scale_factors={4: 65535.0},
+        use_shoreline_aux_loss=True,
+    )
+    shoreline_proximity = np.zeros((4, 4), dtype=np.uint16)
+    shoreline_proximity[:, 1] = 65535
+    shoreline_proximity[:, 2] = 32768
+
+    labels = transform({"img": _band_image(shoreline_proximity=shoreline_proximity, dtype=np.uint16)})
+    field = labels["shoreline_proximity_field"][0]
+
+    assert field[:, 1].min().item() == pytest.approx(1.0, abs=1e-6)
+    assert field[0, 2].item() == pytest.approx(32768.0 / 65535.0, abs=1e-6)
 
 
 def test_blank_shoreline_mask_produces_zero_distance_map() -> None:
@@ -318,6 +405,235 @@ def test_auxiliary_bands_follow_geometric_augmentation() -> None:
         torch.from_numpy(np.fliplr(shoreline_distance).astype(np.float32)),
     )
     assert prepared["shoreline_proximity_field"][0, :, 4].min().item() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_letterbox_uses_nearest_geometry_for_categorical_embedded_bands() -> None:
+    """Letterbox resizing must not invent intermediate land/water classes."""
+    shoreline_mask = np.zeros((8, 8), dtype=np.uint8)
+    shoreline_mask[:, 3:5] = 255
+    land_water_mask = np.full((8, 8), 255, dtype=np.uint8)
+    land_water_mask[:, :2] = 64
+    land_water_mask[:, 2:4] = 128
+    land_water_mask[:, 4:6] = 192
+    shoreline_distance = np.tile(np.arange(8, dtype=np.uint8), (8, 1))
+    shoreline_proximity = shoreline_mask.copy()
+    img = _band_image(shoreline_mask, land_water_mask, shoreline_distance, shoreline_proximity)
+
+    out = LetterBox(new_shape=(13, 13), scale_fill=True, bands=AUX_BANDS)(image=img)
+
+    assert out.shape == (13, 13, 7)
+    assert set(np.unique(out[..., 4]).tolist()) <= {0, 64, 128, 192, 255}
+    assert set(np.unique(out[..., 3]).tolist()) <= {0, 255}
+
+
+def test_random_perspective_uses_nearest_geometry_for_categorical_embedded_bands() -> None:
+    """Affine/perspective transforms must keep categorical TIFF bands valid."""
+    np.random.seed(0)
+    random.seed(0)
+    shoreline_mask = np.zeros((18, 18), dtype=np.uint8)
+    shoreline_mask[4:14, 8:10] = 255
+    land_water_mask = np.full((18, 18), 255, dtype=np.uint8)
+    land_water_mask[:, :5] = 64
+    land_water_mask[:, 5:9] = 128
+    land_water_mask[:, 9:13] = 192
+    shoreline_distance = np.tile(np.arange(18, dtype=np.uint8), (18, 1))
+    shoreline_proximity = shoreline_mask.copy()
+    img = _band_image(shoreline_mask, land_water_mask, shoreline_distance, shoreline_proximity)
+
+    labels = RandomPerspective(
+        degrees=12,
+        translate=0.15,
+        scale=0.2,
+        shear=5,
+        perspective=0.0,
+        bands=AUX_BANDS,
+    )(_empty_labels(img))
+
+    assert labels["img"].shape == (18, 18, 7)
+    assert set(np.unique(labels["img"][..., 4]).tolist()) <= {0, 64, 128, 192, 255}
+    assert set(np.unique(labels["img"][..., 3]).tolist()) <= {0, 255}
+
+
+def test_mosaic_preserves_multiband_dtype_and_valid_categorical_values() -> None:
+    """Mosaic canvases should preserve TIFF dtype/channel count and zero-fill non-RGB bands."""
+    shoreline_mask = np.zeros((6, 6), dtype=np.uint16)
+    shoreline_mask[:, 2:4] = 255
+    land_water_mask = np.full((6, 6), 255, dtype=np.uint16)
+    land_water_mask[:, :2] = 64
+    land_water_mask[:, 2:4] = 128
+    land_water_mask[:, 4:] = 192
+    shoreline_distance = np.full((6, 6), 103, dtype=np.uint16)
+    shoreline_proximity = np.full((6, 6), 65535, dtype=np.uint16)
+    img = _band_image(shoreline_mask, land_water_mask, shoreline_distance, shoreline_proximity, dtype=np.uint16)
+    labels = _empty_labels(img.copy())
+    labels["mix_labels"] = [_empty_labels(img.copy()) for _ in range(3)]
+
+    mosaic = Mosaic(SimpleNamespace(cache=None, bands=AUX_BANDS), imgsz=8, p=1.0)
+    out = mosaic._mosaic4(labels)["img"]
+
+    assert out.dtype == np.uint16
+    assert out.shape[-1] == 7
+    assert set(np.unique(out[..., 4]).tolist()) <= {0, 64, 128, 192, 255}
+    assert set(np.unique(out[..., 3]).tolist()) <= {0, 255}
+
+
+def test_rgb_photometric_transforms_leave_embedded_bands_unchanged() -> None:
+    """Sharpening and Albumentations photometric transforms must only modify RGB channels."""
+    img = np.zeros((16, 16, 7), dtype=np.uint8)
+    img[4:12, 4:12, :3] = 96
+    img[6:10, 6:10, :3] = 180
+    img[:, 7, 3] = 255
+    img[:, :4, 4] = 64
+    img[:, 4:8, 4] = 128
+    img[:, 8:12, 4] = 192
+    img[:, 12:, 4] = 255
+    img[..., 5] = 103
+    img[..., 6] = 255
+
+    sharpened = RandomUnsharpMask(
+        kernel_size_range=(3, 3),
+        sigma_limit=1.0,
+        amount_range=(1.0, 1.0),
+        threshold=0,
+        p=1.0,
+    )({"img": img.copy()})["img"]
+
+    assert not np.array_equal(sharpened[..., :3], img[..., :3])
+    assert np.array_equal(sharpened[..., 3:], img[..., 3:])
+
+    cfg = SimpleNamespace(
+        multi_ch_albu=True,
+        gaussian_blur_p=1.0,
+        motion_blur_p=0.0,
+        additive_noise_p=0.0,
+        multi_spec_noise_p=0.0,
+    )
+    albu = Albumentations(cfg=cfg, p=1.0)
+    if albu.transform is None:
+        pytest.skip("Albumentations transform is unavailable in this environment.")
+    blurred = albu({"img": img.copy(), "cls": np.zeros((0, 1), dtype=np.float32), "instances": _empty_instances()})[
+        "img"
+    ]
+
+    assert not np.array_equal(blurred[..., :3], img[..., :3])
+    assert np.array_equal(blurred[..., 3:], img[..., 3:])
+
+
+def test_multiband_tiff_verify_and_load_round_trip() -> None:
+    """7-band TIFF fixtures should verify cleanly and load with preserved shape and dtype."""
+    root = TMP / "multiband_tiff_verify"
+    image_path = root / "images" / "train" / "sample.tif"
+    label_path = root / "labels" / "train" / "sample.txt"
+    image = np.zeros((16, 16, 7), dtype=np.uint16)
+    image[..., 0] = 255
+    image[..., 5] = 103
+    image[..., 6] = 65535
+    _write_tiff(image_path, image)
+    label_path.parent.mkdir(parents=True, exist_ok=True)
+    label_path.write_text("", encoding="utf-8")
+
+    (_, _), nf, nc, msg = verify_image(((str(image_path), 0), "verify: "))
+    result = verify_image_label((str(image_path), str(label_path), "verify: ", False, 1, 0, 0, False))
+    loaded = imread(str(image_path))
+    loader = load_inference_source(str(image_path), channels=7)
+    _, images, _ = next(iter(loader))
+
+    assert nf == 1
+    assert nc == 0
+    assert msg == ""
+    assert result[7] == 1
+    assert result[9] == 0
+    assert loaded.shape == (16, 16, 7)
+    assert loaded.dtype == np.uint16
+    assert images[0].shape == (16, 16, 7)
+    assert images[0].dtype == np.uint16
+
+    chw_path = root / "images" / "train" / "sample_chw.tif"
+    chw_image = np.moveaxis(image, -1, 0)
+    tifffile.imwrite(chw_path, chw_image, metadata={"axes": "SYX"})
+    chw_loaded = imread(str(chw_path), expected_channels=7)
+
+    assert chw_loaded.shape == (16, 16, 7)
+    assert chw_loaded.dtype == np.uint16
+    assert np.array_equal(chw_loaded, image)
+
+
+def test_multiband_segment_dataset_sample_preserves_prior_targets_and_scales_model_inputs() -> None:
+    """A segment dataset sample should keep raw prior targets while scaling model input channels by config."""
+    root = TMP / "multiband_segment_dataset"
+    image_path = root / "images" / "train" / "sample.tif"
+    label_path = root / "labels" / "train" / "sample.txt"
+    val_image_path = root / "images" / "val" / "sample.tif"
+    val_label_path = root / "labels" / "val" / "sample.txt"
+    for path in (image_path, val_image_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    for path in (label_path, val_label_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    image = np.zeros((16, 16, 7), dtype=np.uint16)
+    image[..., 0] = 255
+    image[..., 1] = 128
+    image[..., 2] = 64
+    image[:, 7, 3] = 255
+    image[:, :4, 4] = 64
+    image[:, 4:8, 4] = 128
+    image[:, 8:12, 4] = 192
+    image[:, 12:, 4] = 255
+    image[..., 5] = 103
+    image[..., 6] = 65535
+    _write_tiff(image_path, image)
+    _write_tiff(val_image_path, image)
+    segment_row = "0 0.25 0.25 0.75 0.25 0.75 0.75 0.25 0.75\n"
+    label_path.write_text(segment_row, encoding="utf-8")
+    val_label_path.write_text(segment_row, encoding="utf-8")
+
+    data_yaml = root / "data.yaml"
+    data_yaml.write_text(
+        "\n".join(
+            [
+                f"path: {root}",
+                "train: images/train",
+                "val: images/val",
+                "channels: 7",
+                "bands:",
+                "  4: shoreline",
+                "  5: land_water",
+                "  6: shoreline_distance",
+                "  7: shoreline_proximity",
+                "band_scale_factors:",
+                "  6: 103",
+                "  7: 65535",
+                "names:",
+                "  0: foreground",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    data = check_det_dataset(str(data_yaml), autodownload=False, hyp=_shoreaux_args(use_shoreline_prior_loss=True))
+    dataset = YOLODataset(
+        img_path=data["train"],
+        imgsz=16,
+        batch_size=1,
+        augment=False,
+        rect=False,
+        hyp=_shoreaux_args(use_shoreline_prior_loss=True, use_land_water_prior_loss=True, use_shoreline_aux_loss=True),
+        prefix="test: ",
+        data=data,
+        task="segment",
+    )
+
+    sample = dataset[0]
+
+    assert sample["img"].shape == (7, 16, 16)
+    assert sample["img"].dtype == torch.float32
+    assert sample["img"][0, 0, 0].item() == pytest.approx(1.0, abs=1e-6)
+    assert sample["img"][5, 0, 0].item() == pytest.approx(1.0, abs=1e-6)
+    assert sample["img"][6, 0, 0].item() == pytest.approx(1.0, abs=1e-6)
+    assert sample["land_water_mask"].dtype == torch.int64
+    assert sample["land_water_mask"].shape == (1, 16, 16)
+    assert sample["shoreline_distance_map"][0, 0, 0].item() == pytest.approx(103.0, abs=1e-6)
+    assert sample["shoreline_proximity_field"][0, 0, 0].item() == pytest.approx(1.0, abs=1e-6)
 
 
 def test_shoreaux_model_yaml_auto_requires_only_shoreline_bands() -> None:
@@ -633,6 +949,14 @@ def test_dual_branch_yolo12_models_build_with_aux_channels() -> None:
 
     assert obb_out is not None
     assert seg_out is not None
+
+
+def test_dual_branch_yolo_constructor_can_infer_channels_from_data_yaml() -> None:
+    """Generic YOLO YAML construction should use supplied local data channels when available."""
+    seg_cfg = "ultralytics/cfg/models/yolo/segment_no_p2/yolo12-pafpn-dual-segment.yaml"
+    model = YOLO(seg_cfg, task="segment", data={"channels": 5}, verbose=False)
+
+    assert model.model.yaml["channels"] == 5
 
 
 def test_dual_branch_models_require_auxiliary_channels() -> None:

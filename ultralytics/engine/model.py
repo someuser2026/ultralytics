@@ -84,6 +84,7 @@ class Model(torch.nn.Module):
         model: str | Path | Model = "yolo11n.pt",
         task: str = None,
         verbose: bool = False,
+        data: str | Path | dict | None = None,
     ) -> None:
         """
         Initialize a new instance of the YOLO model class.
@@ -126,6 +127,7 @@ class Model(torch.nn.Module):
         self.session = None  # HUB session
         self.task = task  # task type
         self.model_name = None  # model name
+        self._init_data = data
         model = str(model).strip()
 
         # Check if Ultralytics HUB model from https://hub.ultralytics.com
@@ -235,6 +237,21 @@ class Model(torch.nn.Module):
 
         return model.startswith(f"{HUB_WEB_ROOT}/models/")
 
+    def _infer_channels_from_init_data(self) -> int | None:
+        """Best-effort channel inference from a local data.yaml or data dict supplied at construction time."""
+        data = getattr(self, "_init_data", None)
+        if data is None:
+            return None
+        try:
+            data_dict = data if isinstance(data, dict) else YAML.load(checks.check_yaml(str(data)))
+            channels = data_dict.get("channels")
+            if channels is None:
+                bands = data_dict.get("bands") or {}
+                channels = max(3, *(int(k) for k in bands)) if bands else None
+            return None if channels is None else int(channels)
+        except Exception:
+            return None
+
     def _new(self, cfg: str, task=None, model=None, verbose=False) -> None:
         """
         Initialize a new model and infer the task type from model definitions.
@@ -258,9 +275,17 @@ class Model(torch.nn.Module):
             >>> model._new("yolo11n.yaml", task="detect", verbose=True)
         """
         cfg_dict = yaml_model_load(cfg)
+        if cfg_dict.get("dual_input_backbone") and int(cfg_dict.get("channels", 3)) <= int(
+            cfg_dict.get("dual_input_rgb_channels", 3)
+        ):
+            if data_channels := self._infer_channels_from_init_data():
+                cfg_dict["channels"] = data_channels
         self.cfg = cfg
         self.task = task or guess_model_task(cfg_dict)
-        self.model = (model or self._smart_load("model"))(cfg_dict, verbose=verbose and RANK == -1)  # build model
+        channels = int(cfg_dict.get("channels", 3))
+        self.model = (model or self._smart_load("model"))(
+            cfg_dict, ch=channels, verbose=verbose and RANK == -1
+        )  # build model
         self.overrides["model"] = self.cfg
         self.overrides["task"] = self.task
 

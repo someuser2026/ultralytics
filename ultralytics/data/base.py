@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 from torch.utils.data import Dataset
 
-from ultralytics.data.utils import FORMATS_HELP_MSG, HELP_URL, IMG_FORMATS, check_file_speeds
+from ultralytics.data.utils import FORMATS_HELP_MSG, HELP_URL, IMG_FORMATS, check_file_speeds, resize_image_with_band_roles
 from ultralytics.utils import DEFAULT_CFG, LOCAL_RANK, LOGGER, NUM_THREADS, TQDM
 from ultralytics.utils.patches import imread
 
@@ -242,9 +242,9 @@ class BaseDataset(Dataset):
                 except Exception as e:
                     LOGGER.warning(f"{self.prefix}Removing corrupt *.npy image file {fn} due to: {e}")
                     Path(fn).unlink(missing_ok=True)
-                    im = imread(f, flags=self.cv2_flag)  # BGR
+                    im = imread(f, flags=self.cv2_flag, expected_channels=self.raw_channels)  # BGR
             else:  # read image
-                im = imread(f, flags=self.cv2_flag)  # BGR
+                im = imread(f, flags=self.cv2_flag, expected_channels=self.raw_channels)  # BGR
             if im is None:
                 raise FileNotFoundError(f"Image Not Found {f}")
             actual_channels = 1 if im.ndim == 2 else int(im.shape[2])
@@ -258,9 +258,19 @@ class BaseDataset(Dataset):
                 r = self.imgsz / max(h0, w0)  # ratio
                 if r != 1:  # if sizes are not equal
                     w, h = (min(math.ceil(w0 * r), self.imgsz), min(math.ceil(h0 * r), self.imgsz))
-                    im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
+                    im = resize_image_with_band_roles(
+                        im,
+                        (w, h),
+                        bands=getattr(self, "bands", {}),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
             elif not (h0 == w0 == self.imgsz):  # resize by stretching image to square imgsz
-                im = cv2.resize(im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+                im = resize_image_with_band_roles(
+                    im,
+                    (self.imgsz, self.imgsz),
+                    bands=getattr(self, "bands", {}),
+                    interpolation=cv2.INTER_LINEAR,
+                )
             if im.ndim == 2:
                 im = im[..., None]
 
@@ -297,7 +307,11 @@ class BaseDataset(Dataset):
         """Save an image as an *.npy file for faster loading."""
         f = self.npy_files[i]
         if not f.exists():
-            np.save(f.as_posix(), imread(self.im_files[i]), allow_pickle=False)
+            np.save(
+                f.as_posix(),
+                imread(self.im_files[i], expected_channels=getattr(self, "raw_channels", None)),
+                allow_pickle=False,
+            )
 
     def check_cache_disk(self, safety_margin: float = 0.5) -> bool:
         """
@@ -315,7 +329,7 @@ class BaseDataset(Dataset):
         n = min(self.ni, 30)  # extrapolate from 30 random images
         for _ in range(n):
             im_file = random.choice(self.im_files)
-            im = imread(im_file)
+            im = imread(im_file, expected_channels=getattr(self, "raw_channels", None))
             if im is None:
                 continue
             b += im.nbytes
@@ -348,7 +362,7 @@ class BaseDataset(Dataset):
         b, gb = 0, 1 << 30  # bytes of cached images, bytes per gigabytes
         n = min(self.ni, 30)  # extrapolate from 30 random images
         for _ in range(n):
-            im = imread(random.choice(self.im_files))  # sample image
+            im = imread(random.choice(self.im_files), expected_channels=getattr(self, "raw_channels", None))  # sample image
             if im is None:
                 continue
             ratio = self.imgsz / max(im.shape[0], im.shape[1])  # max(h, w)  # ratio

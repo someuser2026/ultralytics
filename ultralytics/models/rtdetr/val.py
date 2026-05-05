@@ -109,6 +109,7 @@ class RTDETRDataset(YOLODataset):
         transforms.append(
             PrepareAuxiliaryMaskInputs(
                 bands=self.data.get("bands", {}),
+                band_scale_factors=self.data.get("band_scale_factors", {}),
                 use_shoreline_input=bool(getattr(hyp, "use_shoreline_input", False)),
                 use_land_water_input=bool(getattr(hyp, "use_land_water_input", False)),
                 use_shoreline_prior_loss=bool(getattr(hyp, "use_shoreline_prior_loss", False)),
@@ -120,6 +121,7 @@ class RTDETRDataset(YOLODataset):
             Format(
                 bbox_format="xywh",
                 normalize=True,
+                channel_scale_factors=self.data.get("band_scale_factors", {}),
                 return_mask=self.use_segments,
                 return_keypoint=self.use_keypoints,
                 batch_idx=True,

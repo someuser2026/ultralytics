@@ -12,12 +12,64 @@ from typing import Any
 import cv2
 import numpy as np
 import torch
+import tifffile
 
 # OpenCV Multilanguage-friendly functions ------------------------------------------------------------------------------
 _imshow = cv2.imshow  # copy to avoid recursion errors
 
 
-def imread(filename: str, flags: int = cv2.IMREAD_COLOR) -> np.ndarray | None:
+def _is_tiff_path(filename: str) -> bool:
+    """Return True when filename points to a TIFF image."""
+    return str(filename).lower().endswith((".tif", ".tiff"))
+
+
+def _normalize_tiff_array(
+    array: np.ndarray,
+    axes: str,
+    filename: str,
+    expected_channels: int | None = None,
+) -> np.ndarray:
+    """Normalize TIFF arrays to HWC layout, preserving the source dtype."""
+    if axes == "YX":
+        return array[..., None]
+    if axes in {"YXS", "YXC"}:
+        return array
+    if axes in {"SYX", "CYX"}:
+        return np.moveaxis(array, 0, -1)
+    if array.ndim == 2:
+        return array[..., None]
+    if array.ndim == 3:
+        if expected_channels is not None:
+            expected_channels = int(expected_channels)
+            if array.shape[-1] == expected_channels:
+                return array
+            if array.shape[0] == expected_channels:
+                return np.moveaxis(array, 0, -1)
+            raise ValueError(
+                f"Unsupported TIFF layout for '{filename}': shape={array.shape}, axes='{axes}', "
+                f"expected_channels={expected_channels}."
+            )
+        # Some TIFF writers omit or mislabel channel axes. Fall back to shape heuristics when the layout is obvious.
+        if array.shape[-1] <= min(array.shape[0], array.shape[1], 64):
+            return array
+        if array.shape[0] < min(array.shape[1], array.shape[2]) and array.shape[0] <= 64:
+            return np.moveaxis(array, 0, -1)
+    raise ValueError(f"Unsupported TIFF layout for '{filename}': shape={array.shape}, axes='{axes}'.")
+
+
+def read_tiff(filename: str, expected_channels: int | None = None) -> np.ndarray:
+    """Read a TIFF image from disk into an HWC numpy array."""
+    with tifffile.TiffFile(filename) as tif:
+        series = tif.series[0]
+        im = _normalize_tiff_array(series.asarray(), getattr(series, "axes", ""), filename, expected_channels)
+    if expected_channels is not None and im.shape[2] != int(expected_channels):
+        raise ValueError(
+            f"TIFF '{filename}' has {im.shape[2]} channel(s), expected {int(expected_channels)} channel(s)."
+        )
+    return im
+
+
+def imread(filename: str, flags: int = cv2.IMREAD_COLOR, expected_channels: int | None = None) -> np.ndarray | None:
     """
     Read an image from a file with multilanguage filename support.
 
@@ -32,16 +84,23 @@ def imread(filename: str, flags: int = cv2.IMREAD_COLOR) -> np.ndarray | None:
         >>> img = imread("path/to/image.jpg")
         >>> img = imread("path/to/image.jpg", cv2.IMREAD_GRAYSCALE)
     """
+    if _is_tiff_path(filename):
+        try:
+            im = read_tiff(filename, expected_channels=expected_channels)
+        except Exception:
+            return None
+        if flags == cv2.IMREAD_GRAYSCALE:
+            if im.shape[2] == 1:
+                return im
+            gray = cv2.cvtColor(im[..., :3], cv2.COLOR_RGB2GRAY) if im.shape[2] >= 3 else im[..., 0]
+            return gray[..., None]
+        if im.shape[2] == 1 and flags != cv2.IMREAD_UNCHANGED:
+            return np.repeat(im, 3, axis=2)
+        return im
+
     file_bytes = np.fromfile(filename, np.uint8)
-    if filename.endswith((".tiff", ".tif")):
-        success, frames = cv2.imdecodemulti(file_bytes, cv2.IMREAD_UNCHANGED)
-        if success:
-            # Handle RGB images in tif/tiff format
-            return frames[0] if len(frames) == 1 and frames[0].ndim == 3 else np.stack(frames, axis=2)
-        return None
-    else:
-        im = cv2.imdecode(file_bytes, flags)
-        return im[..., None] if im is not None and im.ndim == 2 else im  # Always ensure 3 dimensions
+    im = cv2.imdecode(file_bytes, flags)
+    return im[..., None] if im is not None and im.ndim == 2 else im  # Always ensure 3 dimensions
 
 
 def imwrite(filename: str, img: np.ndarray, params: list[int] | None = None) -> bool:

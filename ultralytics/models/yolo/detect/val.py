@@ -75,7 +75,7 @@ class DetectionValidator(BaseValidator):
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
-        batch["img"] = (batch["img"].half() if self.args.half else batch["img"].float()) / 255
+        batch["img"] = batch["img"].half() if self.args.half else batch["img"].float()
         return batch
 
     def init_metrics(self, model: torch.nn.Module) -> None:
@@ -628,5 +628,4 @@ class DetectionValidator(BaseValidator):
             except Exception as e:
                 LOGGER.warning(f"faster-coco-eval unable to run: {e}")
         return stats
-
 

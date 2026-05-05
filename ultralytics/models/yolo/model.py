@@ -51,7 +51,13 @@ class YOLO(Model):
         >>> model = YOLO("yolo11n.yaml")
     """
 
-    def __init__(self, model: str | Path = "yolo11n.pt", task: str | None = None, verbose: bool = False):
+    def __init__(
+        self,
+        model: str | Path = "yolo11n.pt",
+        task: str | None = None,
+        verbose: bool = False,
+        data: str | Path | dict | None = None,
+    ):
         """
         Initialize a YOLO model.
 
@@ -80,7 +86,7 @@ class YOLO(Model):
             self.__dict__ = new_instance.__dict__
         else:
             # Continue with default YOLO initialization
-            super().__init__(model=model, task=task, verbose=verbose)
+            super().__init__(model=model, task=task, verbose=verbose, data=data)
             if hasattr(self.model, "model") and "RHINO" in self.model.model[-1]._get_name():
                 from ultralytics import RHINO
 

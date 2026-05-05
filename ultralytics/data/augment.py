@@ -15,7 +15,15 @@ from torch.nn import functional as F
 
 import albumentations as A
 
-from ultralytics.data.utils import polygons2masks, polygons2masks_overlap
+from ultralytics.data.utils import (
+    get_channel_scale_factors,
+    make_image_canvas_with_band_roles,
+    pad_image_with_band_roles,
+    polygons2masks,
+    polygons2masks_overlap,
+    resize_image_with_band_roles,
+    warp_image_with_band_roles,
+)
 from ultralytics.utils import LOGGER, IterableSimpleNamespace, colorstr
 from ultralytics.utils.checks import check_version
 from ultralytics.utils.instance import Instances
@@ -551,6 +559,7 @@ class Mosaic(BaseMixTransform):
         self.border = (-imgsz // 2, -imgsz // 2)  # width, height
         self.n = n
         self.buffer_enabled = self.dataset.cache != "ram"
+        self.bands = dict(getattr(self.dataset, "bands", getattr(self.dataset, "data", {}).get("bands", {})))
 
     def get_indexes(self):
         """
@@ -639,7 +648,7 @@ class Mosaic(BaseMixTransform):
 
             # Place img in img3
             if i == 0:  # center
-                img3 = np.full((s * 3, s * 3, img.shape[2]), 0, dtype=np.uint8)  # base image with 3 tiles
+                img3 = make_image_canvas_with_band_roles((s * 3, s * 3, img.shape[2]), img.dtype)  # 3 tiles
                 h0, w0 = h, w
                 c = s, s, s + w, s + h  # xmin, ymin, xmax, ymax (base) coordinates
             elif i == 1:  # right
@@ -698,7 +707,7 @@ class Mosaic(BaseMixTransform):
 
             # Place img in img4
             if i == 0:  # top left
-                img4 = np.full((s * 2, s * 2, img.shape[2]), 0, dtype=np.uint8)  # base image with 4 tiles
+                img4 = make_image_canvas_with_band_roles((s * 2, s * 2, img.shape[2]), img.dtype)  # 4 tiles
                 x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
                 x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
             elif i == 1:  # top right
@@ -758,7 +767,7 @@ class Mosaic(BaseMixTransform):
 
             # Place img in img9
             if i == 0:  # center
-                img9 = np.full((s * 3, s * 3, img.shape[2]), 0, dtype=np.uint8)  # base image with 4 tiles
+                img9 = make_image_canvas_with_band_roles((s * 3, s * 3, img.shape[2]), img.dtype)  # 9 tiles
                 h0, w0 = h, w
                 c = s, s, s + w, s + h  # xmin, ymin, xmax, ymax (base) coordinates
             elif i == 1:  # top
@@ -1111,6 +1120,7 @@ class RandomPerspective:
         perspective: float = 0.0,
         border: tuple[int, int] = (0, 0),
         pre_transform=None,
+        bands: dict[int, str] | None = None,
     ):
         """
         Initialize RandomPerspective object with transformation parameters.
@@ -1139,6 +1149,7 @@ class RandomPerspective:
         self.perspective = perspective
         self.border = border  # mosaic border
         self.pre_transform = pre_transform
+        self.bands = dict(bands or {})
 
     def affine_transform(self, img: np.ndarray, border: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, float]:
         """
@@ -1196,10 +1207,15 @@ class RandomPerspective:
         M = T @ S @ R @ P @ C  # order of operations (right to left) is IMPORTANT
         # Affine image
         if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():  # image changed
-            if self.perspective:
-                img = cv2.warpPerspective(img, M, dsize=self.size, borderValue=0)
-            else:  # affine
-                img = cv2.warpAffine(img, M[:2], dsize=self.size, borderValue=0)
+            img = warp_image_with_band_roles(
+                img,
+                M,
+                dsize=self.size,
+                bands=self.bands,
+                perspective=bool(self.perspective),
+                interpolation=cv2.INTER_LINEAR,
+                border_value=0,
+            )
             if img.ndim == 2:
                 img = img[..., None]
         return img, M, s
@@ -1502,22 +1518,24 @@ class RandomHSV:
         if img.ndim != 3 or img.shape[-1] < 3:  # only apply when an RGB view is available
             return labels
         if self.hgain or self.sgain or self.vgain:
-            dtype = img.dtype  # uint8
+            dtype = img.dtype
 
             r = np.random.uniform(-1, 1, 3) * [self.hgain, self.sgain, self.vgain]  # random gains
-            x = np.arange(0, 256, dtype=r.dtype)
+            x = np.arange(0, 256, dtype=np.float32)
             # lut_hue = ((x * (r[0] + 1)) % 180).astype(dtype)   # original hue implementation from ultralytics<=8.3.78
-            lut_hue = ((x + r[0] * 180) % 180).astype(dtype)
-            lut_sat = np.clip(x * (r[1] + 1), 0, 255).astype(dtype)
-            lut_val = np.clip(x * (r[2] + 1), 0, 255).astype(dtype)
+            lut_hue = ((x + r[0] * 180) % 180).astype(np.uint8)
+            lut_sat = np.clip(x * (r[1] + 1), 0, 255).astype(np.uint8)
+            lut_val = np.clip(x * (r[2] + 1), 0, 255).astype(np.uint8)
             lut_sat[0] = 0  # prevent pure white changing color, introduced in 8.3.79
 
             rgb_view = img if img.shape[-1] == 3 else img[..., :3].copy()
+            if rgb_view.dtype != np.uint8:
+                rgb_view = np.clip(rgb_view, 0, 255).astype(np.uint8)
             color_code = cv2.COLOR_BGR2HSV if rgb_view.shape[-1] == 3 and img.shape[-1] == 3 else cv2.COLOR_RGB2HSV
             hue, sat, val = cv2.split(cv2.cvtColor(rgb_view, color_code))
             im_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val)))
             dst_code = cv2.COLOR_HSV2BGR if img.shape[-1] == 3 else cv2.COLOR_HSV2RGB
-            rgb_view = cv2.cvtColor(im_hsv, dst_code)
+            rgb_view = cv2.cvtColor(im_hsv, dst_code).astype(dtype, copy=False)
             if img.shape[-1] == 3:
                 img[...] = rgb_view
             else:
@@ -1655,6 +1673,7 @@ class LetterBox:
         stride: int = 32,
         padding_value: int = 0,
         interpolation: int = cv2.INTER_LINEAR,
+        bands: dict[int, str] | None = None,
     ):
         """
         Initialize LetterBox object for resizing and padding images.
@@ -1693,6 +1712,7 @@ class LetterBox:
         self.center = center  # Put the image in the middle or top-left
         self.padding_value = padding_value
         self.interpolation = interpolation
+        self.bands = dict(bands or {})
 
     def __call__(self, labels: dict[str, Any] = None, image: np.ndarray = None) -> dict[str, Any] | np.ndarray:
         """
@@ -1745,21 +1765,18 @@ class LetterBox:
             dh /= 2
 
         if shape[::-1] != new_unpad:  # resize
-            img = cv2.resize(img, new_unpad, interpolation=self.interpolation)
+            img = resize_image_with_band_roles(
+                img,
+                new_unpad,
+                bands=self.bands,
+                interpolation=self.interpolation,
+            )
             if img.ndim == 2:
                 img = img[..., None]
 
         top, bottom = int(round(dh - 0.1)) if self.center else 0, int(round(dh + 0.1))
         left, right = int(round(dw - 0.1)) if self.center else 0, int(round(dw + 0.1))
-        h, w, c = img.shape
-        if c == 3:
-            img = cv2.copyMakeBorder(
-                img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(self.padding_value,) * 3
-            )
-        else:  # multispectral
-            pad_img = np.full((h + top + bottom, w + left + right, c), fill_value=self.padding_value, dtype=img.dtype)
-            pad_img[top : top + h, left : left + w] = img
-            img = pad_img
+        img = pad_image_with_band_roles(img, top, bottom, left, right, padding_value=self.padding_value)
 
         if labels.get("ratio_pad"):
             labels["ratio_pad"] = (labels["ratio_pad"], (left, top))  # for evaluation
@@ -2111,6 +2128,20 @@ class Albumentations:
             return labels
         orig_dtype = im.dtype
 
+        if im.ndim == 3 and im.shape[2] > 3:
+            if self.contains_spatial:
+                LOGGER.warning(
+                    colorstr("albumentations: ")
+                    + "Skipping spatial Albumentations for multiband images; use band-aware YOLO geometry instead."
+                )
+                return labels
+            rgb = im[..., :3].copy()
+            transformed_rgb = self.transform(image=rgb)["image"].astype(orig_dtype, copy=False)
+            out = im.copy()
+            out[..., :3] = transformed_rgb
+            labels["img"] = out
+            return labels
+
         if self.contains_spatial:
             cls = labels["cls"]
             cls_probs = labels.get("cls_probs", np.ones((len(cls), 1), dtype=np.float32))
@@ -2448,20 +2479,24 @@ class RandomGamma:
 
         # Build lookup table for gamma correction
         inv_gamma = 1.0 / gamma
-        table = np.array([(i / 255.0) ** inv_gamma * 255 for i in range(256)]).astype(dtype)
+        table = np.array([(i / 255.0) ** inv_gamma * 255 for i in range(256)], dtype=np.uint8)
 
         # Apply gamma correction only to first 3 channels (RGB)
         if len(img.shape) == 2:
             # Grayscale image
-            img = cv2.LUT(img, table)
+            working = img if img.dtype == np.uint8 else np.clip(img, 0, 255).astype(np.uint8)
+            img = cv2.LUT(working, table).astype(dtype, copy=False)
         elif img.shape[-1] <= 3:
             # RGB or fewer channels - apply to all
-            img = cv2.LUT(img, table)
+            working = img if img.dtype == np.uint8 else np.clip(img, 0, 255).astype(np.uint8)
+            img = cv2.LUT(working, table).astype(dtype, copy=False)
         else:
             # Multispectral image - apply only to first 3 channels (RGB)
             rgb_channels = img[..., :3]
             other_channels = img[..., 3:]
-            rgb_channels = cv2.LUT(rgb_channels, table)
+            if rgb_channels.dtype != np.uint8:
+                rgb_channels = np.clip(rgb_channels, 0, 255).astype(np.uint8)
+            rgb_channels = cv2.LUT(rgb_channels, table).astype(dtype, copy=False)
             img = np.concatenate([rgb_channels, other_channels], axis=-1)
 
         labels["img"] = img
@@ -2556,6 +2591,8 @@ class RandomUnsharpMask:
 
         img = labels["img"]
         dtype = img.dtype
+        rgb_only = img.ndim == 3 and img.shape[-1] > 3
+        working_img = img[..., :3] if rgb_only else img
 
         # Randomly sample parameters
         # Ensure kernel size is odd
@@ -2566,7 +2603,7 @@ class RandomUnsharpMask:
         amount = np.random.uniform(self.amount_range[0], self.amount_range[1])
 
         # Convert to float for processing
-        img_float = img.astype(np.float32)
+        img_float = working_img.astype(np.float32)
 
         # Create blurred version
         blurred = cv2.GaussianBlur(img_float, (kernel_size, kernel_size), sigma)
@@ -2582,7 +2619,12 @@ class RandomUnsharpMask:
         # Clip values and convert back to original dtype
         sharpened = np.clip(sharpened, 0, 255).astype(dtype)
 
-        labels["img"] = sharpened
+        if rgb_only:
+            out = img.copy()
+            out[..., :3] = sharpened
+            labels["img"] = out
+        else:
+            labels["img"] = sharpened
         return labels
 
 class PrepareAuxiliaryMaskInputs:
@@ -2591,6 +2633,7 @@ class PrepareAuxiliaryMaskInputs:
     def __init__(
         self,
         bands: dict[int, str] | None = None,
+        band_scale_factors: dict[int, float] | None = None,
         use_shoreline_input: bool = False,
         use_land_water_input: bool = False,
         use_shoreline_prior_loss: bool = False,
@@ -2600,7 +2643,9 @@ class PrepareAuxiliaryMaskInputs:
         shoreline_aux_gaussian_sigma_ratio: float = 0.035,
         shoreline_aux_gaussian_truncate_sigmas: float = 3.0,
     ) -> None:
-        self.band_name_to_index = {name: idx - 1 for idx, name in (bands or {}).items()}
+        bands = bands or {}
+        self.band_name_to_index = {name: idx - 1 for idx, name in bands.items()}
+        self.band_name_to_scale = {bands[idx]: float(scale) for idx, scale in (band_scale_factors or {}).items() if idx in bands}
         self.use_shoreline_input = use_shoreline_input
         self.use_land_water_input = use_land_water_input
         self.use_shoreline_prior_loss = use_shoreline_prior_loss
@@ -2644,10 +2689,13 @@ class PrepareAuxiliaryMaskInputs:
         return _ensure_mask_2d(mask).astype(np.float32, copy=False)
 
     @staticmethod
-    def _normalize_proximity_band(mask: np.ndarray) -> np.ndarray:
+    def _normalize_proximity_band(mask: np.ndarray, scale_factor: float | None = None) -> np.ndarray:
         mask_2d = _ensure_mask_2d(mask)
+        if scale_factor is not None:
+            return (mask_2d.astype(np.float32) / float(scale_factor)).clip(0.0, 1.0)
         if np.issubdtype(mask_2d.dtype, np.integer):
-            return (mask_2d.astype(np.float32) / 255.0).clip(0.0, 1.0)
+            max_value = float(np.iinfo(mask_2d.dtype).max)
+            return (mask_2d.astype(np.float32) / max(max_value, 1.0)).clip(0.0, 1.0)
         return mask_2d.astype(np.float32, copy=False).clip(0.0, 1.0)
 
     def _build_shoreline_distance_map(self, shoreline_mask: np.ndarray, land_water_mask: np.ndarray) -> np.ndarray:
@@ -2723,7 +2771,10 @@ class PrepareAuxiliaryMaskInputs:
             )
         if self.use_shoreline_aux_loss:
             shoreline_proximity_field = (
-                self._normalize_proximity_band(shoreline_proximity)
+                self._normalize_proximity_band(
+                    shoreline_proximity,
+                    scale_factor=self.band_name_to_scale.get("shoreline_proximity"),
+                )
                 if shoreline_proximity is not None
                 else self._build_shoreline_proximity_field(shoreline_mask)
             )
@@ -2768,6 +2819,7 @@ class Format:
         self,
         bbox_format: str = "xywh",
         normalize: bool = True,
+        channel_scale_factors: dict[int, float] | None = None,
         return_mask: bool = False,
         return_keypoint: bool = False,
         return_obb: bool = False,
@@ -2813,6 +2865,7 @@ class Format:
         """
         self.bbox_format = bbox_format
         self.normalize = normalize
+        self.channel_scale_factors = dict(channel_scale_factors or {})
         self.return_mask = return_mask  # set False when training detection only
         self.return_keypoint = return_keypoint
         self.return_obb = return_obb
@@ -2924,9 +2977,13 @@ class Format:
         if len(img.shape) < 3:
             img = np.expand_dims(img, -1)
         img = img.transpose(2, 0, 1)
-        img = np.ascontiguousarray(img[::-1] if random.uniform(0, 1) > self.bgr and img.shape[0] == 3 else img)
-        img = torch.from_numpy(img)
-        return img
+        channel_scales = get_channel_scale_factors(img.shape[0], self.channel_scale_factors)
+        flip_to_bgr = random.uniform(0, 1) > self.bgr and img.shape[0] == 3
+        if flip_to_bgr:
+            img = img[::-1]
+            channel_scales = channel_scales[::-1]
+        img = torch.from_numpy(np.ascontiguousarray(img)).float()
+        return img / torch.as_tensor(channel_scales[:, None, None], dtype=img.dtype)
 
     def _format_segments(
         self, instances: Instances, cls: np.ndarray, cls_probs: np.ndarray, w: int, h: int
@@ -3227,6 +3284,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
         >>> transforms = v8_transforms(dataset, imgsz=640, hyp=hyp)
         >>> augmented_data = transforms(dataset[0])
     """
+    bands = dict(getattr(dataset, "bands", getattr(dataset, "data", {}).get("bands", {})))
     mosaic = Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic)
     affine = RandomPerspective(
         degrees=hyp.degrees,
@@ -3234,7 +3292,8 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
         scale=hyp.scale,
         shear=hyp.shear,
         perspective=hyp.perspective,
-        pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
+        pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz), bands=bands),
+        bands=bands,
     )
 
     pre_transform = Compose([mosaic, affine])

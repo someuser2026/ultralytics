@@ -47,9 +47,10 @@ import torch
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data import load_inference_source
 from ultralytics.data.augment import LetterBox
+from ultralytics.data.utils import check_det_dataset, get_channel_scale_factors
 from ultralytics.nn.autobackend import AutoBackend
 from ultralytics.utils import DEFAULT_CFG, LOGGER, MACOS, WINDOWS, callbacks, colorstr, ops
-from ultralytics.utils.checks import check_imgsz, check_imshow
+from ultralytics.utils.checks import check_file, check_imgsz, check_imshow
 from ultralytics.utils.files import increment_path
 from ultralytics.utils.torch_utils import attempt_compile, select_device, smart_inference_mode
 
@@ -178,6 +179,32 @@ class BasePredictor:
         if actual != expected:
             raise ValueError(f"Predict source has {actual} channel(s), but model expects {expected}.")
 
+    def _resolve_predict_data(self) -> None:
+        """Resolve dataset metadata for predict-time channel scaling when a local YAML is available."""
+        if isinstance(self.args.data, dict):
+            self.data = self.args.data
+            return
+        if not isinstance(self.args.data, (str, Path)):
+            self.data = self.args.data
+            return
+
+        data_path = check_file(str(self.args.data), suffix=(".yaml", ".yml"), download=False, hard=False)
+        if not data_path:
+            self.data = self.args.data
+            return
+
+        try:
+            self.data = check_det_dataset(data_path, autodownload=False, hyp=self._predict_model_args)
+            self.args.data = data_path
+        except Exception as exc:
+            LOGGER.warning(f"Predict dataset metadata could not be resolved from '{data_path}': {exc}")
+            self.data = self.args.data
+
+    def _predict_channel_scale_factors(self, channels: int) -> np.ndarray:
+        """Return per-channel predict-time input divisors."""
+        band_scale_factors = self.data.get("band_scale_factors", {}) if isinstance(self.data, dict) else {}
+        return get_channel_scale_factors(channels, band_scale_factors)
+
     def preprocess(self, im: torch.Tensor | list[np.ndarray]) -> torch.Tensor:
         """
         Prepare input image before inference.
@@ -204,7 +231,12 @@ class BasePredictor:
         im = im.to(self.device)
         im = im.half() if self.model.fp16 else im.float()  # uint8 to fp16/32
         if not_tensor:
-            im /= 255  # 0 - 255 to 0.0 - 1.0
+            channel_scales = torch.as_tensor(
+                self._predict_channel_scale_factors(int(im.shape[1])),
+                device=im.device,
+                dtype=im.dtype,
+            ).view(1, -1, 1, 1)
+            im = im / channel_scales
         return im
 
     def inference(self, im: torch.Tensor, *args, **kwargs):
@@ -233,6 +265,7 @@ class BasePredictor:
             and self.args.rect
             and (self.model.pt or (getattr(self.model, "dynamic", False) and not self.model.imx)),
             stride=self.model.stride,
+            bands=self.data.get("bands", {}) if isinstance(self.data, dict) else {},
         )
         return [letterbox(image=x) for x in im]
 
@@ -442,6 +475,7 @@ class BasePredictor:
         if hasattr(self.model, "imgsz") and not getattr(self.model, "dynamic", False):
             self.args.imgsz = self.model.imgsz  # reuse imgsz from export metadata
         self._sync_auxiliary_predict_args_from_model()
+        self._resolve_predict_data()
         self.model.eval()
         self.model = attempt_compile(self.model, device=self.device, mode=self.args.compile)
 

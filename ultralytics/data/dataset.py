@@ -97,7 +97,9 @@ class YOLODataset(BaseDataset):
         self.data = data
         self.hyp = kwargs.get("hyp")
         self.auxiliary_mask_flags = get_auxiliary_mask_flags(self.hyp)
+        self.bands = dict(self.data.get("bands", {}))
         self.band_name_to_index = get_band_name_to_index(self.data.get("bands"))
+        self.band_scale_factors = dict(self.data.get("band_scale_factors", {}))
         self.use_auxiliary_bands = bool(CORE_AUXILIARY_BANDS & set(self.band_name_to_index))
         self.use_metadata = bool(self.data.get("metadata"))
         self.metadata_fields = list(self.data.get("metadata_fields", [])) if self.use_metadata else []
@@ -297,10 +299,11 @@ class YOLODataset(BaseDataset):
             hyp.cutmix = hyp.cutmix if self.augment and not self.rect else 0.0
             transforms = v8_transforms(self, self.imgsz, hyp)
         else:
-            transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
+            transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False, bands=self.bands)])
         transforms.append(
             PrepareAuxiliaryMaskInputs(
                 bands=self.data.get("bands", {}),
+                band_scale_factors=self.band_scale_factors,
                 use_shoreline_input=bool(getattr(hyp, "use_shoreline_input", False)),
                 use_land_water_input=bool(getattr(hyp, "use_land_water_input", False)),
                 use_shoreline_prior_loss=bool(getattr(hyp, "use_shoreline_prior_loss", False)),
@@ -317,6 +320,7 @@ class YOLODataset(BaseDataset):
             Format(
                 bbox_format="xywh",
                 normalize=True,
+                channel_scale_factors=self.band_scale_factors,
                 return_mask=self.use_segments,
                 return_keypoint=self.use_keypoints,
                 return_obb=self.use_obb,
