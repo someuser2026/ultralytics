@@ -9,11 +9,20 @@ import json
 import os
 import shutil
 from pathlib import Path
+from typing import Any
 
 import torch
+import yaml
 
 from ultralytics import YOLO
 from ultralytics.utils.callbacks.wb import _prediction_json_payload, _prediction_result_key
+
+try:
+    import wandb as wb
+
+    assert hasattr(wb, "__version__")
+except (ImportError, AssertionError):
+    wb = None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -23,8 +32,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--site-name", required=True, help="Site name under $SCRATCH/data_processed/<site_name>")
     parser.add_argument("--img-dir", required=True, help="Relative directory under $SCRATCH/data_processed/<site>/PSScene")
     parser.add_argument("--imgsz", type=int, default=640, help="Starting inference image size")
-    parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
+    parser.add_argument("--conf", type=float, default=0.01, help="Confidence threshold")
+    parser.add_argument("--iou", type=float, default=0.45, help="IoU threshold for NMS")
+    parser.add_argument("--max-det", type=int, default=None, help="Optional cap on detections per image")
+    parser.add_argument("--batch", type=int, default=None, help="Optional batch-size override for directory mode.")
     parser.add_argument("--device", default="0", help="Inference device, e.g. 0, 0,1, or cpu")
+    parser.add_argument(
+        "--predict-mode",
+        choices=("per-image", "directory"),
+        default="per-image",
+        help="Use one predict call per image or one predict call on the whole image directory.",
+    )
+    parser.add_argument(
+        "--wandb",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to upload the prediction directory to a sibling W&B inference run.",
+    )
+    parser.add_argument(
+        "--wandb-run-id",
+        type=str,
+        default=None,
+        help="Optional W&B run ID to resume instead of creating a sibling inference run.",
+    )
     return parser.parse_args(argv)
 
 
@@ -92,6 +122,100 @@ def resolve_source_root(source_root: str | Path | list[Path] | tuple[Path, ...] 
     return Path(source_root) if source_root is not None else None
 
 
+def load_saved_args(run_dir: str | Path) -> dict[str, Any]:
+    """Load args.yaml from a run directory when it exists."""
+    args_path = Path(run_dir) / "args.yaml"
+    if not args_path.is_file():
+        return {}
+
+    data = yaml.safe_load(args_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected a mapping in {args_path}, but found {type(data).__name__}.")
+    return data
+
+
+def clean_wandb_project_name(project_path: str | Path | None, task: str | None) -> str:
+    """Match the training-side W&B project cleaning logic from the existing callback."""
+    if not project_path:
+        return "Ultralytics"
+
+    proj_name_parts = str(project_path).split("/")
+    required_parts = [part for part in proj_name_parts if "imgsz" in part]
+    if task:
+        required_parts.append(str(task))
+    if proj_name_parts and proj_name_parts[-1]:
+        required_parts.append(proj_name_parts[-1])
+
+    project_cleaned = "-".join(required_parts) if required_parts else "Ultralytics"
+    return project_cleaned.replace("yolo", "")
+
+
+def build_wandb_context(ckpt: Path, task: str) -> dict[str, Any]:
+    """Resolve W&B run context from the checkpoint layout and saved args."""
+    run_dir = ckpt.parent.parent
+    saved_args = load_saved_args(run_dir)
+    project_value = saved_args.get("project")
+    project_path = Path(project_value) if project_value not in (None, "") else run_dir.parent
+    return {
+        "weights_path": ckpt,
+        "run_dir": run_dir,
+        "run_name": run_dir.name,
+        "saved_args": saved_args,
+        "project_path": project_path,
+        "task": saved_args.get("task") or task,
+        "wandb_project": clean_wandb_project_name(project_path, saved_args.get("task") or task),
+    }
+
+
+def initialize_wandb_run(context: dict[str, Any], *, wandb_run_id: str | None = None, wandb_module=None):
+    """Create a sibling inference run or resume the original run when an explicit run ID is provided."""
+    wandb_module = wandb_module or wb
+    if wandb_module is None:
+        raise RuntimeError("wandb is not installed or unavailable in this environment.")
+
+    requested_name = context["run_name"] if wandb_run_id else f"{context['run_name']}_inference"
+    config = {
+        "weights": str(context["weights_path"]),
+        "source_run_name": context["run_name"],
+        "source_run_dir": str(context["run_dir"]),
+        "source_project_path": str(context["project_path"]),
+        "inference_export": True,
+        "resumed_original_run": bool(wandb_run_id),
+    }
+    init_kwargs = {
+        "project": context["wandb_project"],
+        "name": requested_name,
+        "config": config,
+    }
+    if wandb_run_id:
+        init_kwargs["id"] = wandb_run_id
+        init_kwargs["resume"] = "must"
+
+    run = wandb_module.init(**init_kwargs)
+    active_run_name = getattr(run, "name", None) or requested_name
+    return run, active_run_name
+
+
+def log_predictions(pred_dir: str | Path, run_name: str, site_name: str, img_dir_slug: str, wandb_module=None) -> bool:
+    """Upload one site prediction directory to W&B while keeping the local export on disk."""
+    wandb_module = wandb_module or wb
+    if wandb_module is None:
+        raise RuntimeError("wandb is not installed or unavailable in this environment.")
+
+    pred_dir = Path(pred_dir)
+    if not pred_dir.exists():
+        raise RuntimeError(f"Prediction directory does not exist: {pred_dir}")
+
+    artifact_name = f"{run_name}_predictions_site_{site_name}_{img_dir_slug}"
+    artifact_type = "predictions_site"
+    artifact = wandb_module.Artifact(artifact_name, type=artifact_type)
+    artifact.add_dir(str(pred_dir))
+    logged_artifact = wandb_module.log_artifact(artifact)
+    if hasattr(logged_artifact, "wait"):
+        logged_artifact.wait()
+    return True
+
+
 class PredictionJsonWriter:
     """Stream prediction records to disk so large folder runs do not accumulate Results in RAM."""
 
@@ -148,6 +272,98 @@ class PredictionJsonWriter:
         self._closed = True
 
 
+def build_predict_kwargs(
+    args: argparse.Namespace,
+    *,
+    output_dir: Path,
+    run_name: str,
+    use_half: bool,
+    max_det: int,
+    batch: int | None,
+) -> dict[str, Any]:
+    """Build kwargs for YOLO.predict."""
+    predict_kwargs = {
+        "project": str(output_dir),
+        "name": run_name,
+        "exist_ok": True,
+        "save": False,
+        "stream": True,
+        "imgsz": args.imgsz,
+        "conf": args.conf,
+        "iou": args.iou,
+        "max_det": max_det,
+        "half": use_half,
+        "device": args.device,
+        "verbose": False,
+    }
+    if batch is not None:
+        predict_kwargs["batch"] = batch
+    return predict_kwargs
+
+
+def run_per_image_predictions(
+    model,
+    images: list[Path],
+    writer: PredictionJsonWriter,
+    predict_kwargs: dict[str, Any],
+) -> list[str]:
+    """Run one predict call per image and stream results into the aggregate JSON writer."""
+    failed = []
+    for index, image_path in enumerate(images, start=1):
+        try:
+            results = list(model.predict(source=str(image_path), **predict_kwargs))
+            for result in results:
+                writer.add_result(result.cpu())
+            del results
+            if getattr(model, "predictor", None) is not None:
+                model.predictor.results = None
+                model.predictor.batch = None
+        except RuntimeError as exc:
+            if is_oom_error(exc):
+                print(f"[OOM] {image_path.name}: {exc}")
+                writer.abort()
+                raise
+            print(f"[FAIL] {image_path.name}: {exc}")
+            failed.append(image_path.name)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[FAIL] {image_path.name}: {exc}")
+            failed.append(image_path.name)
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        if index % 20 == 0 or index == len(images):
+            print(f"Processed {index}/{len(images)}")
+
+    return failed
+
+
+def run_directory_predictions(
+    model,
+    image_dir: Path,
+    writer: PredictionJsonWriter,
+    predict_kwargs: dict[str, Any],
+) -> None:
+    """Run one predict call on the entire image directory and stream results into the aggregate JSON writer."""
+    processed = 0
+    try:
+        for result in model.predict(source=str(image_dir), **predict_kwargs):
+            writer.add_result(result.cpu())
+            processed += 1
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+            if processed % 20 == 0:
+                print(f"Processed {processed}")
+    except RuntimeError as exc:
+        if is_oom_error(exc):
+            print(f"[OOM] directory mode: {exc}")
+            writer.abort()
+            raise
+        raise
+
+
 def main(argv: list[str] | None = None) -> Path:
     """Run prediction and write one aggregate JSON output directory."""
     args = parse_args(argv)
@@ -163,6 +379,7 @@ def main(argv: list[str] | None = None) -> Path:
 
     run_name = derive_run_name(ckpt)
     task = derive_task(ckpt)
+    max_det = args.max_det if args.max_det is not None else (100 if task == "segment" else 300)
     image_dir = resolve_image_dir(scratch, args.site_name, args.img_dir)
     if not image_dir.is_dir():
         raise FileNotFoundError(f"Image directory not found: {image_dir}")
@@ -176,6 +393,15 @@ def main(argv: list[str] | None = None) -> Path:
 
     model = YOLO(str(ckpt))
     use_half = args.device != "cpu" and torch.cuda.is_available()
+    batch = args.batch if args.predict_mode == "directory" else 1
+    predict_kwargs = build_predict_kwargs(
+        args,
+        output_dir=output_dir,
+        run_name=run_name,
+        use_half=use_half,
+        max_det=max_det,
+        batch=batch,
+    )
     writer = PredictionJsonWriter(output_dir, source_root=image_dir)
 
     print(f"Images: {len(images)}")
@@ -184,54 +410,35 @@ def main(argv: list[str] | None = None) -> Path:
     print(f"Run: {run_name}")
     print(f"Input: {image_dir}")
     print(f"Output: {output_dir}")
+    print(f"Predict mode: {args.predict_mode}")
     print(f"Device: {args.device}, half={use_half}")
+    print(f"NMS: conf={args.conf}, iou={args.iou}, max_det={max_det}")
+    print(f"Batch: {batch}")
+    print(f"W&B upload: {args.wandb}")
 
     failed = []
+    wandb_run = None
+    active_run_name = run_name
+
+    if args.wandb:
+        context = build_wandb_context(ckpt, task)
+        wandb_run, active_run_name = initialize_wandb_run(context, wandb_run_id=args.wandb_run_id)
 
     try:
-        for index, image_path in enumerate(images, start=1):
-            try:
-                with torch.inference_mode():
-                    results = list(
-                        model.predict(
-                            source=str(image_path),
-                            project=str(output_dir),
-                            name=run_name,
-                            exist_ok=True,
-                            save=False,
-                            stream=True,
-                            batch=1,
-                            imgsz=args.imgsz,
-                            conf=args.conf,
-                            half=use_half,
-                            device=args.device,
-                            verbose=False,
-                        )
-                    )
-                for result in results:
-                    writer.add_result(result)
-                del results
-            except RuntimeError as exc:
-                if is_oom_error(exc):
-                    print(f"[OOM] {image_path.name}: {exc}")
-                    writer.abort()
-                    raise
-
-                print(f"[FAIL] {image_path.name}: {exc}")
-                failed.append(image_path.name)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[FAIL] {image_path.name}: {exc}")
-                failed.append(image_path.name)
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-
-            if index % 20 == 0 or index == len(images):
-                print(f"Processed {index}/{len(images)}")
+        if args.predict_mode == "directory":
+            run_directory_predictions(model, image_dir, writer, predict_kwargs)
+        else:
+            failed = run_per_image_predictions(model, images, writer, predict_kwargs)
     except Exception:
         writer.abort()
         raise
+    finally:
+        if getattr(model, "predictor", None) is not None:
+            model.predictor.results = None
+            model.predictor.batch = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
     predictions_json = writer.close()
 
@@ -242,6 +449,14 @@ def main(argv: list[str] | None = None) -> Path:
         failure_log = output_dir / "failed_images.txt"
         failure_log.write_text("\n".join(failed) + "\n", encoding="utf-8")
         print(f"Failure log: {failure_log}")
+
+    try:
+        if args.wandb:
+            log_predictions(output_dir, active_run_name, args.site_name, slugify_img_dir(args.img_dir))
+            print(f"W&B artifact logged for: {output_dir}")
+    finally:
+        if wandb_run is not None and hasattr(wandb_run, "finish"):
+            wandb_run.finish()
 
     return output_dir
 

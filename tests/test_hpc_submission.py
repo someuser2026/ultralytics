@@ -635,6 +635,11 @@ def test_site_prediction_submitter_passes_site_and_img_dir(tmp_path: Path) -> No
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["QSUB_LOG"] = str(qsub_log)
+    env["PREDICT_MODE"] = "directory"
+    env["WANDB"] = "false"
+    env["BATCH"] = "2"
+    env["IOU"] = "0.55"
+    env["MAX_DET"] = "77"
 
     subprocess.run(
         [
@@ -682,7 +687,12 @@ def test_site_prediction_submitter_passes_site_and_img_dir(tmp_path: Path) -> No
     assert vars_map["IMG_DIR"] == "visual/pngs/images_c448_ov35_kf20"
     assert vars_map["IMGSZ"] == "512"
     assert vars_map["CONF"] == "0.33"
+    assert vars_map["IOU"] == "0.55"
+    assert vars_map["MAX_DET"] == "77"
+    assert vars_map["BATCH"] == "2"
     assert vars_map["DEVICE"] == "cpu"
+    assert vars_map["PREDICT_MODE"] == "directory"
+    assert vars_map["WANDB"] == "false"
 
     assert "[DRY RUN] qsub -V -v" in dry_run.stdout
     assert len(_parse_call_log(qsub_log)) == 1

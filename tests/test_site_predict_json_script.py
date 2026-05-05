@@ -58,9 +58,66 @@ class FakeYOLO:
     def predict(self, source, stream: bool = True, **kwargs):
         image_path = Path(source)
         self.predict_calls.append({"source": source, "stream": stream, "kwargs": kwargs})
+        if image_path.is_dir():
+            results = []
+            for child in sorted(image_path.iterdir()):
+                if not child.is_file() or child.suffix.lower() != ".png":
+                    continue
+                if child.name in self.failures:
+                    raise self.failures[child.name]
+                results.append(make_obb_result(child))
+            return results
         if image_path.name in self.failures:
             raise self.failures[image_path.name]
         return [make_obb_result(image_path)]
+
+
+class FakeLoggedArtifact:
+    def wait(self):
+        """Mirror the W&B artifact wait API."""
+
+
+class FakeArtifact:
+    def __init__(self, name: str, artifact_type: str):
+        self.name = name
+        self.type = artifact_type
+        self.added_dirs = []
+
+    def add_dir(self, path: str):
+        self.added_dirs.append(Path(path))
+
+
+class FakeRun:
+    def __init__(self, name: str):
+        self.name = name
+        self.finished = False
+
+    def finish(self):
+        self.finished = True
+
+
+class FakeWandb:
+    __version__ = "0.test"
+
+    def __init__(self):
+        self.init_calls = []
+        self.artifacts = []
+        self.logged_artifacts = []
+        self.run = None
+
+    def init(self, **kwargs):
+        self.init_calls.append(kwargs)
+        self.run = FakeRun(kwargs.get("name", "unnamed"))
+        return self.run
+
+    def Artifact(self, name: str, type: str):
+        artifact = FakeArtifact(name, type)
+        self.artifacts.append(artifact)
+        return artifact
+
+    def log_artifact(self, artifact):
+        self.logged_artifacts.append(artifact)
+        return FakeLoggedArtifact()
 
 
 def test_derive_run_name_and_task_from_checkpoint(inference_module, tmp_path: Path):
@@ -116,6 +173,7 @@ def test_main_writes_aggregate_predictions_json_without_txt_outputs(inference_mo
             "Treachery",
             "--img-dir",
             "visual/pngs/images_c448_ov35_kf20",
+            "--no-wandb",
         ]
     )
 
@@ -128,6 +186,38 @@ def test_main_writes_aggregate_predictions_json_without_txt_outputs(inference_mo
     assert list(output_dir.rglob("*.txt")) == []
     assert not (output_dir / "failed_images.txt").exists()
     assert len(fake_model.predict_calls) == 2
+    assert fake_model.predict_calls[0]["kwargs"]["conf"] == 0.01
+    assert fake_model.predict_calls[0]["kwargs"]["iou"] == 0.45
+    assert fake_model.predict_calls[0]["kwargs"]["max_det"] == 300
+
+
+def test_main_defaults_segment_runs_to_lower_max_det(inference_module, tmp_path: Path, monkeypatch):
+    scratch = tmp_path / "scratch"
+    image_dir = scratch / "data_processed" / "Arrifana" / "PSScene" / "tiles"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    (image_dir / "a.png").write_bytes(b"")
+
+    weights_path = write_run_layout(tmp_path, task="segment", run_name="demo_run")
+    fake_model = FakeYOLO(str(weights_path))
+
+    monkeypatch.setenv("SCRATCH", str(scratch))
+    monkeypatch.setattr(inference_module, "YOLO", lambda weights: fake_model)
+    monkeypatch.setattr(inference_module.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(inference_module.torch.cuda, "empty_cache", lambda: None)
+
+    inference_module.main(
+        [
+            "--ckpt",
+            str(weights_path),
+            "--site-name",
+            "Arrifana",
+            "--img-dir",
+            "tiles",
+            "--no-wandb",
+        ]
+    )
+
+    assert fake_model.predict_calls[0]["kwargs"]["max_det"] == 100
 
 
 def test_main_logs_failed_images_and_keeps_successful_json(inference_module, tmp_path: Path, monkeypatch):
@@ -153,6 +243,7 @@ def test_main_logs_failed_images_and_keeps_successful_json(inference_module, tmp
             "Shipstern",
             "--img-dir",
             "tiles",
+            "--no-wandb",
         ]
     )
 
@@ -188,5 +279,48 @@ def test_main_raises_immediately_on_oom(inference_module, tmp_path: Path, monkey
                 "Shipstern",
                 "--img-dir",
                 "tiles",
+                "--no-wandb",
             ]
         )
+
+
+def test_directory_mode_and_wandb_upload(inference_module, tmp_path: Path, monkeypatch):
+    scratch = tmp_path / "scratch"
+    image_dir = scratch / "data_processed" / "Arrifana" / "PSScene" / "tiles"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    (image_dir / "a.png").write_bytes(b"")
+    (image_dir / "b.png").write_bytes(b"")
+
+    weights_path = write_run_layout(tmp_path, task="segment", run_name="demo_run")
+    fake_model = FakeYOLO(str(weights_path))
+    fake_wandb = FakeWandb()
+
+    monkeypatch.setenv("SCRATCH", str(scratch))
+    monkeypatch.setattr(inference_module, "YOLO", lambda weights: fake_model)
+    monkeypatch.setattr(inference_module, "wb", fake_wandb)
+    monkeypatch.setattr(inference_module.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(inference_module.torch.cuda, "empty_cache", lambda: None)
+
+    output_dir = inference_module.main(
+        [
+            "--ckpt",
+            str(weights_path),
+            "--site-name",
+            "Arrifana",
+            "--img-dir",
+            "tiles",
+            "--predict-mode",
+            "directory",
+            "--batch",
+            "2",
+        ]
+    )
+
+    assert len(fake_model.predict_calls) == 1
+    assert fake_model.predict_calls[0]["source"] == str(image_dir)
+    assert fake_model.predict_calls[0]["kwargs"]["batch"] == 2
+    assert fake_model.predict_calls[0]["kwargs"]["conf"] == 0.01
+    assert fake_wandb.init_calls[0]["name"] == "demo_run_inference"
+    assert fake_wandb.artifacts[0].type == "predictions_site"
+    assert fake_wandb.artifacts[0].added_dirs == [output_dir]
+    assert fake_wandb.run.finished is True

@@ -57,8 +57,14 @@ checkpoint="${CHECKPOINT:-}"
 site_name="${SITE_NAME:-}"
 img_dir="${IMG_DIR:-}"
 imgsz="${IMGSZ:-640}"
-conf="${CONF:-0.25}"
+conf="${CONF:-0.01}"
+iou="${IOU:-0.45}"
+max_det="${MAX_DET:-}"
+batch="${BATCH:-}"
 device="${DEVICE:-0}"
+predict_mode="${PREDICT_MODE:-per-image}"
+wandb="${WANDB:-true}"
+wandb_run_id="${WANDB_RUN_ID:-}"
 script_path="jobs/infer/yolo_site_predict_json.py"
 
 missing_params=()
@@ -106,7 +112,17 @@ cmd_args=(
 )
 append_arg "--imgsz" "${imgsz}"
 append_arg "--conf" "${conf}"
+append_arg "--iou" "${iou}"
+append_arg "--max-det" "${max_det}"
+append_arg "--batch" "${batch}"
 append_arg "--device" "${device}"
+append_arg "--predict-mode" "${predict_mode}"
+append_arg "--wandb-run-id" "${wandb_run_id}"
+if [[ "${wandb}" == "false" || "${wandb}" == "0" || "${wandb}" == "no" ]]; then
+    cmd_args+=("--no-wandb")
+else
+    cmd_args+=("--wandb")
+fi
 
 printf 'Command: python3 %q' "${script_path}"
 for arg in "${cmd_args[@]}"; do
