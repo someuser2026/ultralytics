@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import gc
+import json
 import os
+import shutil
 from pathlib import Path
 
 import torch
 
 from ultralytics import YOLO
-from ultralytics.utils.callbacks.wb import _save_predictions_json
+from ultralytics.utils.callbacks.wb import _prediction_json_payload, _prediction_result_key
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -82,6 +85,69 @@ def list_input_images(img_dir: Path) -> list[Path]:
     return sorted(path for path in img_dir.iterdir() if path.is_file() and path.suffix.lower() == ".png")
 
 
+def resolve_source_root(source_root: str | Path | list[Path] | tuple[Path, ...] | None) -> Path | None:
+    """Normalize source_root to the same shape used by the aggregate JSON helpers."""
+    if isinstance(source_root, (list, tuple)):
+        return next((Path(item) for item in source_root if item is not None), None)
+    return Path(source_root) if source_root is not None else None
+
+
+class PredictionJsonWriter:
+    """Stream prediction records to disk so large folder runs do not accumulate Results in RAM."""
+
+    def __init__(self, output_dir: str | Path, source_root=None):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.source_root = resolve_source_root(source_root)
+        self.entries_tmp_path = self.output_dir / ".predictions_entries.tmp"
+        self.used_keys: set[str] = set()
+        self.count = 0
+        self.first = True
+        self._closed = False
+        self._entries_handle = self.entries_tmp_path.open("w", encoding="utf-8")
+
+    def add_result(self, result) -> None:
+        """Serialize one prediction result directly to the temp entries file."""
+        key = _prediction_result_key(result, self.source_root, self.count, self.used_keys)
+        payload = _prediction_json_payload(result)
+        if not self.first:
+            self._entries_handle.write(",\n")
+        self._entries_handle.write(json.dumps(key))
+        self._entries_handle.write(": ")
+        json.dump(payload, self._entries_handle, indent=2)
+        self.first = False
+        self.count += 1
+
+    def close(self) -> Path:
+        """Build the final predictions.json and remove temporary files."""
+        if self._closed:
+            return self.output_dir / "predictions.json"
+
+        self._entries_handle.close()
+        final_path = self.output_dir / "predictions.json"
+        with final_path.open("w", encoding="utf-8") as handle:
+            handle.write("{\n")
+            handle.write(f'  "count": {self.count},\n')
+            handle.write('  "predictions": {\n')
+            with self.entries_tmp_path.open("r", encoding="utf-8") as entries:
+                shutil.copyfileobj(entries, handle)
+            if not self.first:
+                handle.write("\n")
+            handle.write("  }\n")
+            handle.write("}\n")
+
+        self.entries_tmp_path.unlink(missing_ok=True)
+        self._closed = True
+        return final_path
+
+    def abort(self) -> None:
+        """Remove partial temp output after a fatal error."""
+        if not self._entries_handle.closed:
+            self._entries_handle.close()
+        self.entries_tmp_path.unlink(missing_ok=True)
+        self._closed = True
+
+
 def main(argv: list[str] | None = None) -> Path:
     """Run prediction and write one aggregate JSON output directory."""
     args = parse_args(argv)
@@ -110,6 +176,7 @@ def main(argv: list[str] | None = None) -> Path:
 
     model = YOLO(str(ckpt))
     use_half = args.device != "cpu" and torch.cuda.is_available()
+    writer = PredictionJsonWriter(output_dir, source_root=image_dir)
 
     print(f"Images: {len(images)}")
     print(f"Site: {args.site_name}")
@@ -119,48 +186,54 @@ def main(argv: list[str] | None = None) -> Path:
     print(f"Output: {output_dir}")
     print(f"Device: {args.device}, half={use_half}")
 
-    all_results = []
     failed = []
 
-    for index, image_path in enumerate(images, start=1):
-        try:
-            with torch.inference_mode():
-                results = list(
-                    model.predict(
-                        source=str(image_path),
-                        project=str(output_dir),
-                        name=run_name,
-                        exist_ok=True,
-                        save=False,
-                        stream=True,
-                        batch=1,
-                        imgsz=args.imgsz,
-                        conf=args.conf,
-                        half=use_half,
-                        device=args.device,
-                        verbose=False,
+    try:
+        for index, image_path in enumerate(images, start=1):
+            try:
+                with torch.inference_mode():
+                    results = list(
+                        model.predict(
+                            source=str(image_path),
+                            project=str(output_dir),
+                            name=run_name,
+                            exist_ok=True,
+                            save=False,
+                            stream=True,
+                            batch=1,
+                            imgsz=args.imgsz,
+                            conf=args.conf,
+                            half=use_half,
+                            device=args.device,
+                            verbose=False,
+                        )
                     )
-                )
-            all_results.extend(results)
-        except RuntimeError as exc:
-            if is_oom_error(exc):
-                print(f"[OOM] {image_path.name}: {exc}")
-                raise
+                for result in results:
+                    writer.add_result(result)
+                del results
+            except RuntimeError as exc:
+                if is_oom_error(exc):
+                    print(f"[OOM] {image_path.name}: {exc}")
+                    writer.abort()
+                    raise
 
-            print(f"[FAIL] {image_path.name}: {exc}")
-            failed.append(image_path.name)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[FAIL] {image_path.name}: {exc}")
-            failed.append(image_path.name)
+                print(f"[FAIL] {image_path.name}: {exc}")
+                failed.append(image_path.name)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[FAIL] {image_path.name}: {exc}")
+                failed.append(image_path.name)
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
 
-        if index % 20 == 0 or index == len(images):
-            print(f"Processed {index}/{len(images)}")
+            if index % 20 == 0 or index == len(images):
+                print(f"Processed {index}/{len(images)}")
+    except Exception:
+        writer.abort()
+        raise
 
-    _save_predictions_json(all_results, output_dir, source_root=image_dir)
-    predictions_json = output_dir / "predictions.json"
+    predictions_json = writer.close()
 
     print("Done")
     print(f"Predictions json: {predictions_json}")
