@@ -56,8 +56,16 @@ class FakeYOLO:
         self.predict_calls = []
 
     def predict(self, source, stream: bool = True, **kwargs):
-        image_path = Path(source)
         self.predict_calls.append({"source": source, "stream": stream, "kwargs": kwargs})
+        if isinstance(source, list):
+            results = []
+            for item in source:
+                child = Path(item)
+                if child.name in self.failures:
+                    raise self.failures[child.name]
+                results.append(make_obb_result(child))
+            return results
+        image_path = Path(source)
         if image_path.is_dir():
             results = []
             for child in sorted(image_path.iterdir()):
@@ -324,3 +332,126 @@ def test_directory_mode_and_wandb_upload(inference_module, tmp_path: Path, monke
     assert fake_wandb.artifacts[0].type == "predictions_site"
     assert fake_wandb.artifacts[0].added_dirs == [output_dir]
     assert fake_wandb.run.finished is True
+
+
+def test_main_job_batch_writes_to_batch_subdir(inference_module, tmp_path: Path, monkeypatch):
+    scratch = tmp_path / "scratch"
+    image_dir = scratch / "data_processed" / "Treachery" / "PSScene" / "tiles"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("a.png", "b.png", "c.png"):
+        (image_dir / name).write_bytes(b"")
+
+    weights_path = write_run_layout(tmp_path, task="obb", run_name="demo_run")
+    fake_model = FakeYOLO(str(weights_path))
+
+    monkeypatch.setenv("SCRATCH", str(scratch))
+    monkeypatch.setattr(inference_module, "YOLO", lambda weights: fake_model)
+    monkeypatch.setattr(inference_module.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(inference_module.torch.cuda, "empty_cache", lambda: None)
+
+    output_dir = inference_module.main(
+        [
+            "--ckpt",
+            str(weights_path),
+            "--site-name",
+            "Treachery",
+            "--img-dir",
+            "tiles",
+            "--job-batch-index",
+            "1",
+            "--job-batch-start",
+            "0",
+            "--job-batch-end",
+            "2",
+            "--no-wandb",
+        ]
+    )
+
+    payload = json.loads((output_dir / "predictions.json").read_text(encoding="utf-8"))
+
+    assert output_dir.name == "batch_1"
+    assert output_dir.parent.name == "demo_run__tiles"
+    assert payload["count"] == 2
+    assert set(payload["predictions"]) == {"a", "b"}
+    assert [Path(call["source"]).name for call in fake_model.predict_calls] == ["a.png", "b.png"]
+
+
+def test_directory_mode_job_batch_predicts_only_selected_subset(inference_module, tmp_path: Path, monkeypatch):
+    scratch = tmp_path / "scratch"
+    image_dir = scratch / "data_processed" / "Arrifana" / "PSScene" / "tiles"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("a.png", "b.png", "c.png"):
+        (image_dir / name).write_bytes(b"")
+
+    weights_path = write_run_layout(tmp_path, task="segment", run_name="demo_run")
+    fake_model = FakeYOLO(str(weights_path))
+
+    monkeypatch.setenv("SCRATCH", str(scratch))
+    monkeypatch.setattr(inference_module, "YOLO", lambda weights: fake_model)
+    monkeypatch.setattr(inference_module.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(inference_module.torch.cuda, "empty_cache", lambda: None)
+
+    output_dir = inference_module.main(
+        [
+            "--ckpt",
+            str(weights_path),
+            "--site-name",
+            "Arrifana",
+            "--img-dir",
+            "tiles",
+            "--predict-mode",
+            "directory",
+            "--batch",
+            "2",
+            "--job-batch-index",
+            "2",
+            "--job-batch-start",
+            "1",
+            "--job-batch-end",
+            "3",
+            "--no-wandb",
+        ]
+    )
+
+    payload = json.loads((output_dir / "predictions.json").read_text(encoding="utf-8"))
+
+    assert output_dir.name == "batch_2"
+    assert len(fake_model.predict_calls) == 1
+    assert fake_model.predict_calls[0]["source"] == [str(image_dir / "b.png"), str(image_dir / "c.png")]
+    assert fake_model.predict_calls[0]["kwargs"]["batch"] == 2
+    assert payload["count"] == 2
+    assert set(payload["predictions"]) == {"b", "c"}
+
+
+def test_main_rejects_invalid_job_batch_slice(inference_module, tmp_path: Path, monkeypatch):
+    scratch = tmp_path / "scratch"
+    image_dir = scratch / "data_processed" / "Shipstern" / "PSScene" / "tiles"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    (image_dir / "a.png").write_bytes(b"")
+
+    weights_path = write_run_layout(tmp_path, task="obb", run_name="demo_run")
+    fake_model = FakeYOLO(str(weights_path))
+
+    monkeypatch.setenv("SCRATCH", str(scratch))
+    monkeypatch.setattr(inference_module, "YOLO", lambda weights: fake_model)
+    monkeypatch.setattr(inference_module.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(inference_module.torch.cuda, "empty_cache", lambda: None)
+
+    with pytest.raises(ValueError, match="must be greater than --job-batch-start"):
+        inference_module.main(
+            [
+                "--ckpt",
+                str(weights_path),
+                "--site-name",
+                "Shipstern",
+                "--img-dir",
+                "tiles",
+                "--job-batch-index",
+                "1",
+                "--job-batch-start",
+                "1",
+                "--job-batch-end",
+                "1",
+                "--no-wandb",
+            ]
+        )

@@ -65,6 +65,9 @@ device="${DEVICE:-0}"
 predict_mode="${PREDICT_MODE:-per-image}"
 wandb="${WANDB:-true}"
 wandb_run_id="${WANDB_RUN_ID:-}"
+job_batch_index="${JOB_BATCH_INDEX:-}"
+job_batch_start="${JOB_BATCH_START:-}"
+job_batch_end="${JOB_BATCH_END:-}"
 script_path="jobs/infer/yolo_site_predict_json.py"
 
 missing_params=()
@@ -103,6 +106,11 @@ fi
 echo "Final Python: $(which python3)"
 echo "Final Python version: $(python3 --version 2>&1)"
 echo "Current environment: ${CONDA_DEFAULT_ENV:-system}"
+if ! is_nullish "${job_batch_index}" || ! is_nullish "${job_batch_start}" || ! is_nullish "${job_batch_end}"; then
+    echo "Job batch index: ${job_batch_index:-unset}"
+    echo "Job batch start: ${job_batch_start:-unset}"
+    echo "Job batch end: ${job_batch_end:-unset}"
+fi
 echo "========================================="
 
 cmd_args=(
@@ -118,6 +126,9 @@ append_arg "--batch" "${batch}"
 append_arg "--device" "${device}"
 append_arg "--predict-mode" "${predict_mode}"
 append_arg "--wandb-run-id" "${wandb_run_id}"
+append_arg "--job-batch-index" "${job_batch_index}"
+append_arg "--job-batch-start" "${job_batch_start}"
+append_arg "--job-batch-end" "${job_batch_end}"
 if [[ "${wandb}" == "false" || "${wandb}" == "0" || "${wandb}" == "no" ]]; then
     cmd_args+=("--no-wandb")
 else

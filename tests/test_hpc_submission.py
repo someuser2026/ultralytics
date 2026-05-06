@@ -696,3 +696,74 @@ def test_site_prediction_submitter_passes_site_and_img_dir(tmp_path: Path) -> No
 
     assert "[DRY RUN] qsub -V -v" in dry_run.stdout
     assert len(_parse_call_log(qsub_log)) == 1
+
+
+def test_site_prediction_submitter_splits_batches_into_multiple_jobs(tmp_path: Path) -> None:
+    """Smoke-test batched PBS submission for site prediction export."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{\n"
+        "  echo CALL\n"
+        "  for arg in \"$@\"; do\n"
+        "    printf '%s\\n' \"$arg\"\n"
+        "  done\n"
+        "  echo END\n"
+        "} >> \"$QSUB_LOG\"\n",
+    )
+
+    scratch = tmp_path / "scratch"
+    checkpoint = scratch / "runs" / "cuda" / "obb" / "imgsz_448" / "yolo" / "project_x" / "demo_run" / "weights" / "best.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_bytes(b"weights")
+
+    image_dir = scratch / "data_processed" / "Treachery" / "PSScene" / "visual" / "pngs" / "images_c448_ov35_kf20"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("a.png", "b.png", "c.png", "d.png", "e.png"):
+        (image_dir / name).write_bytes(b"")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["QSUB_LOG"] = str(qsub_log)
+    env["SCRATCH"] = str(scratch)
+    env["PREDICT_MODE"] = "directory"
+    env["WANDB"] = "true"
+    env["BATCH"] = "4"
+    env["JOB_BATCH_SIZE"] = "2"
+
+    subprocess.run(
+        [
+            "bash",
+            "jobs/infer/hpc/submit_yolo_site_predict_json.sh",
+            str(checkpoint),
+            "Treachery",
+            "visual/pngs/images_c448_ov35_kf20",
+            "512",
+            "0.33",
+            "cpu",
+            "0",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == 3
+
+    expected_ranges = [("1", "0", "2"), ("2", "2", "4"), ("3", "4", "5")]
+    for call, (batch_index, batch_start, batch_end) in zip(calls, expected_ranges):
+        vars_map = _parse_varlist(call)
+        assert call[-1] == "jobs/infer/hpc/yolo_site_predict_json.pbs"
+        assert call[call.index("-N") + 1] == f"demo_run_Treachery_b{batch_index}"
+        assert vars_map["IMG_DIR"] == "visual/pngs/images_c448_ov35_kf20"
+        assert vars_map["BATCH"] == "4"
+        assert vars_map["WANDB"] == "false"
+        assert vars_map["JOB_BATCH_INDEX"] == batch_index
+        assert vars_map["JOB_BATCH_START"] == batch_start
+        assert vars_map["JOB_BATCH_END"] == batch_end

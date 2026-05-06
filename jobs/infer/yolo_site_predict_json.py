@@ -55,6 +55,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional W&B run ID to resume instead of creating a sibling inference run.",
     )
+    parser.add_argument("--job-batch-index", type=int, default=None, help="Optional 1-based batch index for job splitting.")
+    parser.add_argument(
+        "--job-batch-start",
+        type=int,
+        default=None,
+        help="Optional inclusive start index into the sorted PNG list for job splitting.",
+    )
+    parser.add_argument(
+        "--job-batch-end",
+        type=int,
+        default=None,
+        help="Optional exclusive end index into the sorted PNG list for job splitting.",
+    )
     return parser.parse_args(argv)
 
 
@@ -104,15 +117,68 @@ def resolve_image_dir(scratch: str | Path, site_name: str, img_dir: str) -> Path
     return Path(scratch) / "data_processed" / site_name / "PSScene" / validate_img_dir(img_dir)
 
 
-def derive_output_dir(scratch: str | Path, site_name: str, task: str, run_name: str, img_dir: str) -> Path:
+def derive_output_dir(
+    scratch: str | Path,
+    site_name: str,
+    task: str,
+    run_name: str,
+    img_dir: str,
+    *,
+    batch_index: int | None = None,
+) -> Path:
     """Derive the output directory that will contain predictions.json."""
     folder_name = f"{run_name}__{slugify_img_dir(img_dir)}"
-    return Path(scratch) / "data_processed" / site_name / "predictions" / task / folder_name
+    output_dir = Path(scratch) / "data_processed" / site_name / "predictions" / task / folder_name
+    if batch_index is not None:
+        if batch_index < 1:
+            raise ValueError(f"batch_index must be >= 1, got: {batch_index}")
+        output_dir = output_dir / f"batch_{batch_index}"
+    return output_dir
 
 
 def list_input_images(img_dir: Path) -> list[Path]:
     """Return sorted top-level PNG files in the image directory."""
     return sorted(path for path in img_dir.iterdir() if path.is_file() and path.suffix.lower() == ".png")
+
+
+def resolve_job_batch(
+    args: argparse.Namespace,
+    images: list[Path],
+    *,
+    scratch: str | Path,
+    site_name: str,
+    task: str,
+    run_name: str,
+    img_dir: str,
+) -> tuple[list[Path], Path]:
+    """Validate optional job-batch arguments and return the selected images/output dir."""
+    batch_fields = (args.job_batch_index, args.job_batch_start, args.job_batch_end)
+    if all(value is None for value in batch_fields):
+        return images, derive_output_dir(scratch, site_name, task, run_name, img_dir)
+    if any(value is None for value in batch_fields):
+        raise ValueError("job batch arguments must be provided together: --job-batch-index/start/end")
+
+    batch_index = args.job_batch_index
+    batch_start = args.job_batch_start
+    batch_end = args.job_batch_end
+    if batch_index is None or batch_start is None or batch_end is None:
+        raise ValueError("job batch arguments must not be None once provided")
+    if batch_index < 1:
+        raise ValueError(f"--job-batch-index must be >= 1, got: {batch_index}")
+    if batch_start < 0:
+        raise ValueError(f"--job-batch-start must be >= 0, got: {batch_start}")
+    if batch_end <= batch_start:
+        raise ValueError(
+            f"--job-batch-end must be greater than --job-batch-start, got start={batch_start}, end={batch_end}"
+        )
+    if batch_end > len(images):
+        raise ValueError(f"--job-batch-end={batch_end} exceeds image count {len(images)}")
+
+    selected_images = images[batch_start:batch_end]
+    if not selected_images:
+        raise ValueError(f"Batch slice [{batch_start}:{batch_end}] did not select any images")
+
+    return selected_images, derive_output_dir(scratch, site_name, task, run_name, img_dir, batch_index=batch_index)
 
 
 def resolve_source_root(source_root: str | Path | list[Path] | tuple[Path, ...] | None) -> Path | None:
@@ -341,14 +407,18 @@ def run_per_image_predictions(
 
 def run_directory_predictions(
     model,
-    image_dir: Path,
+    source: Path | list[Path],
     writer: PredictionJsonWriter,
     predict_kwargs: dict[str, Any],
 ) -> None:
     """Run one predict call on the entire image directory and stream results into the aggregate JSON writer."""
     processed = 0
     try:
-        for result in model.predict(source=str(image_dir), **predict_kwargs):
+        if isinstance(source, Path):
+            predict_source: str | list[str] = str(source)
+        else:
+            predict_source = [str(path) for path in source]
+        for result in model.predict(source=predict_source, **predict_kwargs):
             writer.add_result(result.cpu())
             processed += 1
             if torch.cuda.is_available():
@@ -388,7 +458,15 @@ def main(argv: list[str] | None = None) -> Path:
     if not images:
         raise RuntimeError(f"No PNG images found in {image_dir}")
 
-    output_dir = derive_output_dir(scratch, args.site_name, task, run_name, args.img_dir)
+    selected_images, output_dir = resolve_job_batch(
+        args,
+        images,
+        scratch=scratch,
+        site_name=args.site_name,
+        task=task,
+        run_name=run_name,
+        img_dir=args.img_dir,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model = YOLO(str(ckpt))
@@ -405,6 +483,7 @@ def main(argv: list[str] | None = None) -> Path:
     writer = PredictionJsonWriter(output_dir, source_root=image_dir)
 
     print(f"Images: {len(images)}")
+    print(f"Selected images: {len(selected_images)}")
     print(f"Site: {args.site_name}")
     print(f"Task: {task}")
     print(f"Run: {run_name}")
@@ -415,6 +494,11 @@ def main(argv: list[str] | None = None) -> Path:
     print(f"NMS: conf={args.conf}, iou={args.iou}, max_det={max_det}")
     print(f"Batch: {batch}")
     print(f"W&B upload: {args.wandb}")
+    if args.job_batch_index is not None:
+        print(
+            "Job batch: "
+            f"index={args.job_batch_index}, start={args.job_batch_start}, end={args.job_batch_end}"
+        )
 
     failed = []
     wandb_run = None
@@ -426,9 +510,10 @@ def main(argv: list[str] | None = None) -> Path:
 
     try:
         if args.predict_mode == "directory":
-            run_directory_predictions(model, image_dir, writer, predict_kwargs)
+            directory_source = selected_images if args.job_batch_index is not None else image_dir
+            run_directory_predictions(model, directory_source, writer, predict_kwargs)
         else:
-            failed = run_per_image_predictions(model, images, writer, predict_kwargs)
+            failed = run_per_image_predictions(model, selected_images, writer, predict_kwargs)
     except Exception:
         writer.abort()
         raise
