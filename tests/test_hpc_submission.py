@@ -767,3 +767,88 @@ def test_site_prediction_submitter_splits_batches_into_multiple_jobs(tmp_path: P
         assert vars_map["JOB_BATCH_INDEX"] == batch_index
         assert vars_map["JOB_BATCH_START"] == batch_start
         assert vars_map["JOB_BATCH_END"] == batch_end
+
+
+def test_log_predictions_submitter_passes_expected_env_vars(tmp_path: Path) -> None:
+    """Smoke-test the val/test prediction export submitter with live and dry-run flows."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{\n"
+        "  echo CALL\n"
+        "  for arg in \"$@\"; do\n"
+        "    printf '%s\\n' \"$arg\"\n"
+        "  done\n"
+        "  echo END\n"
+        "} >> \"$QSUB_LOG\"\n",
+    )
+
+    checkpoint = tmp_path / "scratch" / "runs" / "cuda" / "segment" / "imgsz_448" / "yolo" / "project_x" / "demo_run" / "weights" / "best.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_bytes(b"weights")
+
+    data_yaml = tmp_path / "scratch" / "data_processed" / "Global" / "Annotated" / "variants" / "segment" / "planet_full_c448_ov35_kf20_seed0" / "data.yaml"
+    data_yaml.parent.mkdir(parents=True, exist_ok=True)
+    data_yaml.write_text("path: .\nval: val\ntest: test\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["QSUB_LOG"] = str(qsub_log)
+    env["WANDB_RUN_ID"] = "abc123"
+
+    subprocess.run(
+        [
+            "bash",
+            "jobs/infer/hpc/submit_log_predictions_to_wandb.sh",
+            str(checkpoint),
+            str(data_yaml),
+            "cpu",
+            "2",
+            "512",
+            "0.02",
+            "0",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+    dry_run = subprocess.run(
+        [
+            "bash",
+            "jobs/infer/hpc/submit_log_predictions_to_wandb.sh",
+            str(checkpoint),
+            str(data_yaml),
+            "0",
+            "4",
+            "448",
+            "0.01",
+            "1",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == 1
+
+    call = calls[0]
+    vars_map = _parse_varlist(call)
+    assert call[-1] == "jobs/infer/hpc/log_predictions_to_wandb.pbs"
+    assert vars_map["CHECKPOINT"] == str(checkpoint)
+    assert vars_map["DATA"] == str(data_yaml)
+    assert vars_map["DEVICE"] == "cpu"
+    assert vars_map["BATCH"] == "2"
+    assert vars_map["IMGSZ"] == "512"
+    assert vars_map["CONF"] == "0.02"
+    assert vars_map["WANDB_RUN_ID"] == "abc123"
+
+    assert "[DRY RUN] qsub -V -v" in dry_run.stdout
+    assert len(_parse_call_log(qsub_log)) == 1
