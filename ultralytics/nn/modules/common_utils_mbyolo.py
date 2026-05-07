@@ -12,6 +12,13 @@ from .block import DropPath
 
 DropPath.__repr__ = lambda self: f"DropPath({self.drop_prob})"
 
+if hasattr(torch, "amp") and hasattr(torch.amp, "custom_fwd") and hasattr(torch.amp, "custom_bwd"):
+    _amp_custom_fwd = partial(torch.amp.custom_fwd, device_type="cuda")
+    _amp_custom_bwd = partial(torch.amp.custom_bwd, device_type="cuda")
+else:
+    _amp_custom_fwd = torch.cuda.amp.custom_fwd
+    _amp_custom_bwd = torch.cuda.amp.custom_bwd
+
 
 def _import_selective_scan_module(name):
     try:
@@ -174,7 +181,7 @@ class CrossMerge(torch.autograd.Function):
 class SelectiveScanCore(torch.autograd.Function):
     # comment all checks if inside cross_selective_scan
     @staticmethod
-    @torch.cuda.amp.custom_fwd
+    @_amp_custom_fwd
     def forward(ctx, u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=False, nrows=1, backnrows=1,
                 oflex=True):
         _require_selective_scan()
@@ -202,7 +209,7 @@ class SelectiveScanCore(torch.autograd.Function):
         return out
 
     @staticmethod
-    @torch.cuda.amp.custom_bwd
+    @_amp_custom_bwd
     def backward(ctx, dout, *args):
         _require_selective_scan()
         u, delta, A, B, C, D, delta_bias, x = ctx.saved_tensors

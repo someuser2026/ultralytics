@@ -2981,7 +2981,7 @@ class Format:
         flip_to_bgr = random.uniform(0, 1) > self.bgr and img.shape[0] == 3
         if flip_to_bgr:
             img = img[::-1]
-            channel_scales = channel_scales[::-1]
+            channel_scales = np.ascontiguousarray(channel_scales[::-1])
         img = torch.from_numpy(np.ascontiguousarray(img)).float()
         return img / torch.as_tensor(channel_scales[:, None, None], dtype=img.dtype)
 

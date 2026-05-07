@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from ultralytics.data.augment import Mosaic, RandomPerspective
+from ultralytics.data.augment import Format, Mosaic, RandomPerspective
 from ultralytics.utils.instance import Instances
 
 
@@ -60,3 +60,16 @@ def test_mosaic_uses_zero_canvas_fill() -> None:
 
     assert result["img"].shape == (8, 8, 3)
     assert result["img"].min() == 0
+
+
+def test_format_img_bgr_flip_keeps_channel_scales_contiguous(monkeypatch) -> None:
+    """Regression test for PyTorch rejecting negative-stride channel-scale views."""
+    monkeypatch.setattr("ultralytics.data.augment.random.uniform", lambda *_args: 1.0)
+    formatter = Format(channel_scale_factors={1: 1.0, 2: 2.0, 3: 4.0}, bgr=0.0)
+    img = np.arange(12, dtype=np.uint8).reshape(2, 2, 3)
+
+    result = formatter._format_img(img)
+
+    expected = np.ascontiguousarray(img.transpose(2, 0, 1)[::-1]).astype(np.float32)
+    expected /= np.array([4.0, 2.0, 1.0], dtype=np.float32)[:, None, None]
+    np.testing.assert_allclose(result.numpy(), expected)
