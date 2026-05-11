@@ -471,6 +471,7 @@ def main(argv: list[str] | None = None) -> Path:
 
     model = YOLO(str(ckpt))
     use_half = args.device != "cpu" and torch.cuda.is_available()
+    use_half = False
     batch = args.batch if args.predict_mode == "directory" else 1
     predict_kwargs = build_predict_kwargs(
         args,
