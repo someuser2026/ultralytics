@@ -470,9 +470,8 @@ def main(argv: list[str] | None = None) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model = YOLO(str(ckpt))
-    use_half = args.device != "cpu" and torch.cuda.is_available()
     use_half = False
-    batch = args.batch if args.predict_mode == "directory" else 1
+    batch = args.batch if args.batch is not None else (2 if args.predict_mode == "directory" else 1)
     predict_kwargs = build_predict_kwargs(
         args,
         output_dir=output_dir,

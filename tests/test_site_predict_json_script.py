@@ -197,6 +197,7 @@ def test_main_writes_aggregate_predictions_json_without_txt_outputs(inference_mo
     assert fake_model.predict_calls[0]["kwargs"]["conf"] == 0.01
     assert fake_model.predict_calls[0]["kwargs"]["iou"] == 0.45
     assert fake_model.predict_calls[0]["kwargs"]["max_det"] == 300
+    assert fake_model.predict_calls[0]["kwargs"]["half"] is False
 
 
 def test_main_defaults_segment_runs_to_lower_max_det(inference_module, tmp_path: Path, monkeypatch):
@@ -328,10 +329,44 @@ def test_directory_mode_and_wandb_upload(inference_module, tmp_path: Path, monke
     assert fake_model.predict_calls[0]["source"] == str(image_dir)
     assert fake_model.predict_calls[0]["kwargs"]["batch"] == 2
     assert fake_model.predict_calls[0]["kwargs"]["conf"] == 0.01
+    assert fake_model.predict_calls[0]["kwargs"]["half"] is False
     assert fake_wandb.init_calls[0]["name"] == "demo_run_inference"
     assert fake_wandb.artifacts[0].type == "predictions_site"
     assert fake_wandb.artifacts[0].added_dirs == [output_dir]
     assert fake_wandb.run.finished is True
+
+
+def test_directory_mode_defaults_batch_to_two(inference_module, tmp_path: Path, monkeypatch):
+    scratch = tmp_path / "scratch"
+    image_dir = scratch / "data_processed" / "Arrifana" / "PSScene" / "tiles"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    (image_dir / "a.png").write_bytes(b"")
+    (image_dir / "b.png").write_bytes(b"")
+
+    weights_path = write_run_layout(tmp_path, task="segment", run_name="demo_run")
+    fake_model = FakeYOLO(str(weights_path))
+
+    monkeypatch.setenv("SCRATCH", str(scratch))
+    monkeypatch.setattr(inference_module, "YOLO", lambda weights: fake_model)
+    monkeypatch.setattr(inference_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(inference_module.torch.cuda, "empty_cache", lambda: None)
+
+    inference_module.main(
+        [
+            "--ckpt",
+            str(weights_path),
+            "--site-name",
+            "Arrifana",
+            "--img-dir",
+            "tiles",
+            "--predict-mode",
+            "directory",
+            "--no-wandb",
+        ]
+    )
+
+    assert fake_model.predict_calls[0]["kwargs"]["batch"] == 2
+    assert fake_model.predict_calls[0]["kwargs"]["half"] is False
 
 
 def test_main_job_batch_writes_to_batch_subdir(inference_module, tmp_path: Path, monkeypatch):
