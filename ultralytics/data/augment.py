@@ -2685,8 +2685,11 @@ class PrepareAuxiliaryMaskInputs:
         return mask
 
     @staticmethod
-    def _normalize_distance_band(mask: np.ndarray) -> np.ndarray:
-        return _ensure_mask_2d(mask).astype(np.float32, copy=False)
+    def _normalize_distance_band(mask: np.ndarray, scale_factor: float | None = None) -> np.ndarray:
+        mask_2d = _ensure_mask_2d(mask).astype(np.float32, copy=False)
+        if scale_factor is not None:
+            return mask_2d / float(scale_factor)
+        return mask_2d
 
     @staticmethod
     def _normalize_proximity_band(mask: np.ndarray, scale_factor: float | None = None) -> np.ndarray:
@@ -2762,7 +2765,10 @@ class PrepareAuxiliaryMaskInputs:
             labels["land_water_mask"] = torch.from_numpy(land_water_mask[None].astype(np.int64, copy=False))
         if self.use_shoreline_prior_loss:
             shoreline_distance_map = (
-                self._normalize_distance_band(shoreline_distance)
+                self._normalize_distance_band(
+                    shoreline_distance,
+                    scale_factor=self.band_name_to_scale.get("shoreline_distance"),
+                )
                 if shoreline_distance is not None
                 else self._build_shoreline_distance_map(shoreline_mask, land_water_mask)
             )

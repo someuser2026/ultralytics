@@ -640,6 +640,7 @@ def test_site_prediction_submitter_passes_site_and_img_dir(tmp_path: Path) -> No
     env["BATCH"] = "2"
     env["IOU"] = "0.55"
     env["MAX_DET"] = "77"
+    env["JOB_BATCH_SIZE"] = "0"
 
     subprocess.run(
         [
@@ -747,6 +748,7 @@ def test_site_prediction_submitter_splits_batches_into_multiple_jobs(tmp_path: P
             "0.33",
             "cpu",
             "0",
+            "1",
         ],
         cwd=REPO_ROOT,
         env=env,
@@ -767,6 +769,75 @@ def test_site_prediction_submitter_splits_batches_into_multiple_jobs(tmp_path: P
         assert vars_map["JOB_BATCH_INDEX"] == batch_index
         assert vars_map["JOB_BATCH_START"] == batch_start
         assert vars_map["JOB_BATCH_END"] == batch_end
+
+
+def test_site_prediction_submitter_can_disable_batching_from_command_line(tmp_path: Path) -> None:
+    """Smoke-test that the positional batching flag can force a single qsub."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{\n"
+        "  echo CALL\n"
+        "  for arg in \"$@\"; do\n"
+        "    printf '%s\\n' \"$arg\"\n"
+        "  done\n"
+        "  echo END\n"
+        "} >> \"$QSUB_LOG\"\n",
+    )
+
+    scratch = tmp_path / "scratch"
+    checkpoint = scratch / "runs" / "cuda" / "obb" / "imgsz_448" / "yolo" / "project_x" / "demo_run" / "weights" / "best.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_bytes(b"weights")
+
+    image_dir = scratch / "data_processed" / "Treachery" / "PSScene" / "visual" / "pngs" / "images_c448_ov35_kf20"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("a.png", "b.png", "c.png", "d.png", "e.png"):
+        (image_dir / name).write_bytes(b"")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["QSUB_LOG"] = str(qsub_log)
+    env["SCRATCH"] = str(scratch)
+    env["PREDICT_MODE"] = "directory"
+    env["WANDB"] = "true"
+    env["BATCH"] = "4"
+    env["JOB_BATCH_SIZE"] = "2"
+
+    subprocess.run(
+        [
+            "bash",
+            "jobs/infer/hpc/submit_yolo_site_predict_json.sh",
+            str(checkpoint),
+            "Treachery",
+            "visual/pngs/images_c448_ov35_kf20",
+            "512",
+            "0.33",
+            "cpu",
+            "0",
+            "0",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == 1
+
+    call = calls[0]
+    vars_map = _parse_varlist(call)
+    assert call[-1] == "jobs/infer/hpc/yolo_site_predict_json.pbs"
+    assert call[call.index("-N") + 1] == "demo_run_Treachery"
+    assert vars_map["WANDB"] == "true"
+    assert "JOB_BATCH_INDEX" not in vars_map
+    assert "JOB_BATCH_START" not in vars_map
+    assert "JOB_BATCH_END" not in vars_map
 
 
 def test_log_predictions_submitter_passes_expected_env_vars(tmp_path: Path) -> None:

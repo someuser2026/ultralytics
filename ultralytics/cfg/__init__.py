@@ -164,6 +164,7 @@ CFG_FLOAT_KEYS = frozenset(
         "lora_alpha",
         "shoreline_prior_weight",
         "land_water_prior_weight",
+        "shoreline_prior_gt_margin",
         "land_water_prior_land_threshold",
         "land_water_prior_exp_beta",
     }

@@ -9,14 +9,14 @@ PBS_SCRIPT="jobs/infer/hpc/yolo_site_predict_json.pbs"
 usage() {
   cat <<'EOF'
 Usage:
-  bash jobs/infer/hpc/submit_yolo_site_predict_json.sh CHECKPOINT SITE_NAME IMG_DIR [IMGSZ] [CONF] [DEVICE] [DRY_RUN]
+  bash jobs/infer/hpc/submit_yolo_site_predict_json.sh CHECKPOINT SITE_NAME IMG_DIR [IMGSZ] [CONF] [DEVICE] [DRY_RUN] [JOB_BATCHING]
 
 Example:
   bash jobs/infer/hpc/submit_yolo_site_predict_json.sh \
     /srv/scratch/.../best.pt \
     Treachery \
     visual/pngs/images_c448_ov35_kf20 \
-    640 0.25 0 1
+    640 0.25 0 1 1
 
 Positional arguments:
   CHECKPOINT  Path to checkpoint weights (.pt)
@@ -26,13 +26,14 @@ Positional arguments:
   CONF        Optional confidence threshold (default: 0.01)
   DEVICE      Optional device (default: 0)
   DRY_RUN     Optional 0/1 flag (default: 0)
+  JOB_BATCHING Optional 0/1 flag to disable or enable multi-job splitting (default: 1)
 
 Optional environment overrides:
   IOU         IoU threshold for NMS (default: 0.45)
   MAX_DET     Maximum detections per image (default in Python script: 100 for segment, 300 otherwise)
   BATCH       Optional YOLO inference batch size for directory predict mode
   JOB_BATCH_SIZE
-              Optional image count per submitted PBS batch job; 0 or unset keeps single-job submission
+              Optional image count per submitted PBS batch job (default: 5000); set to 0 for single-job submission
   PREDICT_MODE Either `per-image` or `directory` (default: per-image)
   WANDB       Whether to upload the prediction directory to W&B (default: true)
   WANDB_RUN_ID Optional W&B run ID to resume instead of creating a sibling inference run
@@ -51,10 +52,11 @@ IMGSZ="${4:-448}"
 CONF="${5:-0.01}"
 DEVICE="${6:-0}"
 DRY_RUN="${7:-${DRY_RUN:-0}}"
+JOB_BATCHING="${8:-1}"
 IOU="${IOU:-0.45}"
 MAX_DET="${MAX_DET:-}"
 BATCH="${BATCH:-}"
-JOB_BATCH_SIZE="${JOB_BATCH_SIZE:-0}"
+JOB_BATCH_SIZE="${JOB_BATCH_SIZE:-5000}"
 PREDICT_MODE="${PREDICT_MODE:-per-image}"
 WANDB="${WANDB:-true}"
 WANDB_RUN_ID="${WANDB_RUN_ID:-}"
@@ -67,6 +69,7 @@ WANDB_RUN_ID="${WANDB_RUN_ID:-}"
 [[ "${IOU}" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "IOU must be numeric"; exit 1; }
 [[ -n "${DEVICE}" ]] || { echo "DEVICE must not be empty"; exit 1; }
 [[ "${DRY_RUN}" =~ ^[01]$ ]] || { echo "DRY_RUN must be 0 or 1"; exit 1; }
+[[ "${JOB_BATCHING}" =~ ^[01]$ ]] || { echo "JOB_BATCHING must be 0 or 1"; exit 1; }
 [[ -z "${MAX_DET}" || "${MAX_DET}" =~ ^[0-9]+$ ]] || { echo "MAX_DET must be empty or a non-negative integer"; exit 1; }
 [[ -z "${BATCH}" || "${BATCH}" =~ ^[0-9]+$ ]] || { echo "BATCH must be empty or a non-negative integer"; exit 1; }
 [[ "${JOB_BATCH_SIZE}" =~ ^[0-9]+$ ]] || { echo "JOB_BATCH_SIZE must be a non-negative integer"; exit 1; }
@@ -167,6 +170,7 @@ echo "  Confidence: ${CONF}"
 echo "  IoU: ${IOU}"
 echo "  Max det: ${MAX_DET:-auto}"
 echo "  Inference batch: ${BATCH:-auto}"
+echo "  Job batching: ${JOB_BATCHING}"
 echo "  Job batch size: ${JOB_BATCH_SIZE}"
 echo "  Device: ${DEVICE}"
 echo "  Predict mode: ${PREDICT_MODE}"
@@ -194,7 +198,7 @@ if [[ -n "${WANDB_RUN_ID}" ]]; then
   BASE_VARS+=("WANDB_RUN_ID=${WANDB_RUN_ID}")
 fi
 
-if [[ "${JOB_BATCH_SIZE}" == "0" ]]; then
+if [[ "${JOB_BATCHING}" == "0" || "${JOB_BATCH_SIZE}" == "0" ]]; then
   VARS=("${BASE_VARS[@]}" "WANDB=${WANDB}")
   submit_cmd "${JOB_LABEL}" "${VARS[@]}"
   exit 0

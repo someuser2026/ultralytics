@@ -74,6 +74,7 @@ shoreline_prior_point_mode: center # (str) point sampled for shoreline prior: ce
 shoreline_prior_weight: 1.0 # (float) shoreline prior loss gain
 land_water_prior_weight: 1.0 # (float) land/water prior loss gain
 shoreline_prior_max_dist: 128 # (int) shoreline distance cap in pixels for normalization
+shoreline_prior_gt_margin: 0.05 # (float) normalized distance margin before segment GT-relative shoreline prior activates
 land_water_prior_land_threshold: 0.05 # (float) fraction of valid prediction support allowed over land/sand before land-water prior activates
 land_water_prior_exp_beta: 4.0 # (float) exponential sharpness for land-water prior above threshold
 dual_input_backbone: false # (bool) route RGB and auxiliary channels through parallel backbones when the model YAML supports it

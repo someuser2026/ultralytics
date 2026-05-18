@@ -948,6 +948,7 @@ class v8SegmentationLoss(v8DetectionLoss):
         self.shoreline_prior_weight = float(_get_cfg_value(model.args, "shoreline_prior_weight", 1.0))
         self.land_water_prior_weight = float(_get_cfg_value(model.args, "land_water_prior_weight", 1.0))
         self.shoreline_prior_max_dist = float(_get_cfg_value(model.args, "shoreline_prior_max_dist", 128.0))
+        self.shoreline_prior_gt_margin = float(_get_cfg_value(model.args, "shoreline_prior_gt_margin", 0.05))
         self.land_water_prior_land_threshold = float(_get_cfg_value(model.args, "land_water_prior_land_threshold", 0.05))
         self.land_water_prior_exp_beta = float(_get_cfg_value(model.args, "land_water_prior_exp_beta", 4.0))
         self.shoreline_aux_weight = float(_get_cfg_value(model.args, "shoreline_aux_weight", 0.20))
@@ -966,6 +967,7 @@ class v8SegmentationLoss(v8DetectionLoss):
         preds, shore_aux_logits = _split_main_and_aux_preds(preds)
         feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
         batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
+        masks = None
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
         )
@@ -1061,6 +1063,12 @@ class v8SegmentationLoss(v8DetectionLoss):
                 shoreline_prior_max_dist=self.shoreline_prior_max_dist,
                 land_threshold=self.land_water_prior_land_threshold,
                 land_beta=self.land_water_prior_exp_beta,
+                masks=masks,
+                target_gt_idx=target_gt_idx,
+                fg_mask=fg_mask,
+                batch_idx=batch_idx,
+                overlap=self.overlap,
+                shoreline_prior_gt_margin=self.shoreline_prior_gt_margin,
             )
         
         loss[0] *= self.hyp.box  # box gain
@@ -1641,6 +1649,12 @@ def _compute_segmentation_spatial_prior_losses(
     land_threshold: float = 0.05,
     land_beta: float = 4.0,
     chunk_size: int = 256,
+    masks: torch.Tensor | None = None,
+    target_gt_idx: torch.Tensor | None = None,
+    fg_mask: torch.Tensor | None = None,
+    batch_idx: torch.Tensor | None = None,
+    overlap: bool = True,
+    shoreline_prior_gt_margin: float = 0.05,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute shoreline and land/water priors across all segmentation predictions."""
     zero = pred_scores.new_tensor(0.0)
@@ -1663,6 +1677,10 @@ def _compute_segmentation_spatial_prior_losses(
         )
         shoreline_distance_map = shoreline_distance_map.clamp_(0.0, float(max(shoreline_prior_max_dist, 1.0)))
         shoreline_distance_map = shoreline_distance_map / float(max(shoreline_prior_max_dist, 1.0))
+        sigma = shoreline_distance_map.new_tensor(1.0 / 3.0)
+        shoreline_penalty_map = 1.0 - torch.exp(-0.5 * (shoreline_distance_map / sigma).pow(2))
+    else:
+        shoreline_penalty_map = None
 
     proto_scale = math.sqrt(max(proto.shape[1], 1))
     shoreline_num = zero
@@ -1693,11 +1711,63 @@ def _compute_segmentation_spatial_prior_losses(
 
             if shoreline_distance_map is not None and land_water_mask is not None:
                 water_mass = (probs * water_mask[image_idx, 0]).sum(dim=(1, 2))
-                shoreline_mass = (probs * water_mask[image_idx, 0] * shoreline_distance_map[image_idx, 0]).sum(dim=(1, 2))
+                gt_masks = None
+                fg_chunk = None
+                if masks is not None and target_gt_idx is not None and fg_mask is not None:
+                    fg_chunk = fg_mask[image_idx, start:end]
+                    if fg_chunk.any():
+                        mask_idx = target_gt_idx[image_idx, start:end][fg_chunk]
+                        if overlap:
+                            gt_masks = masks[image_idx] == (mask_idx + 1).view(-1, 1, 1)
+                        elif batch_idx is not None:
+                            image_masks = masks[batch_idx.view(-1) == image_idx]
+                            gt_masks = image_masks[mask_idx]
+                        if gt_masks is not None:
+                            gt_masks = gt_masks.to(device=probs.device, dtype=probs.dtype)
+
+                outside_gt = torch.ones_like(probs)
+                if gt_masks is not None and fg_chunk is not None:
+                    outside_gt[fg_chunk] = 1.0 - gt_masks
+
+                fp_mass = (probs * outside_gt * water_mask[image_idx, 0] * shoreline_penalty_map[image_idx, 0]).sum(
+                    dim=(1, 2)
+                )
+                fp_values = torch.where(water_mass > 0, fp_mass / water_mass.clamp_min(1e-6), torch.zeros_like(water_mass))
+                shoreline_values = fp_values.clone()
+
+                if gt_masks is not None and fg_chunk is not None:
+                    pos_probs = probs[fg_chunk]
+                    pos_water = water_mask[image_idx, 0]
+                    pred_dist_mass = (pos_probs * pos_water * shoreline_distance_map[image_idx, 0]).sum(dim=(1, 2))
+                    pred_water_mass = (pos_probs * pos_water).sum(dim=(1, 2))
+                    pred_mean = torch.where(
+                        pred_water_mass > 0,
+                        pred_dist_mass / pred_water_mass.clamp_min(1e-6),
+                        torch.zeros_like(pred_water_mass),
+                    )
+
+                    gt_water_mass = (gt_masks * pos_water).sum(dim=(1, 2))
+                    gt_dist_mass = (gt_masks * pos_water * shoreline_distance_map[image_idx, 0]).sum(dim=(1, 2))
+                    gt_mean = torch.where(
+                        gt_water_mass > 0,
+                        gt_dist_mass / gt_water_mass.clamp_min(1e-6),
+                        torch.zeros_like(gt_water_mass),
+                    )
+                    gt_guard = (pred_mean - gt_mean - float(shoreline_prior_gt_margin)).clamp_min(0.0)
+
+                    intersection = (pos_probs * gt_masks).sum(dim=(1, 2))
+                    union = (pos_probs + gt_masks - pos_probs * gt_masks).sum(dim=(1, 2))
+                    iou_gate = torch.where(
+                        union > 0,
+                        intersection / union.clamp_min(1e-6),
+                        torch.zeros_like(union),
+                    ).detach()
+                    shoreline_values[fg_chunk] = 0.5 * (fp_values[fg_chunk] + gt_guard) * iou_gate
+
                 shoreline_values = torch.where(
                     valid_area > 0,
-                    shoreline_mass / valid_area.clamp_min(1e-6),
-                    torch.zeros_like(valid_area),
+                    shoreline_values,
+                    torch.zeros_like(shoreline_values),
                 )
                 shoreline_num = shoreline_num + (shoreline_values * conf_chunk).sum()
 

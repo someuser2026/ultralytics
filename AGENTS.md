@@ -41,6 +41,23 @@ pytest tests/test_rotated_fcos.py
 - OBB: `/Users/manishagupta/Desktop/PhD/rip-detection/data_processed/Global/Annotated/variants/obb/planet_full_c448_ov35_kf20_10075-single_sh-lw-d-prx-cl-hz-sdw_smoke10_seed0/data.yaml`
 - Segment: `/Users/manishagupta/Desktop/PhD/rip-detection/data_processed/Global/Annotated/variants/segment/planet_full_c448_ov35_kf20_10075-single_sh-lw-d-prx-cl-hz-sdw_smoke10_seed0/data.yaml`
 
+## Smoke Test Priorities
+
+Run the smoke test for 2 full epochs and not just steps. During the smoke test focus on these things first:
+
+1. the logic is correct [incorrect logic can still have finite loss and gradients]. If you do not have enough clarification for the checking the correctness of the logic, simply ask for clarification. do not assume anything.
+2. the graidients are finite and non zero for the layers they should be
+3. the losses are finite [not nan] or stuck at one value
+4. Data is loading correctly
+
+Key areas for problems include:
+
+1. Data loading process
+2. logical errors in the loss functions
+3. logical errors in model architecture [example modules etc]
+
+Do not edit the code during the smoke test unless specifcally asked to. Simply report the results from the smoke tests, including what worked and what did not.
+
 ## Agent Rules
 - Prefer editing `ultralytics/` over the reference repos.
 - Reuse existing components before adding new abstractions.

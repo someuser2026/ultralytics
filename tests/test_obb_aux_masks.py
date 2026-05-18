@@ -105,6 +105,7 @@ def _shoreaux_args(**overrides) -> SimpleNamespace:
         "shoreline_aux_bce_weight": 1.0,
         "shoreline_aux_dice_weight": 1.0,
         "shoreline_aux_warmup_epochs": 10,
+        "shoreline_prior_gt_margin": 0.05,
     }
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -310,6 +311,24 @@ def test_prepare_auxiliary_mask_inputs_use_configured_proximity_scale_factor() -
 
     assert field[:, 1].min().item() == pytest.approx(1.0, abs=1e-6)
     assert field[0, 2].item() == pytest.approx(32768.0 / 65535.0, abs=1e-6)
+
+
+def test_prepare_auxiliary_mask_inputs_use_configured_distance_scale_factor() -> None:
+    """Configured band scale factors should normalize shoreline distance maps used by prior losses."""
+    transform = PrepareAuxiliaryMaskInputs(
+        bands={4: "shoreline", 5: "land_water", 6: "shoreline_distance"},
+        band_scale_factors={6: 8.0},
+        use_shoreline_prior_loss=True,
+    )
+    shoreline_mask = np.zeros((4, 4), dtype=np.uint16)
+    land_water_mask = np.full((4, 4), 255, dtype=np.uint16)
+    shoreline_distance = np.full((4, 4), 24, dtype=np.uint16)
+
+    labels = transform({"img": _band_image(shoreline_mask, land_water_mask, shoreline_distance, dtype=np.uint16)})
+    distance = labels["shoreline_distance_map"][0]
+
+    assert distance.dtype == torch.float32
+    assert distance[0, 0].item() == pytest.approx(3.0, abs=1e-6)
 
 
 def test_blank_shoreline_mask_produces_zero_distance_map() -> None:
@@ -558,8 +577,8 @@ def test_multiband_tiff_verify_and_load_round_trip() -> None:
     assert np.array_equal(chw_loaded, image)
 
 
-def test_multiband_segment_dataset_sample_preserves_prior_targets_and_scales_model_inputs() -> None:
-    """A segment dataset sample should keep raw prior targets while scaling model input channels by config."""
+def test_multiband_segment_dataset_sample_scales_prior_targets_and_model_inputs() -> None:
+    """A segment dataset sample should scale configured prior targets and model input channels."""
     root = TMP / "multiband_segment_dataset"
     image_path = root / "images" / "train" / "sample.tif"
     label_path = root / "labels" / "train" / "sample.txt"
@@ -632,7 +651,7 @@ def test_multiband_segment_dataset_sample_preserves_prior_targets_and_scales_mod
     assert sample["img"][6, 0, 0].item() == pytest.approx(1.0, abs=1e-6)
     assert sample["land_water_mask"].dtype == torch.int64
     assert sample["land_water_mask"].shape == (1, 16, 16)
-    assert sample["shoreline_distance_map"][0, 0, 0].item() == pytest.approx(103.0, abs=1e-6)
+    assert sample["shoreline_distance_map"][0, 0, 0].item() == pytest.approx(1.0, abs=1e-6)
     assert sample["shoreline_proximity_field"][0, 0, 0].item() == pytest.approx(1.0, abs=1e-6)
 
 
@@ -737,7 +756,7 @@ def test_spatial_prior_losses_support_threshold_area_and_closest_corner_modes() 
 
 
 def test_segment_spatial_prior_losses_cover_all_predictions() -> None:
-    """Segment priors use all predictions with thresholded land overlap and shoreline distance aggregation."""
+    """Segment priors use all predictions with thresholded land overlap and Gaussian shoreline penalties."""
     proto = torch.tensor(
         [
             [
@@ -787,8 +806,114 @@ def test_segment_spatial_prior_losses_cover_all_predictions() -> None:
 
     assert shoreline_loss.item() > 0.0
     assert land_loss.item() == pytest.approx(0.0, abs=1e-6)
-    assert shoreline_land.item() < shoreline_loss.item() * 0.05
+    assert shoreline_land.item() > 0.0
     assert land_high.item() > 0.0
+
+
+def test_segment_shoreline_prior_respects_assigned_offshore_gt_mask() -> None:
+    """Assigned masks that match offshore GT should not be penalized just for matching that GT distance."""
+    proto = torch.tensor([[[[-12.0, -12.0, 12.0, 12.0]] * 4]], dtype=torch.float32)
+    pred_masks = torch.tensor([[[1.0]]], dtype=torch.float32)
+    pred_scores = torch.tensor([[0.9]], dtype=torch.float32)
+    land_water_mask = torch.full((1, 1, 4, 4), 255, dtype=torch.long)
+    shoreline_distance = torch.tensor([[[[0.0, 0.0, 0.8, 0.8]] * 4]], dtype=torch.float32)
+    gt_masks = torch.zeros((1, 4, 4), dtype=torch.long)
+    gt_masks[:, :, 2:] = 1
+
+    fallback_loss, fallback_land = _compute_segmentation_spatial_prior_losses(
+        pred_scores,
+        pred_masks,
+        proto,
+        land_water_mask,
+        shoreline_distance,
+        shoreline_prior_max_dist=1.0,
+    )
+    gt_relative_loss, gt_relative_land = _compute_segmentation_spatial_prior_losses(
+        pred_scores,
+        pred_masks,
+        proto,
+        land_water_mask,
+        shoreline_distance,
+        shoreline_prior_max_dist=1.0,
+        masks=gt_masks,
+        target_gt_idx=torch.zeros((1, 1), dtype=torch.long),
+        fg_mask=torch.ones((1, 1), dtype=torch.bool),
+        batch_idx=torch.tensor([[0]]),
+        overlap=True,
+    )
+
+    assert fallback_loss.item() > 0.0
+    assert gt_relative_loss.item() < fallback_loss.item() * 0.05
+    assert gt_relative_land.item() == pytest.approx(fallback_land.item(), abs=1e-6)
+
+
+def test_segment_shoreline_prior_gates_low_iou_assigned_masks() -> None:
+    """Low-IoU assigned masks should not receive a strong shoreline-prior signal."""
+    proto = torch.tensor([[[[-12.0, -12.0, 12.0, 12.0]] * 4]], dtype=torch.float32)
+    pred_masks = torch.tensor([[[1.0]]], dtype=torch.float32)
+    pred_scores = torch.tensor([[0.9]], dtype=torch.float32)
+    land_water_mask = torch.full((1, 1, 4, 4), 255, dtype=torch.long)
+    shoreline_distance = torch.tensor([[[[0.0, 0.0, 1.0, 1.0]] * 4]], dtype=torch.float32)
+    gt_masks = torch.zeros((1, 4, 4), dtype=torch.long)
+    gt_masks[:, :, :2] = 1
+
+    assigned_loss, _ = _compute_segmentation_spatial_prior_losses(
+        pred_scores,
+        pred_masks,
+        proto,
+        land_water_mask,
+        shoreline_distance,
+        shoreline_prior_max_dist=1.0,
+        masks=gt_masks,
+        target_gt_idx=torch.zeros((1, 1), dtype=torch.long),
+        fg_mask=torch.ones((1, 1), dtype=torch.bool),
+        batch_idx=torch.tensor([[0]]),
+        overlap=True,
+    )
+    unassigned_loss, _ = _compute_segmentation_spatial_prior_losses(
+        pred_scores,
+        pred_masks,
+        proto,
+        land_water_mask,
+        shoreline_distance,
+        shoreline_prior_max_dist=1.0,
+        masks=gt_masks,
+        target_gt_idx=torch.zeros((1, 1), dtype=torch.long),
+        fg_mask=torch.zeros((1, 1), dtype=torch.bool),
+        batch_idx=torch.tensor([[0]]),
+        overlap=True,
+    )
+
+    assert assigned_loss.item() < unassigned_loss.item() * 0.05
+    assert unassigned_loss.item() > 0.9
+
+
+def test_segment_shoreline_prior_keeps_unassigned_offshore_penalty_with_gt_context() -> None:
+    """Unassigned confident offshore masks should still receive the Gaussian false-positive prior."""
+    proto = torch.tensor([[[[-12.0, -12.0, 12.0, 12.0]] * 4]], dtype=torch.float32)
+    pred_masks = torch.tensor([[[1.0]]], dtype=torch.float32)
+    pred_scores = torch.tensor([[0.9]], dtype=torch.float32)
+    land_water_mask = torch.full((1, 1, 4, 4), 255, dtype=torch.long)
+    shoreline_distance = torch.tensor([[[[0.0, 0.0, 1.0, 1.0]] * 4]], dtype=torch.float32)
+    gt_masks = torch.zeros((1, 4, 4), dtype=torch.long)
+    gt_masks[:, :, :2] = 1
+
+    shoreline_loss, land_loss = _compute_segmentation_spatial_prior_losses(
+        pred_scores,
+        pred_masks,
+        proto,
+        land_water_mask,
+        shoreline_distance,
+        shoreline_prior_max_dist=1.0,
+        masks=gt_masks,
+        target_gt_idx=torch.zeros((1, 1), dtype=torch.long),
+        fg_mask=torch.zeros((1, 1), dtype=torch.bool),
+        batch_idx=torch.tensor([[0]]),
+        overlap=True,
+    )
+
+    assert shoreline_loss.item() > 0.9
+    assert land_loss.item() == pytest.approx(0.0, abs=1e-6)
 
 
 def test_predict_multichannel_tiff_validates_channel_count() -> None:
