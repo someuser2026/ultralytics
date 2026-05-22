@@ -613,10 +613,9 @@ class v8DetectionLoss:
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
-        feats = preds[1] if isinstance(preds, tuple) else preds
-        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 4, self.nc), 1
-        )
+        preds = _require_yolo_prediction_dict(preds, "v8DetectionLoss")
+        feats = preds["feats"]
+        pred_distri, pred_scores = preds["boxes"], preds["scores"]
 
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
@@ -965,12 +964,11 @@ class v8SegmentationLoss(v8DetectionLoss):
 
         loss = torch.zeros(7, device=self.device)  # box, seg, cls, dfl, shoreline_prior, land_water_prior, shore_aux
         preds, shore_aux_logits = _split_main_and_aux_preds(preds)
-        feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
+        preds = _require_yolo_prediction_dict(preds, "v8SegmentationLoss")
+        feats, pred_masks, proto = preds["feats"], preds["mask_coefficient"], preds["proto"]
         batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
         masks = None
-        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 4, self.nc), 1
-        )
+        pred_distri, pred_scores = preds["boxes"], preds["scores"]
 
         # B, grids, ..
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
@@ -1264,10 +1262,9 @@ class v8PoseLoss(v8DetectionLoss):
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the total loss and detach it for pose estimation."""
         loss = torch.zeros(5, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility
-        feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
-        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 4, self.nc), 1
-        )
+        preds = _require_yolo_prediction_dict(preds, "v8PoseLoss")
+        feats, pred_kpts = preds["feats"], preds["kpts"]
+        pred_distri, pred_scores = preds["boxes"], preds["scores"]
 
         # B, grids, ..
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
@@ -1436,9 +1433,25 @@ def _get_cfg_value(cfg: Any, key: str, default: Any) -> Any:
 
 def _split_main_and_aux_preds(preds: Any) -> tuple[Any, torch.Tensor | None]:
     """Separate standard YOLO predictions from optional shoreline auxiliary logits."""
-    if isinstance(preds, dict):
+    if isinstance(preds, dict) and "main" in preds:
         return preds.get("main"), preds.get("shore_aux_logits")
     return preds, None
+
+
+def _require_yolo_prediction_dict(preds: Any, context: str) -> dict[str, Any]:
+    """Require the new dict-style YOLO prediction contract."""
+    if isinstance(preds, dict):
+        return preds
+    raise TypeError(f"{context} expects dict-style YOLO predictions, got {type(preds).__name__}.")
+
+
+def _make_yolo_prediction_dict_from_feats(
+    feats: list[torch.Tensor], reg_max: int, nc: int
+) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+    """Build named YOLO prediction tensors from per-level concatenated feature outputs."""
+    bs = feats[0].shape[0]
+    boxes, scores = torch.cat([xi.view(bs, reg_max * 4 + nc, -1) for xi in feats], 2).split((reg_max * 4, nc), 1)
+    return {"boxes": boxes, "scores": scores, "feats": feats}
 
 
 def _compute_shoreline_aux_loss(
@@ -1820,11 +1833,10 @@ class v8OBBLoss(v8DetectionLoss):
         """Calculate and return the loss for oriented bounding box detection."""
         loss = torch.zeros(6, device=self.device)  # box, cls, dfl, shoreline_prior, land_water_prior, shore_aux
         preds, shore_aux_logits = _split_main_and_aux_preds(preds)
-        feats, pred_angle = preds if isinstance(preds[0], list) else preds[1]
+        preds = _require_yolo_prediction_dict(preds, "v8OBBLoss")
+        feats, pred_angle = preds["feats"], preds["angle"]
         batch_size = pred_angle.shape[0]  # batch size, number of masks, mask height, mask width
-        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 4, self.nc), 1
-        )
+        pred_distri, pred_scores = preds["boxes"], preds["scores"]
 
         # b, grids, ..
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
@@ -2141,7 +2153,11 @@ class RotatedFCOSLoss:
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute Rotated FCOS classification, bbox, and centerness losses."""
         loss = torch.zeros(5, device=self.device)
-        cls_scores, bbox_preds, angle_preds, centernesses = preds if len(preds) == 4 else preds[1]
+        preds = _require_yolo_prediction_dict(preds, "RotatedFCOSLoss")
+        cls_scores = preds["cls_scores"]
+        bbox_preds = preds["bbox_preds"]
+        angle_preds = preds["angle_preds"]
+        centernesses = preds["centernesses"]
         batch_size = cls_scores[0].shape[0]
         dtype = cls_scores[0].dtype
 
@@ -2269,10 +2285,10 @@ class E2EDetectLoss:
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        preds = preds[1] if isinstance(preds, tuple) else preds
-        one2many = preds["one2many"]
+        preds = _require_yolo_prediction_dict(preds, "E2EDetectLoss")
+        one2many = _require_yolo_prediction_dict(preds["one2many"], "E2EDetectLoss.one2many")
         loss_one2many = self.one2many(one2many, batch)
-        one2one = preds["one2one"]
+        one2one = _require_yolo_prediction_dict(preds["one2one"], "E2EDetectLoss.one2one")
         loss_one2one = self.one2one(one2one, batch)
         return loss_one2many[0] + loss_one2one[0], loss_one2many[1] + loss_one2one[1]
 
@@ -2290,7 +2306,8 @@ class TVPDetectLoss:
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the loss for text-visual prompt detection."""
-        feats = preds[1] if isinstance(preds, tuple) else preds
+        preds = _require_yolo_prediction_dict(preds, "TVPDetectLoss")
+        feats = preds["feats"]
         assert self.ori_reg_max == self.vp_criterion.reg_max  # TODO: remove it
 
         if self.ori_reg_max * 4 + self.ori_nc == feats[0].shape[1]:
@@ -2298,7 +2315,9 @@ class TVPDetectLoss:
             return loss, loss.detach()
 
         vp_feats = self._get_vp_features(feats)
-        vp_loss = self.vp_criterion(vp_feats, batch)
+        vp_loss = self.vp_criterion(
+            _make_yolo_prediction_dict_from_feats(vp_feats, self.vp_criterion.reg_max, self.vp_criterion.nc), batch
+        )
         box_loss = vp_loss[0][1]
         return box_loss, vp_loss[1]
 
@@ -2326,7 +2345,8 @@ class TVPSegmentLoss(TVPDetectLoss):
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the loss for text-visual prompt segmentation."""
-        feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
+        preds = _require_yolo_prediction_dict(preds, "TVPSegmentLoss")
+        feats, pred_masks, proto = preds["feats"], preds["mask_coefficient"], preds["proto"]
         assert self.ori_reg_max == self.vp_criterion.reg_max  # TODO: remove it
 
         if self.ori_reg_max * 4 + self.ori_nc == feats[0].shape[1]:
@@ -2334,7 +2354,10 @@ class TVPSegmentLoss(TVPDetectLoss):
             return loss, loss.detach()
 
         vp_feats = self._get_vp_features(feats)
-        vp_loss = self.vp_criterion((vp_feats, pred_masks, proto), batch)
+        vp_preds = _make_yolo_prediction_dict_from_feats(vp_feats, self.vp_criterion.reg_max, self.vp_criterion.nc)
+        vp_preds["mask_coefficient"] = pred_masks
+        vp_preds["proto"] = proto
+        vp_loss = self.vp_criterion(vp_preds, batch)
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
 

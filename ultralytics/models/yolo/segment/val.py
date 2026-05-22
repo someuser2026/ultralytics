@@ -131,8 +131,13 @@ class SegmentationValidator(DetectionValidator):
         Returns:
             list[dict[str, torch.Tensor]]: Processed detection predictions with masks.
         """
-        proto = preds[1][-1] if len(preds[1]) == 3 else preds[1]  # second output is len 3 if pt, but only 1 if exported
-        preds = super().postprocess(preds[0])
+        if isinstance(preds, (tuple, list)) and isinstance(preds[0], (tuple, list)):
+            pred, proto = preds[0]
+        elif isinstance(preds, (tuple, list)):
+            pred, proto = preds
+        else:
+            raise TypeError(f"SegmentationValidator expects tuple/list predictions, got {type(preds).__name__}.")
+        preds = super().postprocess(pred)
         # imgsz = [4 * x for x in proto.shape[2:]]  # get image size from proto
         imgsz = self._last_imgsz
         for i, pred in enumerate(preds):

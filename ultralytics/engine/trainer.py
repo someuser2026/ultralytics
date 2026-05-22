@@ -1207,7 +1207,7 @@ class BaseTrainer:
         # Update best metric if current is better
         # if not self.best_comp_metric or self.best_comp_metric < self.comp_metric:
         #     self.best_comp_metric = copy(self.comp_metric)
-        self.fitness = metrics.get("fitness", None)
+        self.fitness = metrics.pop("fitness", None)
         if not self.best_fitness or self.best_fitness < self.fitness:
             self.best_fitness = copy(self.fitness)
             

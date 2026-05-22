@@ -62,9 +62,13 @@ class SegmentationPredictor(DetectionPredictor):
             >>> predictor = SegmentationPredictor(overrides=dict(model="yolo11n-seg.pt"))
             >>> results = predictor.postprocess(preds, img, orig_img)
         """
-        # Extract protos - tuple if PyTorch model or array if exported
-        protos = preds[1][-1] if isinstance(preds[1], tuple) else preds[1]
-        return super().postprocess(preds[0], img, orig_imgs, protos=protos)
+        if isinstance(preds, (tuple, list)) and isinstance(preds[0], (tuple, list)):
+            pred, protos = preds[0]
+        elif isinstance(preds, (tuple, list)):
+            pred, protos = preds
+        else:
+            raise TypeError(f"SegmentationPredictor expects tuple/list predictions, got {type(preds).__name__}.")
+        return super().postprocess(pred, img, orig_imgs, protos=protos)
 
     def construct_results(self, preds, img, orig_imgs, protos):
         """

@@ -306,7 +306,7 @@ class BaseModel(torch.nn.Module):
                 if isinstance(m, RepVGGDW):
                     m.fuse()
                     m.forward = m.forward_fuse
-                if isinstance(m, v10Detect):
+                if isinstance(m, Detect) and getattr(m, "end2end", False) and hasattr(m, "fuse"):
                     m.fuse()  # remove one2many head
             self.info(verbose=verbose)
 
@@ -485,14 +485,23 @@ class DetectionModel(BaseModel):
             # s = 256
             m.inplace = self.inplace
 
-            def _forward(x):
-                """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
-                if self.end2end:
-                    return self.forward(x)["one2many"]
-                out = self.forward(x)
+            def _stride_features(out):
+                """Return per-level raw feature maps from dict-style Detect-family outputs."""
                 if isinstance(out, dict):
                     out = out.get("main", out)
-                return out[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB, RotatedFCOS)) else out
+                    out = out.get("one2many", out)
+                    if isinstance(out, dict) and "feats" in out:
+                        return out["feats"]
+                    if isinstance(out, dict) and "cls_scores" in out:
+                        return out["cls_scores"]
+                if isinstance(out, tuple) and len(out) > 1 and isinstance(out[1], dict):
+                    return _stride_features(out[1])
+                return out
+
+            def _forward(x):
+                """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
+                out = self.forward(x)
+                return _stride_features(out)
 
             self.model.eval()  # Avoid changing batch statistics until training begins
             m.training = True  # Setting it to True to properly return strides
@@ -647,6 +656,8 @@ class DetectionModel(BaseModel):
 
         if preds is None:
             preds = self.forward(batch["img"], metadata_vec=batch.get("metadata_vec"))
+        elif isinstance(preds, tuple) and len(preds) > 1 and isinstance(preds[1], dict):
+            preds = preds[1]
         return self.criterion(preds, batch)
 
 

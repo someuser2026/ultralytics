@@ -1429,7 +1429,14 @@ class NMSModel(torch.nn.Module):
         from torchvision.ops import nms
 
         preds = self.model(x)
-        pred = preds[0] if isinstance(preds, tuple) else preds
+        segment_proto = None
+        if self.model.task == "segment" and isinstance(preds, (tuple, list)):
+            if isinstance(preds[0], (tuple, list)):
+                pred, segment_proto = preds[0]
+            else:
+                pred, segment_proto = preds
+        else:
+            pred = preds[0] if isinstance(preds, (tuple, list)) else preds
         kwargs = dict(device=pred.device, dtype=pred.dtype)
         bs = pred.shape[0]
         if pred.shape[-1] > pred.shape[-2]:
@@ -1492,4 +1499,4 @@ class NMSModel(torch.nn.Module):
             # Zero-pad to max_det size to avoid reshape error
             pad = (0, 0, 0, self.args.max_det - dets.shape[0])
             out[i] = torch.nn.functional.pad(dets, pad)
-        return (out[:bs], preds[1]) if self.model.task == "segment" else out[:bs]
+        return (out[:bs], segment_proto) if self.model.task == "segment" else out[:bs]

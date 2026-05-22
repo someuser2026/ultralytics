@@ -155,7 +155,12 @@ def _build_manual_fcos_preds(head, batch_size: int = 1, imgsz: int = 64, bbox_va
         bbox_preds.append(torch.full((batch_size, 4, size, size), bbox_value))
         angle_preds.append(torch.zeros(batch_size, 1, size, size))
         centernesses.append(torch.zeros(batch_size, 1, size, size))
-    return cls_scores, bbox_preds, angle_preds, centernesses
+    return {
+        "cls_scores": cls_scores,
+        "bbox_preds": bbox_preds,
+        "angle_preds": angle_preds,
+        "centernesses": centernesses,
+    }
 
 
 @pytest.mark.skipif(not ULTRA_READY, reason="cv2 and torch are required")
@@ -284,12 +289,12 @@ def test_rotated_fcos_cls_and_centerness_use_positive_count(monkeypatch):
     import torch
 
     _, criterion = _build_rotated_fcos_criterion()
-    preds = (
-        [torch.zeros(1, criterion.nc, 1, 1) for _ in criterion.stride],
-        [torch.zeros(1, 4, 1, 1) for _ in criterion.stride],
-        [torch.zeros(1, 1, 1, 1) for _ in criterion.stride],
-        [torch.zeros(1, 1, 1, 1) for _ in criterion.stride],
-    )
+    preds = {
+        "cls_scores": [torch.zeros(1, criterion.nc, 1, 1) for _ in criterion.stride],
+        "bbox_preds": [torch.zeros(1, 4, 1, 1) for _ in criterion.stride],
+        "angle_preds": [torch.zeros(1, 1, 1, 1) for _ in criterion.stride],
+        "centernesses": [torch.zeros(1, 1, 1, 1) for _ in criterion.stride],
+    }
     batch = {
         "img": torch.zeros(1, 3, 4, 4),
         "batch_idx": torch.zeros((0, 1)),
@@ -358,6 +363,8 @@ def test_rotated_fcos_forward_and_backward(boxes_per_image, bbox_loss_type):
     model.eval()
     preds = model(batch["img"])
     infer = preds[0] if isinstance(preds, tuple) else preds
+    assert isinstance(preds[1], dict)
+    assert {"cls_scores", "bbox_preds", "angle_preds", "centernesses"} <= set(preds[1])
     assert infer.shape[1] == 4 + model.model[-1].nc + 1
 
 
