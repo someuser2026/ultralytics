@@ -35,6 +35,7 @@ __all__ = (
     "Bottleneck",
     "BottleneckCSP",
     "Proto",
+    "Proto26",
     "RepC3",
     "ResNetLayer",
     "RepNCSPELAN4",
@@ -118,6 +119,43 @@ class Proto(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Perform a forward pass through layers using an upsampled input image."""
         return self.cv3(self.cv2(self.upsample(self.cv1(x))))
+
+
+class Proto26(Proto):
+    """YOLO26 mask prototype module with multi-scale feature fusion and optional semantic logits."""
+
+    def __init__(self, ch: tuple = (), c_: int = 256, c2: int = 32, nc: int = 80):
+        """
+        Initialize the YOLO26 prototype module.
+
+        Args:
+            ch (tuple): Tuple of feature-map channels from the segmentation head inputs.
+            c_ (int): Intermediate prototype channels.
+            c2 (int): Number of prototype masks.
+            nc (int): Number of classes for the optional semantic supervision branch.
+        """
+        if not ch:
+            raise ValueError("Proto26 requires at least one feature-map channel.")
+        super().__init__(c_, c_, c2)
+        self.feat_refine = nn.ModuleList(Conv(x, ch[0], k=1) for x in ch[1:])
+        self.feat_fuse = Conv(ch[0], c_, k=3)
+        self.semseg = nn.Sequential(Conv(ch[0], c_, k=3), Conv(c_, c_, k=3), nn.Conv2d(c_, nc, 1))
+
+    def forward(self, x: list[torch.Tensor], return_semantic: bool = True) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Fuse multi-scale features and generate mask prototypes, with semantic logits during training."""
+        feat = x[0]
+        for i, refine in enumerate(self.feat_refine):
+            up_feat = refine(x[i + 1])
+            up_feat = F.interpolate(up_feat, size=feat.shape[2:], mode="nearest")
+            feat = feat + up_feat
+        proto = super().forward(self.feat_fuse(feat))
+        if self.training and return_semantic and self.semseg is not None:
+            return proto, self.semseg(feat)
+        return proto
+
+    def fuse(self):
+        """Drop the semantic branch for inference-only fused models."""
+        self.semseg = None
 
 
 class HGStem(nn.Module):
@@ -231,7 +269,7 @@ class SPP(nn.Module):
 class SPPF(nn.Module):
     """Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher."""
 
-    def __init__(self, c1: int, c2: int, k: int = 5):
+    def __init__(self, c1: int, c2: int, k: int = 5, n: int = 3, shortcut: bool = False):
         """
         Initialize the SPPF layer with given input/output channels and kernel size.
 
@@ -239,21 +277,26 @@ class SPPF(nn.Module):
             c1 (int): Input channels.
             c2 (int): Output channels.
             k (int): Kernel size.
+            n (int): Number of sequential pooling operations.
+            shortcut (bool): Whether to add a residual connection when channels match.
 
         Notes:
             This module is equivalent to SPP(k=(5, 9, 13)).
         """
         super().__init__()
         c_ = c1 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_ * 4, c2, 1, 1)
+        self.cv1 = Conv(c1, c_, 1, 1, act=False)
+        self.cv2 = Conv(c_ * (n + 1), c2, 1, 1)
         self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+        self.n = n
+        self.add = shortcut and c1 == c2
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply sequential pooling operations to input and return concatenated feature maps."""
         y = [self.cv1(x)]
-        y.extend(self.m(y[-1]) for _ in range(3))
-        return self.cv2(torch.cat(y, 1))
+        y.extend(self.m(y[-1]) for _ in range(self.n))
+        y = self.cv2(torch.cat(y, 1))
+        return y + x if self.add else y
 
 
 class C1(nn.Module):
@@ -1123,7 +1166,15 @@ class C3k2(C2f):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
     def __init__(
-        self, c1: int, c2: int, n: int = 1, c3k: bool = False, e: float = 0.5, g: int = 1, shortcut: bool = True
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
     ):
         """
         Initialize C3k2 module.
@@ -1134,12 +1185,21 @@ class C3k2(C2f):
             n (int): Number of blocks.
             c3k (bool): Whether to use C3k blocks.
             e (float): Expansion ratio.
+            attn (bool): Whether to use PSABlock attention inside each block.
             g (int): Groups for convolutions.
             shortcut (bool): Whether to use shortcut connections.
         """
         super().__init__(c1, c2, n, shortcut, g, e)
         self.m = nn.ModuleList(
-            C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g) for _ in range(n)
+            nn.Sequential(
+                Bottleneck(self.c, self.c, shortcut, g),
+                PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
+            )
+            if attn
+            else C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck(self.c, self.c, shortcut, g)
+            for _ in range(n)
         )
 
 

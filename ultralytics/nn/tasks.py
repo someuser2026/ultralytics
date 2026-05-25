@@ -24,6 +24,7 @@ from ultralytics.nn.modules import (
     C3TR,
     ELAN1,
     OBB,
+    OBB26,
     OBBShoreAux,
     RotatedFCOS,
     PSA,
@@ -72,6 +73,7 @@ from ultralytics.nn.modules import (
     RotatedFasterRCNNHead,
     SCDown,
     Segment,
+    Segment26,
     SegmentShoreAux,
     EdgeStem,
     EdgeVSSBlock,
@@ -116,6 +118,7 @@ from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
     E2EDetectLoss,
+    E2ELoss,
     v8ClassificationLoss,
     v8DetectionLoss,
     v8OBBLoss,
@@ -694,7 +697,9 @@ class OBBModel(DetectionModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the model."""
-        return RotatedFCOSLoss(self) if isinstance(self.model[-1], RotatedFCOS) else v8OBBLoss(self)
+        if isinstance(self.model[-1], RotatedFCOS):
+            return RotatedFCOSLoss(self)
+        return E2ELoss(self, v8OBBLoss) if getattr(self, "end2end", False) else v8OBBLoss(self)
 
 
 class SegmentationModel(DetectionModel):
@@ -728,7 +733,7 @@ class SegmentationModel(DetectionModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the SegmentationModel."""
-        return v8SegmentationLoss(self)
+        return E2ELoss(self, v8SegmentationLoss) if getattr(self, "end2end", False) else v8SegmentationLoss(self)
 
 
 class _RCNNModel(BaseModel):
@@ -2381,7 +2386,8 @@ def parse_model(d, ch, verbose=True):
     # Args
     legacy = True  # backward compatibility for v3/v5/v8/v9 models
     max_channels = float("inf")
-    nc, act, scales = (d.get(x) for x in ("nc", "activation", "scales"))
+    nc, act, scales, end2end = (d.get(x) for x in ("nc", "activation", "scales", "end2end"))
+    reg_max = d.get("reg_max", 16)
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
     scale = d.get("scale")
     if scales:
@@ -2523,14 +2529,16 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, SegmentShoreAux, YOLOESegment, Pose, OBB, OBBShoreAux, RotatedFCOS, ImagePoolingAttn, v10Detect}#, Mask2FormerHead}
+            {Detect, WorldDetect, YOLOEDetect, Segment, Segment26, SegmentShoreAux, YOLOESegment, Pose, OBB, OBB26, OBBShoreAux, RotatedFCOS, ImagePoolingAttn, v10Detect}#, Mask2FormerHead}
         ):
             # print("f:", f)
             # print("ch:", ch)
             args.append([ch[x] for x in f])
-            if m in {Segment, SegmentShoreAux, YOLOESegment}:
+            if m in {Segment26, OBB26}:
+                args.extend([reg_max, bool(end2end)])
+            if m in {Segment, Segment26, SegmentShoreAux, YOLOESegment}:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, SegmentShoreAux, YOLOESegment, Pose, OBB, OBBShoreAux, RotatedFCOS}:
+            if m in {Detect, YOLOEDetect, Segment, Segment26, SegmentShoreAux, YOLOESegment, Pose, OBB, OBB26, OBBShoreAux, RotatedFCOS}:
                 m.legacy = legacy
         elif m in frozenset({RTDETRDecoder, RTDETRSegmentDecoder, RTDETROBBDecoder, RHINOOBBDecoder}):  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
@@ -2755,7 +2763,7 @@ def guess_model_task(model):
             with contextlib.suppress(Exception):
                 return cfg2task(eval(x))
         for m in model.modules():
-            if isinstance(m, (Segment, YOLOESegment, MaskRCNNHead, CascadeMaskRCNNHead)):
+            if isinstance(m, (Segment, Segment26, YOLOESegment, MaskRCNNHead, CascadeMaskRCNNHead)):
                 return "segment"
             elif isinstance(m, RTDETRSegmentDecoder):
                 return "segment"
@@ -2763,7 +2771,7 @@ def guess_model_task(model):
                 return "classify"
             elif isinstance(m, Pose):
                 return "pose"
-            elif isinstance(m, (OBB, RotatedFCOS, RotatedFasterRCNNHead, OrientedRCNNHead)):
+            elif isinstance(m, (OBB, OBB26, RotatedFCOS, RotatedFasterRCNNHead, OrientedRCNNHead)):
                 return "obb"
             elif isinstance(m, (RTDETROBBDecoder, RHINOOBBDecoder)):
                 return "obb"

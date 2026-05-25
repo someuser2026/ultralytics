@@ -920,9 +920,9 @@ class MixedMaskLoss(nn.Module):
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
 
-    def __init__(self, model):  # model must be de-paralleled
+    def __init__(self, model, tal_topk: int = 10):  # model must be de-paralleled
         """Initialize the v8SegmentationLoss class with model parameters and mask overlap setting."""
-        super().__init__(model)
+        super().__init__(model, tal_topk=tal_topk)
         self.overlap = model.args.overlap_mask
 
         self.use_mixed_loss = getattr(model.args, "seg_use_mixed_loss", False)
@@ -966,6 +966,9 @@ class v8SegmentationLoss(v8DetectionLoss):
         preds, shore_aux_logits = _split_main_and_aux_preds(preds)
         preds = _require_yolo_prediction_dict(preds, "v8SegmentationLoss")
         feats, pred_masks, proto = preds["feats"], preds["mask_coefficient"], preds["proto"]
+        pred_semantic = None
+        if isinstance(proto, tuple) and len(proto) == 2:
+            proto, pred_semantic = proto
         batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
         masks = None
         pred_distri, pred_scores = preds["boxes"], preds["scores"]
@@ -1068,6 +1071,21 @@ class v8SegmentationLoss(v8DetectionLoss):
                 overlap=self.overlap,
                 shoreline_prior_gt_margin=self.shoreline_prior_gt_margin,
             )
+
+        if pred_semantic is not None:
+            sem_masks = batch.get("sem_masks", batch.get("semantic_mask"))
+            if sem_masks is not None:
+                sem_masks = sem_masks.to(self.device)
+                if sem_masks.ndim == 3:
+                    sem_masks = F.one_hot(sem_masks.long().clamp(0, self.nc - 1), num_classes=self.nc).permute(0, 3, 1, 2)
+                sem_masks = sem_masks.to(dtype=pred_semantic.dtype)
+                if pred_semantic.shape[-2:] != sem_masks.shape[-2:]:
+                    sem_masks = F.interpolate(sem_masks, size=pred_semantic.shape[-2:], mode="nearest")
+                loss[1] = loss[1] + 0.2 * (
+                    F.binary_cross_entropy_with_logits(pred_semantic, sem_masks, reduction="mean")
+                )
+            else:
+                loss[1] = loss[1] + (pred_semantic * 0).sum()
         
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.mask_weight  # seg gain
@@ -1792,11 +1810,11 @@ def _compute_segmentation_spatial_prior_losses(
 class v8OBBLoss(v8DetectionLoss):
     """Calculates losses for object detection, classification, and box distribution in rotated YOLO models."""
 
-    def __init__(self, model):
+    def __init__(self, model, tal_topk: int = 10):
         """Initialize v8OBBLoss with model, assigner, and rotated bbox loss; model must be de-paralleled."""
-        super().__init__(model)
+        super().__init__(model, tal_topk=tal_topk)
         bbox_loss_type = getattr(model.model[-1], "bbox_loss_type", "probiou")
-        self.assigner = RotatedTaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
+        self.assigner = RotatedTaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = RotatedBboxLoss(self.reg_max, bbox_loss_type=bbox_loss_type).to(self.device)
         self.use_shoreline_prior_loss = bool(_get_cfg_value(model.args, "use_shoreline_prior_loss", False))
         self.use_land_water_prior_loss = bool(_get_cfg_value(model.args, "use_land_water_prior_loss", False))
@@ -2289,6 +2307,24 @@ class E2EDetectLoss:
         one2many = _require_yolo_prediction_dict(preds["one2many"], "E2EDetectLoss.one2many")
         loss_one2many = self.one2many(one2many, batch)
         one2one = _require_yolo_prediction_dict(preds["one2one"], "E2EDetectLoss.one2one")
+        loss_one2one = self.one2one(one2one, batch)
+        return loss_one2many[0] + loss_one2one[0], loss_one2many[1] + loss_one2one[1]
+
+
+class E2ELoss:
+    """Generic end-to-end dual-assignment criterion for YOLO dict-style task losses."""
+
+    def __init__(self, model, loss_fn=v8DetectionLoss):
+        """Initialize one-to-many and one-to-one losses for the provided task loss class."""
+        self.one2many = loss_fn(model, tal_topk=10)
+        self.one2one = loss_fn(model, tal_topk=1)
+
+    def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Calculate the summed one-to-many and one-to-one losses."""
+        preds = _require_yolo_prediction_dict(preds, "E2ELoss")
+        one2many = _require_yolo_prediction_dict(preds["one2many"], "E2ELoss.one2many")
+        loss_one2many = self.one2many(one2many, batch)
+        one2one = _require_yolo_prediction_dict(preds["one2one"], "E2ELoss.one2one")
         loss_one2one = self.one2one(one2one, batch)
         return loss_one2many[0] + loss_one2one[0], loss_one2many[1] + loss_one2one[1]
 
