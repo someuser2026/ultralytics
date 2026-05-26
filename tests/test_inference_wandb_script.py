@@ -97,6 +97,13 @@ class FakeYOLO:
         return [make_obb_result(image_path)]
 
 
+class FakeTrainFailYOLO(FakeYOLO):
+    def predict(self, source, stream: bool = True, **kwargs):
+        if Path(source[0] if isinstance(source, (list, tuple)) else source).name == "train":
+            raise RuntimeError("train failed")
+        return super().predict(source, stream=stream, **kwargs)
+
+
 def make_obb_result(image_path: Path) -> Results:
     """Create one small OBB result payload for JSON export tests."""
     return Results(
@@ -308,6 +315,8 @@ def test_run_inference_exports_logs_active_run_artifacts_and_preserves_local_exp
 
     assert result["active_run_name"] == "demo_run_inference"
     assert result["exported_subsets"] == ["train", "val", "test"]
+    assert result["skipped_subsets"] == []
+    assert result["failed_subsets"] == []
     assert [artifact.name for artifact in fake_wandb.artifacts] == [
         "demo_run_inference_predictions_train",
         "demo_run_inference_predictions_val",
@@ -328,7 +337,25 @@ def test_run_inference_exports_skips_missing_test_cleanly(inference_module, tmp_
     result = inference_module.run_inference_exports(args, wandb_module=fake_wandb, model_cls=FakeYOLO)
 
     assert result["exported_subsets"] == ["train", "val"]
+    assert result["skipped_subsets"] == ["test"]
+    assert result["failed_subsets"] == []
     assert [artifact.name for artifact in fake_wandb.artifacts] == [
         "demo_run_inference_predictions_train",
         "demo_run_inference_predictions_val",
     ]
+
+
+def test_run_inference_exports_raises_when_configured_train_split_fails(inference_module, tmp_path: Path):
+    _, weights_path = write_run_layout(tmp_path)
+    data_yaml, _, _ = write_dataset_yaml(tmp_path / "dataset")
+    fake_wandb = FakeWandb()
+    args = inference_module.parse_args(["--weights", str(weights_path), "--data", str(data_yaml)])
+
+    with pytest.raises(RuntimeError, match="Prediction export failed for configured split\\(s\\): train"):
+        inference_module.run_inference_exports(args, wandb_module=fake_wandb, model_cls=FakeTrainFailYOLO)
+
+    assert [artifact.name for artifact in fake_wandb.artifacts] == [
+        "demo_run_inference_predictions_val",
+        "demo_run_inference_predictions_test",
+    ]
+    assert fake_wandb.run is not None and fake_wandb.run.finished is True
