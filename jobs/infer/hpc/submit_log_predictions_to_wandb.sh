@@ -19,7 +19,7 @@ Example:
 
 Positional arguments:
   CHECKPOINT   Path to checkpoint weights (.pt)
-  DATA         Path to dataset YAML containing val/test splits
+  DATA         Path to dataset YAML containing train/val/test splits
   DEVICE       Optional device (default: 0)
   BATCH        Optional batch size (default: use script/default behavior)
   IMGSZ        Optional inference image size (default: 448)
@@ -114,10 +114,10 @@ DATA="$(resolve_path "${DATA_INPUT}")"
 
 RUN_NAME="$(infer_run_name "${CHECKPOINT}")"
 DATA_NAME="$(basename "$(dirname "${DATA}")")"
-JOB_LABEL="${JOB_LABEL:-$(sanitize_label "${RUN_NAME}_${DATA_NAME}_valtest")}"
+JOB_LABEL="${JOB_LABEL:-$(sanitize_label "${RUN_NAME}_${DATA_NAME}_trainvaltest")}"
 
 echo "============================================================"
-echo "Submitting val/test W&B prediction export job"
+echo "Submitting train/val/test W&B prediction export job"
 echo "  Checkpoint: ${CHECKPOINT}"
 echo "  Data YAML: ${DATA}"
 echo "  Device: ${DEVICE}"

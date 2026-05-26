@@ -842,7 +842,7 @@ def test_site_prediction_submitter_can_disable_batching_from_command_line(tmp_pa
 
 
 def test_log_predictions_submitter_passes_expected_env_vars(tmp_path: Path) -> None:
-    """Smoke-test the val/test prediction export submitter with live and dry-run flows."""
+    """Smoke-test the train/val/test prediction export submitter with live and dry-run flows."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     qsub_log = tmp_path / "qsub.log"
