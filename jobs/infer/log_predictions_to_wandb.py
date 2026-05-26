@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export val/test predictions for a trained run and upload them to Weights & Biases."""
+"""Export train/val/test predictions for a trained run and upload them to Weights & Biases."""
 
 from __future__ import annotations
 
@@ -143,6 +143,7 @@ def log_run_context(context: dict[str, Any], active_run_name: str, *, resumed_or
     LOGGER.info(f"Image size: {format_context_value(context.get('imgsz'))}")
     LOGGER.info(f"Confidence: {format_context_value(context.get('conf'))}")
     LOGGER.info("Local prediction output directories:")
+    LOGGER.info(f"  train: {context['run_dir'] / 'predictions' / 'train'}")
     LOGGER.info(f"  val:  {context['run_dir'] / 'predictions' / 'val'}")
     LOGGER.info(f"  test: {context['run_dir'] / 'predictions' / 'test'}")
     LOGGER.info("=========================================")
@@ -162,16 +163,19 @@ def resolve_split_source(dataset_root, split_spec):
     return Path(dataset_root) / split_path
 
 
-def load_data_split_sources(data_yaml: str | Path) -> tuple[dict[str, Any], Path | list[Path] | None, Path | list[Path] | None]:
-    """Load dataset YAML and resolve val/test sources."""
+def load_data_split_sources(
+    data_yaml: str | Path,
+) -> tuple[dict[str, Any], Path | list[Path] | None, Path | list[Path] | None, Path | list[Path] | None]:
+    """Load dataset YAML and resolve train/val/test sources."""
     data_path = Path(data_yaml).expanduser().resolve()
     data_dict = yaml.safe_load(data_path.read_text(encoding="utf-8")) or {}
     if not isinstance(data_dict, dict):
         raise ValueError(f"Expected a mapping in {data_path}, but found {type(data_dict).__name__}.")
 
+    train_source = resolve_split_source(data_dict.get("path"), data_dict.get("train"))
     val_source = resolve_split_source(data_dict.get("path"), data_dict.get("val"))
     test_source = resolve_split_source(data_dict.get("path"), data_dict.get("test"))
-    return data_dict, val_source, test_source
+    return data_dict, train_source, val_source, test_source
 
 
 def prediction_task_name(result) -> str:
@@ -387,7 +391,7 @@ def build_predict_kwargs(context: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_inference_exports(args: argparse.Namespace, *, wandb_module=None, model_cls=YOLO) -> dict[str, Any]:
-    """Run standalone val/test prediction export and upload results to W&B."""
+    """Run standalone train/val/test prediction export and upload results to W&B."""
     weights_path = args.weights.expanduser().resolve()
     data_path = args.data.expanduser().resolve()
 
@@ -419,12 +423,12 @@ def run_inference_exports(args: argparse.Namespace, *, wandb_module=None, model_
             wandb_module=wandb_module,
         )
         log_run_context(context, active_run_name, resumed_original_run=bool(args.wandb_run_id))
-        _, val_source, test_source = load_data_split_sources(context["data_path"])
+        _, train_source, val_source, test_source = load_data_split_sources(context["data_path"])
         output_root = context["run_dir"] / "predictions"
         predict_kwargs = build_predict_kwargs(context)
 
         exported_subsets = []
-        for subset, split_source in (("val", val_source), ("test", test_source)):
+        for subset, split_source in (("train", train_source), ("val", val_source), ("test", test_source)):
             output_dir = output_root / subset
             if export_split_predictions(
                 model,
@@ -438,7 +442,7 @@ def run_inference_exports(args: argparse.Namespace, *, wandb_module=None, model_
                 exported_subsets.append(subset)
 
         if not exported_subsets:
-            LOGGER.warning("No val/test prediction artifacts were exported.")
+            LOGGER.warning("No train/val/test prediction artifacts were exported.")
 
         return {
             "active_run_name": active_run_name,
@@ -451,7 +455,7 @@ def run_inference_exports(args: argparse.Namespace, *, wandb_module=None, model_
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entrypoint for standalone val/test prediction artifact export."""
+    """CLI entrypoint for standalone train/val/test prediction artifact export."""
     args = parse_args(argv)
     try:
         run_inference_exports(args)

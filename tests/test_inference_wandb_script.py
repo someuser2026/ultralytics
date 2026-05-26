@@ -110,19 +110,25 @@ def make_obb_result(image_path: Path) -> Results:
 def write_dataset_yaml(
     root: Path,
     *,
+    include_train: bool = True,
     include_val: bool = True,
     include_test: bool = True,
     test_as_list: bool = False,
 ) -> tuple[Path, Path, Path]:
     """Create a small dataset layout and corresponding YAML file."""
+    train_dir = root / "images" / "train"
     val_dir = root / "images" / "val"
     test_dir = root / "images" / "test"
+    train_dir.mkdir(parents=True, exist_ok=True)
     val_dir.mkdir(parents=True, exist_ok=True)
     test_dir.mkdir(parents=True, exist_ok=True)
+    (train_dir / "sample.png").write_bytes(b"")
     (val_dir / "sample.png").write_bytes(b"")
     (test_dir / "sample.png").write_bytes(b"")
 
     payload = {"path": str(root)}
+    if include_train:
+        payload["train"] = "images/train"
     if include_val:
         payload["val"] = "images/val"
     if include_test:
@@ -211,6 +217,7 @@ def test_load_data_split_sources_supports_relative_absolute_and_lists(inference_
         yaml.safe_dump(
             {
                 "path": str(dataset_root),
+                "train": "images/train",
                 "val": "images/val",
                 "test": ["images/test", str(absolute_test)],
             }
@@ -218,8 +225,9 @@ def test_load_data_split_sources_supports_relative_absolute_and_lists(inference_
         encoding="utf-8",
     )
 
-    _, val_source, test_source = inference_module.load_data_split_sources(data_yaml)
+    _, train_source, val_source, test_source = inference_module.load_data_split_sources(data_yaml)
 
+    assert train_source == dataset_root / "images" / "train"
     assert val_source == dataset_root / "images" / "val"
     assert test_source == [dataset_root / "images" / "test", absolute_test]
 
@@ -282,6 +290,7 @@ def test_log_run_context_prints_resolved_details(inference_module, tmp_path: Pat
     assert "Model weights:" in output
     assert "Task: segment" in output
     assert "W&B run name: demo_run_inference" in output
+    assert str(context["run_dir"] / "predictions" / "train") in output
     assert str(context["run_dir"] / "predictions" / "val") in output
 
 
@@ -298,11 +307,13 @@ def test_run_inference_exports_logs_active_run_artifacts_and_preserves_local_exp
     result = inference_module.run_inference_exports(args, wandb_module=fake_wandb, model_cls=FakeYOLO)
 
     assert result["active_run_name"] == "demo_run_inference"
-    assert result["exported_subsets"] == ["val", "test"]
+    assert result["exported_subsets"] == ["train", "val", "test"]
     assert [artifact.name for artifact in fake_wandb.artifacts] == [
+        "demo_run_inference_predictions_train",
         "demo_run_inference_predictions_val",
         "demo_run_inference_predictions_test",
     ]
+    assert (run_dir / "predictions" / "train" / "predictions.json").is_file()
     assert (run_dir / "predictions" / "val" / "predictions.json").is_file()
     assert (run_dir / "predictions" / "test" / "predictions.json").is_file()
     assert fake_wandb.run is not None and fake_wandb.run.finished is True
@@ -316,5 +327,8 @@ def test_run_inference_exports_skips_missing_test_cleanly(inference_module, tmp_
 
     result = inference_module.run_inference_exports(args, wandb_module=fake_wandb, model_cls=FakeYOLO)
 
-    assert result["exported_subsets"] == ["val"]
-    assert [artifact.name for artifact in fake_wandb.artifacts] == ["demo_run_inference_predictions_val"]
+    assert result["exported_subsets"] == ["train", "val"]
+    assert [artifact.name for artifact in fake_wandb.artifacts] == [
+        "demo_run_inference_predictions_train",
+        "demo_run_inference_predictions_val",
+    ]
