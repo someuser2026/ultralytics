@@ -588,6 +588,7 @@ def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
         assert train_map["mode"] == "train"
         assert train_map["model"] == str(checkpoint)
         assert train_map["data"] == str(dataset_dir / "data.yaml")
+        assert train_map["time"] == "11"
         assert train_map["freeze"] == "1"
         assert train_map["lora"] == "true"
         assert train_map["lora_rank"] == "8"

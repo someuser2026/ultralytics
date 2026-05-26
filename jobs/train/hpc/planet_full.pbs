@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #PBS -l select=1:ncpus=6:ngpus=1:mem=32gb
-#PBS -l walltime=11:00:00
+#PBS -l walltime=11:30:00
 #PBS -M z5428587@ad.unsw.edu.au
 #PBS -m ae
 
@@ -59,6 +59,57 @@ bool_string() {
     fi
 }
 
+walltime_hours_before_buffer() {
+    local walltime="$1"
+    local buffer_minutes="${2:-30}"
+    local hours minutes seconds extra total_minutes whole_hours remaining_minutes decimal
+
+    IFS=: read -r hours minutes seconds extra <<< "${walltime}"
+    if [[ -n "${extra:-}" || -z "${hours}" || -z "${minutes}" || -z "${seconds}" ]]; then
+        return 1
+    fi
+    if ! [[ "${hours}" =~ ^[0-9]+$ && "${minutes}" =~ ^[0-9]+$ && "${seconds}" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+
+    total_minutes=$((10#${hours} * 60 + 10#${minutes} - buffer_minutes))
+    if ((10#${seconds} > 0)); then
+        total_minutes=$((total_minutes + 1))
+    fi
+    if ((total_minutes <= 0)); then
+        return 1
+    fi
+
+    whole_hours=$((total_minutes / 60))
+    remaining_minutes=$((total_minutes % 60))
+    decimal=$((remaining_minutes * 10000 / 60))
+    if ((remaining_minutes == 0)); then
+        printf '%d\n' "${whole_hours}"
+    else
+        printf '%d.%04d\n' "${whole_hours}" "${decimal}"
+    fi
+}
+
+resolve_pbs_walltime() {
+    local fallback_walltime="$1"
+    local walltime="${PBS_WALLTIME:-}"
+
+    if ! is_nullish "${walltime}"; then
+        printf '%s\n' "${walltime}"
+        return 0
+    fi
+
+    if [[ -n "${PBS_JOBID:-}" ]] && command -v qstat >/dev/null 2>&1; then
+        walltime="$(qstat -f "${PBS_JOBID}" 2>/dev/null | awk -F' = ' '/Resource_List.walltime/ {print $2; exit}' || true)"
+        if ! is_nullish "${walltime}"; then
+            printf '%s\n' "${walltime}"
+            return 0
+        fi
+    fi
+
+    printf '%s\n' "${fallback_walltime}"
+}
+
 append_arg() {
     local key="$1"
     local value="${2:-}"
@@ -106,6 +157,7 @@ resolve_run_name() {
     esac
 }
 
+pbs_walltime="11:30:00"
 task="${TASK:-}"
 imgsz="${IMGSZ:-}"
 model_yaml="${CONFIG_YAML:-}"
@@ -148,6 +200,16 @@ gaussian_blur_p="${GAUSSIAN_BLUR_P:-}"
 motion_blur_p="${MOTION_BLUR_P:-}"
 additive_noise_p="${ADDITIVE_NOISE_P:-}"
 multi_spec_noise_p="${MULTI_SPEC_NOISE_P:-}"
+
+if is_nullish "${time}"; then
+    effective_walltime="$(resolve_pbs_walltime "${pbs_walltime}")"
+    if time="$(walltime_hours_before_buffer "${effective_walltime}" 30)"; then
+        echo "TIME_FLOAT not provided; using time=${time} hours (30 minutes before PBS walltime ${effective_walltime})"
+    else
+        echo "Error: Could not derive TIME_FLOAT from PBS walltime: ${effective_walltime}"
+        exit 1
+    fi
+fi
 
 missing_params=()
 is_nullish "${task}" && missing_params+=("TASK")
