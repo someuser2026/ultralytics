@@ -104,6 +104,14 @@ class FakeTrainFailYOLO(FakeYOLO):
         return super().predict(source, stream=stream, **kwargs)
 
 
+class FakeStreamingYOLO(FakeYOLO):
+    def predict(self, source, stream: bool = True, **kwargs):
+        self.predict_calls.append({"source": source, "stream": stream, "kwargs": kwargs})
+        source_path = Path(source[0] if isinstance(source, (list, tuple)) else source)
+        image_path = next(source_path.rglob("*.png")) if source_path.is_dir() else source_path
+        yield make_obb_result(image_path)
+
+
 def make_obb_result(image_path: Path) -> Results:
     """Create one small OBB result payload for JSON export tests."""
     return Results(
@@ -359,3 +367,35 @@ def test_run_inference_exports_raises_when_configured_train_split_fails(inferenc
         "demo_run_inference_predictions_test",
     ]
     assert fake_wandb.run is not None and fake_wandb.run.finished is True
+
+
+def test_export_split_predictions_passes_prediction_stream_to_json_writer(inference_module, tmp_path: Path, monkeypatch):
+    split_root = tmp_path / "images" / "train"
+    split_root.mkdir(parents=True)
+    (split_root / "sample.png").write_bytes(b"")
+    output_dir = tmp_path / "predictions" / "train"
+    fake_model = FakeStreamingYOLO("weights.pt")
+    fake_wandb = FakeWandb()
+
+    def fake_save_predictions_json(results, output_dir_arg, source_root=None):
+        assert not isinstance(results, list)
+        output_path = Path(output_dir_arg)
+        output_path.mkdir(parents=True, exist_ok=True)
+        consumed = list(results)
+        assert len(consumed) == 1
+        (output_path / "predictions.json").write_text("{}", encoding="utf-8")
+        return output_path
+
+    monkeypatch.setattr(inference_module, "save_predictions_json", fake_save_predictions_json)
+
+    assert inference_module.export_split_predictions(
+        fake_model,
+        split_root,
+        output_dir,
+        "demo_run",
+        "train",
+        wandb_module=fake_wandb,
+        batch=8,
+    )
+    assert fake_model.predict_calls[0]["stream"] is True
+    assert [artifact.name for artifact in fake_wandb.artifacts] == ["demo_run_predictions_train"]

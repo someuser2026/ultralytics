@@ -284,6 +284,8 @@ def save_predictions_json(results, output_dir: str | Path, source_root=None) -> 
     payload = {"count": 0, "predictions": {}}
 
     for index, result in enumerate(results):
+        if hasattr(result, "cpu"):
+            result = result.cpu()
         key = prediction_result_key(result, source_root, index, used_keys)
         payload["predictions"][key] = prediction_json_payload(result)
 
@@ -336,7 +338,7 @@ def export_split_predictions(
 
     try:
         LOGGER.info(f"Exporting {subset} predictions from source: {format_context_value(split_source)}")
-        prediction_results = list(model.predict(split_source, stream=True, **predict_kwargs))
+        prediction_results = model.predict(split_source, stream=True, **predict_kwargs)
         save_predictions_json(prediction_results, output_dir, source_root=split_source)
         return log_predictions(output_dir, run_name, subset, wandb_module=wandb_module)
     except Exception as exc:
