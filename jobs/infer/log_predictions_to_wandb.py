@@ -124,6 +124,11 @@ def format_context_value(value: Any) -> str:
     return str(value)
 
 
+def has_split_source(split_source: Any) -> bool:
+    """Return whether a dataset split source is configured."""
+    return split_source not in (None, [])
+
+
 def log_run_context(context: dict[str, Any], active_run_name: str, *, resumed_original_run: bool) -> None:
     """Print the resolved model and inference context before prediction export starts."""
     LOGGER.info("=========================================")
@@ -325,11 +330,12 @@ def export_split_predictions(
     **predict_kwargs,
 ) -> bool:
     """Export one split's predictions to JSON and upload them to W&B."""
-    if split_source in (None, []):
+    if not has_split_source(split_source):
         LOGGER.info(f"No '{subset}' path found in data.yaml; skipping {subset} prediction artifact export.")
         return False
 
     try:
+        LOGGER.info(f"Exporting {subset} predictions from source: {format_context_value(split_source)}")
         prediction_results = list(model.predict(split_source, stream=True, **predict_kwargs))
         save_predictions_json(prediction_results, output_dir, source_root=split_source)
         return log_predictions(output_dir, run_name, subset, wandb_module=wandb_module)
@@ -427,8 +433,15 @@ def run_inference_exports(args: argparse.Namespace, *, wandb_module=None, model_
         output_root = context["run_dir"] / "predictions"
         predict_kwargs = build_predict_kwargs(context)
 
+        split_sources = (("train", train_source), ("val", val_source), ("test", test_source))
+        LOGGER.info("Resolved dataset split sources:")
+        for subset, split_source in split_sources:
+            LOGGER.info(f"  {subset}: {format_context_value(split_source)}")
+
         exported_subsets = []
-        for subset, split_source in (("train", train_source), ("val", val_source), ("test", test_source)):
+        failed_subsets = []
+        skipped_subsets = []
+        for subset, split_source in split_sources:
             output_dir = output_root / subset
             if export_split_predictions(
                 model,
@@ -440,6 +453,16 @@ def run_inference_exports(args: argparse.Namespace, *, wandb_module=None, model_
                 **predict_kwargs,
             ):
                 exported_subsets.append(subset)
+            elif has_split_source(split_source):
+                failed_subsets.append(subset)
+            else:
+                skipped_subsets.append(subset)
+
+        LOGGER.info(f"Exported prediction artifacts: {format_context_value(exported_subsets)}")
+        if skipped_subsets:
+            LOGGER.info(f"Skipped prediction artifacts: {format_context_value(skipped_subsets)}")
+        if failed_subsets:
+            raise RuntimeError(f"Prediction export failed for configured split(s): {', '.join(failed_subsets)}")
 
         if not exported_subsets:
             LOGGER.warning("No train/val/test prediction artifacts were exported.")
@@ -448,6 +471,8 @@ def run_inference_exports(args: argparse.Namespace, *, wandb_module=None, model_
             "active_run_name": active_run_name,
             "context": context,
             "exported_subsets": exported_subsets,
+            "skipped_subsets": skipped_subsets,
+            "failed_subsets": failed_subsets,
         }
     finally:
         if run is not None and hasattr(run, "finish"):
