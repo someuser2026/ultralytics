@@ -169,6 +169,7 @@ experiment_prefix="${EXPERIMENT_PREFIX:-}"
 overlap="${OVERLAP:-}"
 keep_frac="${KEEP_FRAC:-}"
 batch="${BATCH:-}"
+data_yaml_override="${DATA_YAML:-}"
 
 weights="${CHECKPOINT:-}"
 freeze="${FREEZE:-}"
@@ -190,6 +191,10 @@ slovhn="${SLOVHN:-}"
 angle_mode="${ANGLE_MODE:-}"
 use_land_water_input="${USE_LAND_WATER_INPUT:-}"
 use_shoreline_input="${USE_SHORELINE_INPUT:-}"
+use_shoreline_prior_loss="${USE_SHORELINE_PRIOR_LOSS:-}"
+use_land_water_prior_loss="${USE_LAND_WATER_PRIOR_LOSS:-}"
+use_shoreline_aux_loss="${USE_SHORELINE_AUX_LOSS:-}"
+shoreline_aux_warmup_epochs="${SHORELINE_AUX_WARMUP_EPOCHS:-}"
 
 clahe_p="${CLAHE_P:-}"
 rand_gamma_p="${RAND_GAMMA_P:-}"
@@ -247,6 +252,7 @@ echo "  Experiment mode: ${experiment_mode}"
 echo "  Overlap: ${overlap}"
 echo "  Keep fraction: ${keep_frac}"
 echo "  Batch: ${batch}"
+echo "  Data YAML override: ${data_yaml_override:-null}"
 echo ""
 echo "Optional Parameters:"
 echo "  Weights: ${weights:-null}"
@@ -262,6 +268,12 @@ echo "  Multispectral: ${multispectral}"
 echo "  WandB: ${wandb}"
 echo "  Project Name: ${project:-null}"
 echo "  Use soft ignore boundary loss: ${use_soft_ignore:-null}"
+echo "  Use shoreline input: ${use_shoreline_input:-null}"
+echo "  Use land/water input: ${use_land_water_input:-null}"
+echo "  Use shoreline prior loss: ${use_shoreline_prior_loss:-null}"
+echo "  Use land/water prior loss: ${use_land_water_prior_loss:-null}"
+echo "  Use shoreline aux loss: ${use_shoreline_aux_loss:-null}"
+echo "  Shoreline aux warmup epochs: ${shoreline_aux_warmup_epochs:-null}"
 echo "  Seed: ${seed}"
 echo "========================================="
 
@@ -282,57 +294,62 @@ else
     echo "ℹ No weights file specified - will use model YAML"
 fi
 
-case "${multispectral}" in
-    0)
-        data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_full_c${imgsz}_ov${overlap}_kf${keep_frac}_seed${seed}/data.yaml"
-        echo "ℹ Using standard RGB dataset with only 100"
-        ;;
-    01)
-        data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_full_c${imgsz}_ov${overlap}_kf${keep_frac}_maxarea5000_seed${seed}/data.yaml"
-        echo "ℹ Using standard RGB dataset (max area filtered)"
-        ;;
-    001)
-        data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_full_c${imgsz}_ov${overlap}_kf${keep_frac}_10075-multi_seed${seed}/data.yaml"
-        echo "ℹ Using Planet RGB dataset with 100 and 75 as different classes"
-        ;;
-    002)
-        data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_full_c${imgsz}_ov${overlap}_kf${keep_frac}_all_seed${seed}/data.yaml"
-        echo "ℹ Using Planet RGB dataset with 100, 75, 50 and 30 as different classes"
-        ;;
-    003)
-        data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_full_c${imgsz}_ov${overlap}_kf${keep_frac}_10075-single_seed${seed}/data.yaml"
-        echo "ℹ Using Planet RGB dataset with 100 and 75 as single class"
-        ;;
-    004)
-        data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_full_c${imgsz}_ov${overlap}_kf${keep_frac}_all_soft_seed${seed}/data.yaml"
-        echo "ℹ Using Planet RGB dataset with soft labels (single class + per-annotation probability)"
-        ;;
-    1)
-        data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_full_analytic_udm2_c${imgsz}_ov${overlap}_kf${keep_frac}_seed${seed}/data.yaml"
-        echo "ℹ Using RGB + NIR dataset"
-        ;;
-    11)
-        data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_full_analytic_udm2_c${imgsz}_ov${overlap}_kf${keep_frac}_maxarea5000_seed${seed}/data.yaml"
-        echo "ℹ Using RGB + NIR dataset (max area filtered)"
-        ;;
-    2)
-        data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_nearmap_c${imgsz}_ov${overlap}_kf${keep_frac}_seed${seed}/data.yaml"
-        echo "ℹ Using Planet + Nearmap RGB dataset with 100 only"
-        ;;
-    21)
-        data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_nearmap_c${imgsz}_ov${overlap}_kf${keep_frac}_10075-single_seed${seed}/data.yaml"
-        echo "ℹ Using Planet + Nearmap RGB dataset with 100, 75 single class"
-        ;;
-    3)
-        data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/nearmap_c${imgsz}_ov${overlap}_kf${keep_frac}_seed${seed}/data.yaml"
-        echo "ℹ Using Only Nearmap RGB dataset"
-        ;;
-    *)
-        echo "Error: Invalid multispectral value: ${multispectral}"
-        echo "Valid values: 0, 01, 001, 002, 003, 004, 1, 11, 2, 21, 3"
-        exit 1
-        ;;
-esac
+if ! is_nullish "${data_yaml_override}"; then
+    data_yaml_path="${data_yaml_override}"
+    echo "ℹ Using explicit data YAML override"
+else
+    case "${multispectral}" in
+        0)
+            data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_full_c${imgsz}_ov${overlap}_kf${keep_frac}_seed${seed}/data.yaml"
+            echo "ℹ Using standard RGB dataset with only 100"
+            ;;
+        01)
+            data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_full_c${imgsz}_ov${overlap}_kf${keep_frac}_maxarea5000_seed${seed}/data.yaml"
+            echo "ℹ Using standard RGB dataset (max area filtered)"
+            ;;
+        001)
+            data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_full_c${imgsz}_ov${overlap}_kf${keep_frac}_10075-multi_seed${seed}/data.yaml"
+            echo "ℹ Using Planet RGB dataset with 100 and 75 as different classes"
+            ;;
+        002)
+            data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_full_c${imgsz}_ov${overlap}_kf${keep_frac}_all_seed${seed}/data.yaml"
+            echo "ℹ Using Planet RGB dataset with 100, 75, 50 and 30 as different classes"
+            ;;
+        003)
+            data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_full_c${imgsz}_ov${overlap}_kf${keep_frac}_10075-single_seed${seed}/data.yaml"
+            echo "ℹ Using Planet RGB dataset with 100 and 75 as single class"
+            ;;
+        004)
+            data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_full_c${imgsz}_ov${overlap}_kf${keep_frac}_all_soft_seed${seed}/data.yaml"
+            echo "ℹ Using Planet RGB dataset with soft labels (single class + per-annotation probability)"
+            ;;
+        1)
+            data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_full_analytic_udm2_c${imgsz}_ov${overlap}_kf${keep_frac}_seed${seed}/data.yaml"
+            echo "ℹ Using RGB + NIR dataset"
+            ;;
+        11)
+            data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_full_analytic_udm2_c${imgsz}_ov${overlap}_kf${keep_frac}_maxarea5000_seed${seed}/data.yaml"
+            echo "ℹ Using RGB + NIR dataset (max area filtered)"
+            ;;
+        2)
+            data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_nearmap_c${imgsz}_ov${overlap}_kf${keep_frac}_seed${seed}/data.yaml"
+            echo "ℹ Using Planet + Nearmap RGB dataset with 100 only"
+            ;;
+        21)
+            data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/planet_nearmap_c${imgsz}_ov${overlap}_kf${keep_frac}_10075-single_seed${seed}/data.yaml"
+            echo "ℹ Using Planet + Nearmap RGB dataset with 100, 75 single class"
+            ;;
+        3)
+            data_yaml_path="${SCRATCH}/data_processed/Global/Annotated/variants/${task}/nearmap_c${imgsz}_ov${overlap}_kf${keep_frac}_seed${seed}/data.yaml"
+            echo "ℹ Using Only Nearmap RGB dataset"
+            ;;
+        *)
+            echo "Error: Invalid multispectral value: ${multispectral}"
+            echo "Valid values: 0, 01, 001, 002, 003, 004, 1, 11, 2, 21, 3"
+            exit 1
+            ;;
+    esac
+fi
 
 if [ ! -f "${data_yaml_path}" ]; then
     echo "Error: Data YAML file not found: ${data_yaml_path}"
@@ -413,6 +430,10 @@ append_arg "seg_w_lovasz" "${slovhn}"
 append_arg "angle_mode" "${angle_mode}"
 append_arg "use_land_water_input" "${use_land_water_input}"
 append_arg "use_shoreline_input" "${use_shoreline_input}"
+append_arg "use_shoreline_prior_loss" "${use_shoreline_prior_loss}"
+append_arg "use_land_water_prior_loss" "${use_land_water_prior_loss}"
+append_arg "use_shoreline_aux_loss" "${use_shoreline_aux_loss}"
+append_arg "shoreline_aux_warmup_epochs" "${shoreline_aux_warmup_epochs}"
 
 append_arg "clahe_p" "${clahe_p}"
 append_arg "rand_gamma_p" "${rand_gamma_p}"

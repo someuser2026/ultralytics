@@ -412,6 +412,98 @@ def test_mamba_yolo_submitters_resolve_local_configs(tmp_path: Path) -> None:
     assert len(_parse_call_log(qsub_log)) == len(cases)
 
 
+def test_shoreline_segment_submitter_passes_requested_variants(tmp_path: Path) -> None:
+    """Smoke-test the fixed shoreline segment launcher with the requested knobs."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+    scratch = tmp_path / "scratch"
+
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{\n"
+        "  echo CALL\n"
+        "  for arg in \"$@\"; do\n"
+        "    printf '%s\\n' \"$arg\"\n"
+        "  done\n"
+        "  echo END\n"
+        "} >> \"$QSUB_LOG\"\n",
+    )
+    _write_stub(bin_dir / "sleep", "#!/usr/bin/env bash\nexit 0\n")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["QSUB_LOG"] = str(qsub_log)
+    env["SCRATCH"] = str(scratch)
+
+    subprocess.run(
+        ["bash", "jobs/train/hpc/bash_scripts_seg/submit_shoreline_segment_models.sh", "8", "5", "0", "0"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == 10
+
+    expected_data = (
+        scratch
+        / "data_processed/Global/Annotated/variants/segment/"
+        / "planet_full_c448_ov35_kf20_10075-single_sh-lw-d-prx-cl-hz-sdw_seed0/data.yaml"
+    )
+    by_name = {call[call.index("-N") + 1]: _parse_varlist(call) for call in calls}
+
+    expected_configs = {
+        "yolo12n_seg_shore_lw_loss": "ultralytics/cfg/models/12/yolo12-seg.yaml",
+        "yolo12n_seg_shore_lw_input": "ultralytics/cfg/models/12/yolo12-seg.yaml",
+        "yolo12n_seg_shore_aux_head": "ultralytics/cfg/models/12/yolo12-seg-shoreaux.yaml",
+        "yolo26n_seg_normal": "ultralytics/cfg/models/26/yolo26-seg.yaml",
+        "yolo26n_seg_shore_lw_input": "ultralytics/cfg/models/26/yolo26-seg.yaml",
+        "mamba_hrnet_seg_shore_lw_loss": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml",
+        "mamba_hrnet_seg_shore_lw_input": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml",
+        "mamba_hrnet_yolo26_seg_normal": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml",
+        "mamba_hrnet_yolo26_seg_shore_lw_input": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml",
+        "mamba_hrnet_cascade_mask_rcnn_normal": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-cascade-mask-rcnn.yaml",
+    }
+    assert set(by_name) == set(expected_configs)
+
+    for name, config_yaml in expected_configs.items():
+        vars_map = by_name[name]
+        assert vars_map["TASK"] == "segment"
+        assert vars_map["IMGSZ"] == "448"
+        assert vars_map["EPOCHS"] == "5"
+        assert vars_map["BATCH"] == "8"
+        assert vars_map["DEVICE"] == "0"
+        assert vars_map["PROJECT"] == "null"
+        assert vars_map["DATA_YAML"] == str(expected_data)
+        assert vars_map["CONFIG_YAML"] == config_yaml
+        assert vars_map["EXPERIMENT_MODE"] == name
+        assert Path(REPO_ROOT / config_yaml).is_file()
+
+    for name in ("yolo12n_seg_shore_lw_loss", "mamba_hrnet_seg_shore_lw_loss"):
+        assert by_name[name]["USE_SHORELINE_PRIOR_LOSS"] == "true"
+        assert by_name[name]["USE_LAND_WATER_PRIOR_LOSS"] == "true"
+        assert by_name[name]["USE_SHORELINE_INPUT"] == "false"
+        assert by_name[name]["USE_LAND_WATER_INPUT"] == "false"
+
+    for name in (
+        "yolo12n_seg_shore_lw_input",
+        "yolo26n_seg_shore_lw_input",
+        "mamba_hrnet_seg_shore_lw_input",
+        "mamba_hrnet_yolo26_seg_shore_lw_input",
+    ):
+        assert by_name[name]["USE_SHORELINE_INPUT"] == "true"
+        assert by_name[name]["USE_LAND_WATER_INPUT"] == "true"
+        assert by_name[name]["USE_SHORELINE_PRIOR_LOSS"] == "false"
+        assert by_name[name]["USE_LAND_WATER_PRIOR_LOSS"] == "false"
+
+    aux_vars = by_name["yolo12n_seg_shore_aux_head"]
+    assert aux_vars["USE_SHORELINE_AUX_LOSS"] == "true"
+    assert aux_vars["SHORELINE_AUX_WARMUP_EPOCHS"] == "2"
+
+
 def test_rhino_submitter_resolves_local_configs(tmp_path: Path) -> None:
     """Smoke-test the RHINO submitter with aliases, paths, and dry-run flows."""
     bin_dir = tmp_path / "bin"
@@ -555,6 +647,12 @@ def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
     env_base["LORA_ALPHA"] = "16"
     env_base["LORA_DROPOUT"] = "0.1"
     env_base["USE_SOFT_IGNORE"] = "true"
+    env_base["USE_SHORELINE_INPUT"] = "true"
+    env_base["USE_LAND_WATER_INPUT"] = "true"
+    env_base["USE_SHORELINE_PRIOR_LOSS"] = "true"
+    env_base["USE_LAND_WATER_PRIOR_LOSS"] = "true"
+    env_base["USE_SHORELINE_AUX_LOSS"] = "true"
+    env_base["SHORELINE_AUX_WARMUP_EPOCHS"] = "2"
     env_base["SDICE"] = "1"
     env_base["GAUSSIAN_BLUR_P"] = "0.25"
     env_base["WANDB"] = "true"
@@ -595,6 +693,12 @@ def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
         assert train_map["lora_alpha"] == "16"
         assert train_map["lora_dropout"] == "0.1"
         assert train_map["use_soft_ignore_band"] == "true"
+        assert train_map["use_shoreline_input"] == "true"
+        assert train_map["use_land_water_input"] == "true"
+        assert train_map["use_shoreline_prior_loss"] == "true"
+        assert train_map["use_land_water_prior_loss"] == "true"
+        assert train_map["use_shoreline_aux_loss"] == "true"
+        assert train_map["shoreline_aux_warmup_epochs"] == "2"
         assert train_map["seg_w_dice"] == "1"
         assert train_map["gaussian_blur_p"] == "0.25"
 
