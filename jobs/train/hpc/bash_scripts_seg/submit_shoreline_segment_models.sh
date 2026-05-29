@@ -1,29 +1,53 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Submit the fixed shoreline/land-water segment model checks requested for the
-# Planet full c448 10075-single shoreline-band dataset.
+# Submit full segment runs for the fixed Planet full c448 10075-single
+# shoreline-band dataset.
 #
 # Usage:
 #   bash jobs/train/hpc/bash_scripts_seg/submit_shoreline_segment_models.sh [BATCH] [EPOCHS] [SEED] [DRY_RUN]
 #
 # Example:
-#   bash jobs/train/hpc/bash_scripts_seg/submit_shoreline_segment_models.sh 8 5 0 1
+#   bash jobs/train/hpc/bash_scripts_seg/submit_shoreline_segment_models.sh 8 100 0 1
 #
 # Optional environment overrides:
 #   DATA_YAML=/path/to/data.yaml
-#   PROJECT=null
+#   PROJECT=shoreline_segment_models
 #   DEVICE=0
 #   WANDB=true
+#   CLAHE_P=0.0
+#   UNSHARP_P=0.0
+#   GAUSSIAN_BLUR_P=0.0
+#   MOTION_BLUR_P=0.0
+#   MULTI_SPEC_NOISE_P=0.0
+#   MOSAIC=0.0
 
 IMGSZ=448
-BATCH="${1:-8}"
-EPOCHS="${2:-5}"
-SEED="${3:-0}"
-DRY_RUN="${4:-0}"
+BATCH="${1:-${BATCH:-8}}"
+EPOCHS="${2:-${EPOCHS:-100}}"
+SEED="${3:-${SEED:-0}}"
+DRY_RUN="${4:-${DRY_RUN:-0}}"
 DEVICE="${DEVICE:-0}"
 WANDB="${WANDB:-true}"
-PROJECT="${PROJECT:-null}"
+PROJECT="${PROJECT:-shoreline_segment_models}"
+RUN_TAG="${RUN_TAG:-$(date +%m%d-%H%M%S)}"
+USE_SOFT_IGNORE="${USE_SOFT_IGNORE:-}"
+SDICE="${SDICE:-1}"
+SBCE="${SBCE:-}"
+SLOVHN="${SLOVHN:-}"
+CLAHE_P="${CLAHE_P:-0.0}"
+RAND_GAMMA_P="${RAND_GAMMA_P:-}"
+UNSHARP_P="${UNSHARP_P:-0.0}"
+EDGEBOOST_P="${EDGEBOOST_P:-}"
+HOMOMORPHIC_P="${HOMOMORPHIC_P:-}"
+GAUSSIAN_BLUR_P="${GAUSSIAN_BLUR_P:-0.0}"
+MOTION_BLUR_P="${MOTION_BLUR_P:-0.0}"
+ADDITIVE_NOISE_P="${ADDITIVE_NOISE_P:-}"
+MULTI_SPEC_NOISE_P="${MULTI_SPEC_NOISE_P:-0.0}"
+MOSAIC="${MOSAIC:-0.0}"
+MIXUP="${MIXUP:-0.0}"
+COPY_PASTE="${COPY_PASTE:-0.0}"
+CLOSE_MOSAIC="${CLOSE_MOSAIC:-0}"
 PBS_SCRIPT="jobs/train/hpc/planet_full.pbs"
 
 [[ "$BATCH" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "BATCH must be numeric"; exit 1; }
@@ -50,6 +74,14 @@ append_var() {
   VARS+=("${key}=${value}")
 }
 
+append_if_set() {
+  local key="$1"
+  local value="${2:-}"
+  if [[ -n "$value" ]]; then
+    VARS+=("${key}=${value}")
+  fi
+}
+
 submit_job() {
   local label="$1"
   local config_yaml="$2"
@@ -67,7 +99,7 @@ submit_job() {
   append_var "TIME_FLOAT" "null"
   append_var "EPOCHS" "$EPOCHS"
   append_var "DEVICE" "$DEVICE"
-  append_var "EXPERIMENT_MODE" "$label"
+  append_var "EXPERIMENT_MODE" "${RUN_TAG}_${label}"
   append_var "OVERLAP" "35"
   append_var "KEEP_FRAC" "20"
   append_var "MULTISPECTRAL" "003"
@@ -78,6 +110,10 @@ submit_job() {
   append_var "SEED" "$SEED"
   append_var "WANDB" "$WANDB"
   append_var "PROJECT" "$PROJECT"
+  append_if_set "USE_SOFT_IGNORE" "$USE_SOFT_IGNORE"
+  append_if_set "SDICE" "$SDICE"
+  append_if_set "SBCE" "$SBCE"
+  append_if_set "SLOVHN" "$SLOVHN"
   append_var "USE_SHORELINE_PRIOR_LOSS" "$use_shoreline_prior_loss"
   append_var "USE_LAND_WATER_PRIOR_LOSS" "$use_land_water_prior_loss"
   append_var "USE_SHORELINE_INPUT" "$use_shoreline_input"
@@ -86,6 +122,19 @@ submit_job() {
   if [[ "$shoreline_aux_warmup_epochs" != "null" ]]; then
     append_var "SHORELINE_AUX_WARMUP_EPOCHS" "$shoreline_aux_warmup_epochs"
   fi
+  append_if_set "CLAHE_P" "$CLAHE_P"
+  append_if_set "RAND_GAMMA_P" "$RAND_GAMMA_P"
+  append_if_set "UNSHARP_P" "$UNSHARP_P"
+  append_if_set "EDGEBOOST_P" "$EDGEBOOST_P"
+  append_if_set "HOMOMORPHIC_P" "$HOMOMORPHIC_P"
+  append_if_set "GAUSSIAN_BLUR_P" "$GAUSSIAN_BLUR_P"
+  append_if_set "MOTION_BLUR_P" "$MOTION_BLUR_P"
+  append_if_set "ADDITIVE_NOISE_P" "$ADDITIVE_NOISE_P"
+  append_if_set "MULTI_SPEC_NOISE_P" "$MULTI_SPEC_NOISE_P"
+  append_if_set "MOSAIC" "$MOSAIC"
+  append_if_set "MIXUP" "$MIXUP"
+  append_if_set "COPY_PASTE" "$COPY_PASTE"
+  append_if_set "CLOSE_MOSAIC" "$CLOSE_MOSAIC"
 
   local varlist
   varlist="$(IFS=,; echo "${VARS[*]}")"
@@ -122,7 +171,8 @@ done
 
 echo "Submitting ${#MODELS[@]} shoreline segment jobs"
 echo "DATA_YAML=${DATA_YAML}"
-echo "IMGSZ=${IMGSZ}, EPOCHS=${EPOCHS}, BATCH=${BATCH}, DEVICE=${DEVICE}, SEED=${SEED}, PROJECT=${PROJECT}, DRY_RUN=${DRY_RUN}"
+echo "IMGSZ=${IMGSZ}, EPOCHS=${EPOCHS}, BATCH=${BATCH}, DEVICE=${DEVICE}, SEED=${SEED}, PROJECT=${PROJECT}, RUN_TAG=${RUN_TAG}, DRY_RUN=${DRY_RUN}"
+echo "Augmentations: CLAHE_P=${CLAHE_P}, UNSHARP_P=${UNSHARP_P}, GAUSSIAN_BLUR_P=${GAUSSIAN_BLUR_P}, MOTION_BLUR_P=${MOTION_BLUR_P}, MULTI_SPEC_NOISE_P=${MULTI_SPEC_NOISE_P}, MOSAIC=${MOSAIC}, MIXUP=${MIXUP}, COPY_PASTE=${COPY_PASTE}, CLOSE_MOSAIC=${CLOSE_MOSAIC}"
 
 count=0
 for entry in "${MODELS[@]}"; do

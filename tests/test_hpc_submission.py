@@ -437,9 +437,10 @@ def test_shoreline_segment_submitter_passes_requested_variants(tmp_path: Path) -
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["QSUB_LOG"] = str(qsub_log)
     env["SCRATCH"] = str(scratch)
+    env["RUN_TAG"] = "testrun"
 
     subprocess.run(
-        ["bash", "jobs/train/hpc/bash_scripts_seg/submit_shoreline_segment_models.sh", "8", "5", "0", "0"],
+        ["bash", "jobs/train/hpc/bash_scripts_seg/submit_shoreline_segment_models.sh", "8", "100", "0", "0"],
         cwd=REPO_ROOT,
         env=env,
         check=True,
@@ -473,13 +474,23 @@ def test_shoreline_segment_submitter_passes_requested_variants(tmp_path: Path) -
         vars_map = by_name[name]
         assert vars_map["TASK"] == "segment"
         assert vars_map["IMGSZ"] == "448"
-        assert vars_map["EPOCHS"] == "5"
+        assert vars_map["EPOCHS"] == "100"
         assert vars_map["BATCH"] == "8"
         assert vars_map["DEVICE"] == "0"
-        assert vars_map["PROJECT"] == "null"
+        assert vars_map["PROJECT"] == "shoreline_segment_models"
         assert vars_map["DATA_YAML"] == str(expected_data)
         assert vars_map["CONFIG_YAML"] == config_yaml
-        assert vars_map["EXPERIMENT_MODE"] == name
+        assert vars_map["EXPERIMENT_MODE"] == f"testrun_{name}"
+        assert vars_map["SDICE"] == "1"
+        assert vars_map["CLAHE_P"] == "0.0"
+        assert vars_map["UNSHARP_P"] == "0.0"
+        assert vars_map["GAUSSIAN_BLUR_P"] == "0.0"
+        assert vars_map["MOTION_BLUR_P"] == "0.0"
+        assert vars_map["MULTI_SPEC_NOISE_P"] == "0.0"
+        assert vars_map["MOSAIC"] == "0.0"
+        assert vars_map["MIXUP"] == "0.0"
+        assert vars_map["COPY_PASTE"] == "0.0"
+        assert vars_map["CLOSE_MOSAIC"] == "0"
         assert Path(REPO_ROOT / config_yaml).is_file()
 
     for name in ("yolo12n_seg_shore_lw_loss", "mamba_hrnet_seg_shore_lw_loss"):
@@ -655,6 +666,10 @@ def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
     env_base["SHORELINE_AUX_WARMUP_EPOCHS"] = "2"
     env_base["SDICE"] = "1"
     env_base["GAUSSIAN_BLUR_P"] = "0.25"
+    env_base["MOSAIC"] = "0.0"
+    env_base["MIXUP"] = "0.0"
+    env_base["COPY_PASTE"] = "0.0"
+    env_base["CLOSE_MOSAIC"] = "0"
     env_base["WANDB"] = "true"
     env_base["SEED"] = "0"
     env_base["MULTISPECTRAL"] = "0"
@@ -701,6 +716,10 @@ def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
         assert train_map["shoreline_aux_warmup_epochs"] == "2"
         assert train_map["seg_w_dice"] == "1"
         assert train_map["gaussian_blur_p"] == "0.25"
+        assert train_map["mosaic"] == "0.0"
+        assert train_map["mixup"] == "0.0"
+        assert train_map["copy_paste"] == "0.0"
+        assert train_map["close_mosaic"] == "0"
 
     auto_run = {k: v for k, v in (arg.split("=", 1) for arg in calls[1] if "=" in arg)}
     literal_run = {k: v for k, v in (arg.split("=", 1) for arg in calls[3] if "=" in arg)}
