@@ -522,8 +522,8 @@ def test_shoreline_segment_submitter_passes_requested_variants(tmp_path: Path) -
     assert aux_vars["SHORELINE_AUX_WARMUP_EPOCHS"] == "2"
 
 
-def test_mamba_hrnet_shore_lw_input_submitter_limits_batch_and_workers(tmp_path: Path) -> None:
-    """Submit only the Mamba-HRNet shoreline input segment variants with reduced loader pressure."""
+def test_mamba_hrnet_shore_lw_submitter_limits_batch_and_workers(tmp_path: Path) -> None:
+    """Submit only the Mamba-HRNet shoreline input/loss segment variants with reduced loader pressure."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     qsub_log = tmp_path / "qsub.log"
@@ -557,7 +557,7 @@ def test_mamba_hrnet_shore_lw_input_submitter_limits_batch_and_workers(tmp_path:
     )
 
     calls = _parse_call_log(qsub_log)
-    assert len(calls) == 2
+    assert len(calls) == 3
     for call in calls:
         assert call[-1] == "jobs/train/hpc/planet_full.pbs"
     by_name = {call[call.index("-N") + 1]: _parse_varlist(call) for call in calls}
@@ -568,13 +568,20 @@ def test_mamba_hrnet_shore_lw_input_submitter_limits_batch_and_workers(tmp_path:
         / "planet_full_c448_ov35_kf20_10075-single_sh-lw-d-prx-cl-hz-sdw_seed0/data.yaml"
     )
     expected_configs = {
+        "mamba_hrnet_seg_shore_lw_loss": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml",
         "mamba_hrnet_seg_shore_lw_input": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml",
         "mamba_hrnet_yolo26_seg_shore_lw_input": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml",
+    }
+    expected_flags = {
+        "mamba_hrnet_seg_shore_lw_loss": ("true", "true", "false", "false"),
+        "mamba_hrnet_seg_shore_lw_input": ("false", "false", "true", "true"),
+        "mamba_hrnet_yolo26_seg_shore_lw_input": ("false", "false", "true", "true"),
     }
     assert set(by_name) == set(expected_configs)
 
     for name, config_yaml in expected_configs.items():
         vars_map = by_name[name]
+        shore_prior, lw_prior, shore_input, lw_input = expected_flags[name]
         assert vars_map["TASK"] == "segment"
         assert vars_map["IMGSZ"] == "448"
         assert vars_map["EPOCHS"] == "100"
@@ -584,10 +591,10 @@ def test_mamba_hrnet_shore_lw_input_submitter_limits_batch_and_workers(tmp_path:
         assert vars_map["DATA_YAML"] == str(expected_data)
         assert vars_map["CONFIG_YAML"] == config_yaml
         assert vars_map["EXPERIMENT_MODE"] == f"testrun_{name}"
-        assert vars_map["USE_SHORELINE_INPUT"] == "true"
-        assert vars_map["USE_LAND_WATER_INPUT"] == "true"
-        assert vars_map["USE_SHORELINE_PRIOR_LOSS"] == "false"
-        assert vars_map["USE_LAND_WATER_PRIOR_LOSS"] == "false"
+        assert vars_map["USE_SHORELINE_PRIOR_LOSS"] == shore_prior
+        assert vars_map["USE_LAND_WATER_PRIOR_LOSS"] == lw_prior
+        assert vars_map["USE_SHORELINE_INPUT"] == shore_input
+        assert vars_map["USE_LAND_WATER_INPUT"] == lw_input
         assert vars_map["USE_SHORELINE_AUX_LOSS"] == "false"
 
 

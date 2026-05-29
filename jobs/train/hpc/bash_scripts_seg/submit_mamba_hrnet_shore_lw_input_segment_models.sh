@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Submit only the Mamba-HRNet shoreline + land/water input segment runs.
+# Submit only the Mamba-HRNet shoreline + land/water input/loss segment runs.
 #
 # Usage:
 #   bash jobs/train/hpc/bash_scripts_seg/submit_mamba_hrnet_shore_lw_input_segment_models.sh [BATCH] [EPOCHS] [SEED] [DRY_RUN] [WORKERS]
@@ -82,6 +82,10 @@ append_if_set() {
 submit_job() {
   local label="$1"
   local config_yaml="$2"
+  local use_shoreline_prior_loss="$3"
+  local use_land_water_prior_loss="$4"
+  local use_shoreline_input="$5"
+  local use_land_water_input="$6"
 
   VARS=()
   append_var "TASK" "segment"
@@ -106,10 +110,10 @@ submit_job() {
   append_if_set "SDICE" "$SDICE"
   append_if_set "SBCE" "$SBCE"
   append_if_set "SLOVHN" "$SLOVHN"
-  append_var "USE_SHORELINE_PRIOR_LOSS" "false"
-  append_var "USE_LAND_WATER_PRIOR_LOSS" "false"
-  append_var "USE_SHORELINE_INPUT" "true"
-  append_var "USE_LAND_WATER_INPUT" "true"
+  append_var "USE_SHORELINE_PRIOR_LOSS" "$use_shoreline_prior_loss"
+  append_var "USE_LAND_WATER_PRIOR_LOSS" "$use_land_water_prior_loss"
+  append_var "USE_SHORELINE_INPUT" "$use_shoreline_input"
+  append_var "USE_LAND_WATER_INPUT" "$use_land_water_input"
   append_var "USE_SHORELINE_AUX_LOSS" "false"
   append_if_set "SEGMENT_PRIOR_TOPK" "$SEGMENT_PRIOR_TOPK"
   append_if_set "CLAHE_P" "$CLAHE_P"
@@ -142,16 +146,17 @@ submit_job() {
 }
 
 MODELS=(
-  "mamba_hrnet_seg_shore_lw_input|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml"
-  "mamba_hrnet_yolo26_seg_shore_lw_input|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml"
+  "mamba_hrnet_seg_shore_lw_loss|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|true|true|false|false"
+  "mamba_hrnet_seg_shore_lw_input|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|false|false|true|true"
+  "mamba_hrnet_yolo26_seg_shore_lw_input|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml|false|false|true|true"
 )
 
 for entry in "${MODELS[@]}"; do
-  IFS='|' read -r _label cfg <<< "$entry"
+  IFS='|' read -r _label cfg _shore_prior _lw_prior _shore_input _lw_input <<< "$entry"
   require_file "$cfg"
 done
 
-echo "Submitting ${#MODELS[@]} Mamba-HRNet shoreline+land-water input segment jobs"
+echo "Submitting ${#MODELS[@]} Mamba-HRNet shoreline+land-water input/loss segment jobs"
 echo "DATA_YAML=${DATA_YAML}"
 echo "IMGSZ=${IMGSZ}, EPOCHS=${EPOCHS}, BATCH=${BATCH}, WORKERS=${WORKERS}, DEVICE=${DEVICE}, SEED=${SEED}, PROJECT=${PROJECT}, RUN_TAG=${RUN_TAG}, DRY_RUN=${DRY_RUN}"
 echo "Augmentations: CLAHE_P=${CLAHE_P}, UNSHARP_P=${UNSHARP_P}, GAUSSIAN_BLUR_P=${GAUSSIAN_BLUR_P}, MOTION_BLUR_P=${MOTION_BLUR_P}, MULTI_SPEC_NOISE_P=${MULTI_SPEC_NOISE_P}, MOSAIC=${MOSAIC}, MIXUP=${MIXUP}, COPY_PASTE=${COPY_PASTE}, CLOSE_MOSAIC=${CLOSE_MOSAIC}"
@@ -159,9 +164,9 @@ echo "Augmentations: CLAHE_P=${CLAHE_P}, UNSHARP_P=${UNSHARP_P}, GAUSSIAN_BLUR_P
 count=0
 for entry in "${MODELS[@]}"; do
   count=$((count + 1))
-  IFS='|' read -r label cfg <<< "$entry"
+  IFS='|' read -r label cfg shore_prior lw_prior shore_input lw_input <<< "$entry"
   printf '[%02d/%02d] ' "$count" "${#MODELS[@]}"
-  submit_job "$label" "$cfg"
+  submit_job "$label" "$cfg" "$shore_prior" "$lw_prior" "$shore_input" "$lw_input"
 done
 
 echo "Done. Monitor with: qstat -u \"$USER\""
