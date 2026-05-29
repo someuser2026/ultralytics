@@ -86,7 +86,7 @@ seg_w_dice: 0.0 # (float) weight for dice loss for segmentation
 seg_w_bce: 1 # (float) weight for bce loss for segmentation
 seg_ignore_index: -100 # (int) ignore index for segmentation
 seg_area_normalize: False # (bool) False: no normalization, True: normalize by image area
-use_soft_ignore_band: true
+use_soft_ignore_band: false
 ignore_band_width: 10
 soft_ignore_transition_ratio: 0.5
 use_ultrafast_ignore_band: true
