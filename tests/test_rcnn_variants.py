@@ -520,6 +520,7 @@ def _segment_batch():
         "cls": torch.tensor([[0], [0]], dtype=torch.float32),
         "bboxes": torch.tensor([[0.5, 0.5, 0.35, 0.25], [0.45, 0.55, 0.30, 0.28]], dtype=torch.float32),
         "masks": torch.zeros(2, 128, 128, dtype=torch.float32),
+        "metadata_vec": torch.randn(2, 4),
     }
     batch["masks"][0, 40:88, 36:92] = 1
     batch["masks"][1, 44:92, 28:86] = 1
@@ -535,6 +536,46 @@ def _obb_batch():
             [[0.5, 0.5, 0.28, 0.18, 0.10], [0.42, 0.58, 0.24, 0.20, -0.25]],
             dtype=torch.float32,
         ),
+        "metadata_vec": torch.randn(2, 4),
+    }
+
+
+def _metadata_enabled_rcnn_cfg():
+    return {
+        "nc": 1,
+        "stride": 16,
+        "backbone": [
+            [-1, 1, "Conv", [16, 3, 2]],
+            [-1, 1, "Conv", [32, 3, 2]],
+            [-1, 1, "Conv", [64, 3, 2]],
+            [-1, 1, "Conv", [128, 3, 2]],
+        ],
+        "head": [
+            [[0, 1, 2, 3], 1, "FPN", [16, {"num_outs": 4, "metadata_cfg": {"enabled": True, "mode": "film_gate", "hidden_dim": 8}}]],
+            [[4], 1, "MaskRCNNHead", [1, {
+                "rpn": {
+                    "anchor_scales": [1],
+                    "anchor_ratios": [1.0],
+                    "strides": [2, 4, 8, 16],
+                    "pre_nms_topk_train": 50,
+                    "post_nms_topk_train": 50,
+                    "pre_nms_topk_test": 20,
+                    "post_nms_topk_test": 20,
+                    "nms_thresh": 0.7,
+                    "min_box_size": 0.0,
+                    "pos_iou": 0.7,
+                    "neg_iou": 0.3,
+                    "samples_per_img": 16,
+                    "pos_fraction": 0.5,
+                    "beta": 0.1111111111111111,
+                },
+                "roi": {"pool_size": 7, "mask_pool_size": 14, "sampling_ratio": 0, "featmap_strides": [2, 4, 8, 16]},
+                "train": {"pos_iou": 0.5, "neg_iou": 0.5, "samples_per_img": 16, "pos_fraction": 0.25},
+                "test": {"score_thresh": 0.05, "nms_iou": 0.5, "max_dets": 20},
+                "bbox_head": {"hidden_dim": 64, "loss": "smooth_l1", "beta": 1.0},
+                "mask_head": {"dim": 16, "num_convs": 2, "resolution": 28},
+            }]],
+        ],
     }
 
 
@@ -562,7 +603,9 @@ def test_rcnn_variant_forward_and_loss_smoke(model_name, task):
 
     model.eval()
     with torch.no_grad():
-        preds = model(batch["img"])
+        with pytest.raises(TypeError, match="batch dict"):
+            model(batch["img"])
+        preds = model({"img": batch["img"], "metadata_vec": batch["metadata_vec"]}, mode="predict")
     assert len(preds) == batch["img"].shape[0]
     for pred in preds:
         assert {"bboxes", "conf", "cls"} <= set(pred)
@@ -571,3 +614,25 @@ def test_rcnn_variant_forward_and_loss_smoke(model_name, task):
         else:
             if pred["bboxes"].numel():
                 assert pred["bboxes"].shape[1] == 5
+
+
+def test_metadata_enabled_rcnn_requires_and_uses_batch_metadata():
+    from ultralytics.nn.tasks import RCNNSegmentationModel
+
+    model = RCNNSegmentationModel(_metadata_enabled_rcnn_cfg(), nc=1, ch=3, verbose=False)
+    batch = _segment_batch()
+
+    missing_metadata = dict(batch)
+    missing_metadata.pop("metadata_vec")
+    model.train()
+    with pytest.raises(ValueError, match="metadata-conditioned neck"):
+        model(missing_metadata, mode="loss")
+
+    loss, loss_items = model(batch, mode="loss")
+    assert torch.isfinite(loss)
+    assert torch.isfinite(loss_items).all()
+
+    model.eval()
+    with torch.no_grad():
+        preds = model({"img": batch["img"], "metadata_vec": batch["metadata_vec"]}, mode="predict")
+    assert len(preds) == batch["img"].shape[0]

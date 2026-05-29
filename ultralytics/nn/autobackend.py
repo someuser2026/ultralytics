@@ -637,7 +637,13 @@ class AutoBackend(nn.Module):
 
         # PyTorch
         if self.pt or self.nn_module:
-            y = self.model(im, augment=augment, visualize=visualize, embed=embed, **kwargs)
+            if getattr(self.model, "uses_batch_dict", False):
+                batch = {"img": im}
+                if "metadata_vec" in kwargs:
+                    batch["metadata_vec"] = kwargs.pop("metadata_vec")
+                y = self.model(batch, mode="predict", augment=augment, visualize=visualize, embed=embed, **kwargs)
+            else:
+                y = self.model(im, augment=augment, visualize=visualize, embed=embed, **kwargs)
 
         # TorchScript
         elif self.jit:

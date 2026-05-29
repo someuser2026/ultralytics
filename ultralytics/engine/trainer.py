@@ -903,8 +903,11 @@ class BaseTrainer:
                     batch = self.preprocess_batch(batch)
                     if self.args.compile:
                         # Decouple inference and loss calculations for improved compile performance
-                        preds = self.model(batch["img"], metadata_vec=batch.get("metadata_vec"))
-                        loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
+                        if getattr(unwrap_model(self.model), "uses_batch_dict", False):
+                            loss, self.loss_items = self.model(batch, mode="loss")
+                        else:
+                            preds = self.model(batch["img"], metadata_vec=batch.get("metadata_vec"))
+                            loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
                     else:
                         loss, self.loss_items = self.model(batch)
                     self.loss = loss.sum()

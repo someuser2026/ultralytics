@@ -182,6 +182,8 @@ class BaseModel(torch.nn.Module):
         >>> model.info()  # Display model information
     """
 
+    uses_batch_dict = False
+
     def forward(self, x, *args, **kwargs):
         """
         Perform forward pass of the model for either training or inference.
@@ -199,6 +201,18 @@ class BaseModel(torch.nn.Module):
         if isinstance(x, dict):  # for cases of training and validating while training.
             return self.loss(x, *args, **kwargs)
         return self.predict(x, *args, **kwargs)
+
+    def _metadata_required(self) -> bool:
+        """Return True when any neck in the current graph expects metadata modulation."""
+        return any(isinstance(m, BaseNeck) and getattr(m, "metadata_enabled", False) for m in getattr(self, "model", ()))
+
+    def _resolve_metadata_vec(self, metadata_vec: torch.Tensor | None) -> torch.Tensor | None:
+        """Validate metadata presence when a metadata-conditioned neck is active."""
+        if metadata_vec is None and self._metadata_required() and not getattr(self, "_building_strides", False):
+            raise ValueError(
+                "This model has metadata-conditioned neck layers and requires batch['metadata_vec'] during train/val/test."
+            )
+        return metadata_vec
 
     def predict(self, x, profile=False, visualize=False, augment=False, embed=None):
         """
@@ -542,18 +556,6 @@ class DetectionModel(BaseModel):
             self.info()
             LOGGER.info("")
 
-    def _metadata_required(self) -> bool:
-        """Return True when any neck in the current YOLO graph expects metadata modulation."""
-        return any(isinstance(m, BaseNeck) and getattr(m, "metadata_enabled", False) for m in self.model)
-
-    def _resolve_metadata_vec(self, metadata_vec: torch.Tensor | None) -> torch.Tensor | None:
-        """Validate metadata presence when a metadata-conditioned neck is active."""
-        if metadata_vec is None and self._metadata_required() and not self._building_strides:
-            raise ValueError(
-                "This model has metadata-conditioned neck layers and requires batch['metadata_vec'] during train/val/test."
-            )
-        return metadata_vec
-
     def _predict_once_with_metadata(self, x, metadata_vec=None, profile=False, visualize=False, embed=None):
         """Run a single YOLO forward pass, routing metadata vectors only into neck modules."""
         metadata_vec = self._resolve_metadata_vec(metadata_vec)
@@ -739,6 +741,8 @@ class SegmentationModel(DetectionModel):
 class _RCNNModel(BaseModel):
     """Base model class for native RCNN segmentation and OBB heads."""
 
+    uses_batch_dict = True
+
     def __init__(self, cfg, ch=3, nc=None, task="detect", verbose=True):
         super().__init__()
         self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)
@@ -759,14 +763,40 @@ class _RCNNModel(BaseModel):
             self.info()
             LOGGER.info("")
 
-    def _forward_backbone_neck(self, x, profile=False, visualize=False):
+    @staticmethod
+    def _require_batch_dict(batch):
+        if not isinstance(batch, dict):
+            raise TypeError("RCNN models require a batch dict input with an 'img' tensor; direct tensor calls are unsupported.")
+        if "img" not in batch:
+            raise KeyError("RCNN batch dict must contain an 'img' tensor.")
+        return batch
+
+    @staticmethod
+    def _has_train_targets(batch):
+        return {"batch_idx", "cls", "bboxes"}.issubset(batch)
+
+    def forward(self, batch, mode="auto", profile=False, visualize=False, augment=False, embed=None):
+        """Run RCNN loss or prediction from a batch dictionary."""
+        batch = self._require_batch_dict(batch)
+        if mode == "auto":
+            mode = "loss" if self.training and self._has_train_targets(batch) else "predict"
+        if mode == "loss":
+            return self.loss(batch)
+        if mode == "predict":
+            return self.predict(batch, profile=profile, visualize=visualize, augment=augment, embed=embed)
+        raise ValueError(f"Unsupported RCNN forward mode '{mode}'. Expected one of 'auto', 'loss', or 'predict'.")
+
+    def _forward_backbone_neck(self, batch, profile=False, visualize=False):
+        batch = self._require_batch_dict(batch)
+        x = batch["img"]
+        metadata_vec = self._resolve_metadata_vec(batch.get("metadata_vec"))
         y = []
         for m in self.model[:-1]:
             if m.f != -1:
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
             if profile:
                 self._profile_one_layer(m, x, [])
-            x = m(x)
+            x = m(x, metadata_vec=metadata_vec) if isinstance(m, BaseNeck) else m(x)
             y.append(x if m.i in self.save else None)
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
@@ -781,17 +811,17 @@ class _RCNNModel(BaseModel):
         sources = [x if j == -1 else y[j] for j in head.f]
         return sources[0] if len(sources) == 1 and isinstance(sources[0], (list, tuple)) else sources
 
-    def predict(self, x, profile=False, visualize=False, augment=False, embed=None):
+    def predict(self, batch, profile=False, visualize=False, augment=False, embed=None):
         if augment:
-            return self._predict_augment(x)
-        x, y = self._forward_backbone_neck(x, profile=profile, visualize=visualize)
+            LOGGER.warning("RCNN models do not support 'augment=True' prediction. Reverting to single-scale prediction.")
+        x, y = self._forward_backbone_neck(batch, profile=profile, visualize=visualize)
         head = self.model[-1]
         return head(self._head_input(head, x, y))
 
     def loss(self, batch, preds=None):
         if preds is not None and isinstance(preds, tuple) and len(preds) == 2 and isinstance(preds[0], torch.Tensor):
             return preds
-        x, y = self._forward_backbone_neck(batch["img"])
+        x, y = self._forward_backbone_neck(batch)
         head = self.model[-1]
         return head.loss(self._head_input(head, x, y), batch)
 

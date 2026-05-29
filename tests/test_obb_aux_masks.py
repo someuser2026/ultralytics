@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ import torch
 import tifffile
 
 from tests import TMP
+from ultralytics.cfg import check_cfg
 from ultralytics.data.augment import (
     Albumentations,
     LetterBox,
@@ -808,6 +810,126 @@ def test_segment_spatial_prior_losses_cover_all_predictions() -> None:
     assert land_loss.item() == pytest.approx(0.0, abs=1e-6)
     assert shoreline_land.item() > 0.0
     assert land_high.item() > 0.0
+
+
+def _segment_prior_topk_fixture() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    proto = torch.tensor([[[[8.0, -8.0], [8.0, -8.0]]]], dtype=torch.float32)
+    pred_masks = torch.tensor([[[1.0], [-1.0], [1.0], [-1.0]]], dtype=torch.float32)
+    pred_scores = torch.tensor([[0.1, 0.9, 0.8, 0.7]], dtype=torch.float32)
+    land_water_mask = torch.tensor([[[[64, 255], [64, 255]]]], dtype=torch.long)
+    return pred_scores, pred_masks, proto, land_water_mask
+
+
+def test_segment_spatial_prior_topk_disabled_matches_all_anchor_behavior() -> None:
+    """segment_prior_topk=-1 or inf should preserve all-anchor segment prior behavior."""
+    pred_scores, pred_masks, proto, land_water_mask = _segment_prior_topk_fixture()
+
+    baseline = _compute_segmentation_spatial_prior_losses(
+        pred_scores,
+        pred_masks,
+        proto,
+        land_water_mask,
+        None,
+        segment_prior_topk=pred_scores.shape[1],
+    )
+    disabled = _compute_segmentation_spatial_prior_losses(
+        pred_scores,
+        pred_masks,
+        proto,
+        land_water_mask,
+        None,
+        segment_prior_topk=-1,
+    )
+    inf_disabled = _compute_segmentation_spatial_prior_losses(
+        pred_scores,
+        pred_masks,
+        proto,
+        land_water_mask,
+        None,
+        segment_prior_topk=math.inf,
+    )
+
+    torch.testing.assert_close(disabled[0], baseline[0])
+    torch.testing.assert_close(disabled[1], baseline[1])
+    torch.testing.assert_close(inf_disabled[0], baseline[0])
+    torch.testing.assert_close(inf_disabled[1], baseline[1])
+
+
+def test_segment_spatial_prior_topk_selects_highest_confidence_unassigned_anchor() -> None:
+    """Finite segment_prior_topk should rank unassigned anchors by detached confidence."""
+    pred_scores, pred_masks, proto, land_water_mask = _segment_prior_topk_fixture()
+
+    actual = _compute_segmentation_spatial_prior_losses(
+        pred_scores,
+        pred_masks,
+        proto,
+        land_water_mask,
+        None,
+        segment_prior_topk=1,
+    )
+    expected = _compute_segmentation_spatial_prior_losses(
+        pred_scores[:, 1:2],
+        pred_masks[:, 1:2],
+        proto,
+        land_water_mask,
+        None,
+        segment_prior_topk=-1,
+    )
+
+    torch.testing.assert_close(actual[1], expected[1])
+
+
+def test_segment_spatial_prior_topk_keeps_low_confidence_foreground_anchor() -> None:
+    """Foreground anchors should be evaluated even when top-k unassigned count is zero."""
+    pred_scores, pred_masks, proto, land_water_mask = _segment_prior_topk_fixture()
+    fg_mask = torch.tensor([[True, False, False, False]], dtype=torch.bool)
+
+    actual = _compute_segmentation_spatial_prior_losses(
+        pred_scores,
+        pred_masks,
+        proto,
+        land_water_mask,
+        None,
+        fg_mask=fg_mask,
+        segment_prior_topk=0,
+    )
+    expected = _compute_segmentation_spatial_prior_losses(
+        pred_scores[:, :1],
+        pred_masks[:, :1],
+        proto,
+        land_water_mask,
+        None,
+        segment_prior_topk=-1,
+    )
+
+    torch.testing.assert_close(actual[1], expected[1])
+
+
+def test_segment_spatial_prior_topk_rejects_invalid_values() -> None:
+    """Only non-negative integers, -1, and inf are valid segment_prior_topk values."""
+    pred_scores, pred_masks, proto, land_water_mask = _segment_prior_topk_fixture()
+
+    for bad_value in (1.5, -2, math.nan):
+        with pytest.raises(ValueError):
+            _compute_segmentation_spatial_prior_losses(
+                pred_scores,
+                pred_masks,
+                proto,
+                land_water_mask,
+                None,
+                segment_prior_topk=bad_value,
+            )
+
+
+def test_segment_prior_topk_cfg_accepts_numeric_and_inf_strings() -> None:
+    """The CLI/config checker should coerce segment_prior_topk as a float key."""
+    finite_cfg = {"segment_prior_topk": "512"}
+    check_cfg(finite_cfg, hard=False)
+    assert finite_cfg["segment_prior_topk"] == pytest.approx(512.0)
+
+    inf_cfg = {"segment_prior_topk": "inf"}
+    check_cfg(inf_cfg, hard=False)
+    assert math.isinf(inf_cfg["segment_prior_topk"])
 
 
 def test_segment_shoreline_prior_respects_assigned_offshore_gt_mask() -> None:

@@ -64,3 +64,4 @@ Do not edit the code during the smoke test unless specifcally asked to. Simply r
 - Check nearby tests/configs before making assumptions.
 - Be careful with absolute dataset paths, scratch paths, and HPC env variables.
 - Ask before deleting non-temporary files.
+- When asked to `check`/`find`/`investigate`/`brainstorm` do not edit any code. Only read the required files.

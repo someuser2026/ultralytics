@@ -343,6 +343,7 @@ def test_mamba_yolo_submitters_resolve_local_configs(tmp_path: Path) -> None:
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["QSUB_LOG"] = str(qsub_log)
+    env["SEGMENT_PRIOR_TOPK"] = "256"
 
     cases = [
         (
@@ -407,6 +408,10 @@ def test_mamba_yolo_submitters_resolve_local_configs(tmp_path: Path) -> None:
         assert vars_map["MULTISPECTRAL"] == multispectral
         assert "/Users/manishagupta/Desktop/PhD/Code" not in vars_map["CONFIG_YAML"]
         assert Path(REPO_ROOT / vars_map["CONFIG_YAML"]).is_file()
+        if task == "segment":
+            assert vars_map["SEGMENT_PRIOR_TOPK"] == "256"
+        else:
+            assert "SEGMENT_PRIOR_TOPK" not in vars_map
 
     assert "[DRY RUN] qsub -V -v" in dry_run.stdout
     assert len(_parse_call_log(qsub_log)) == len(cases)
@@ -438,6 +443,7 @@ def test_shoreline_segment_submitter_passes_requested_variants(tmp_path: Path) -
     env["QSUB_LOG"] = str(qsub_log)
     env["SCRATCH"] = str(scratch)
     env["RUN_TAG"] = "testrun"
+    env["SEGMENT_PRIOR_TOPK"] = "-1"
 
     subprocess.run(
         ["bash", "jobs/train/hpc/bash_scripts_seg/submit_shoreline_segment_models.sh", "8", "100", "0", "0"],
@@ -491,6 +497,7 @@ def test_shoreline_segment_submitter_passes_requested_variants(tmp_path: Path) -
         assert vars_map["MIXUP"] == "0.0"
         assert vars_map["COPY_PASTE"] == "0.0"
         assert vars_map["CLOSE_MOSAIC"] == "0"
+        assert vars_map["SEGMENT_PRIOR_TOPK"] == "-1"
         assert Path(REPO_ROOT / config_yaml).is_file()
 
     for name in ("yolo12n_seg_shore_lw_loss", "mamba_hrnet_seg_shore_lw_loss"):
@@ -513,6 +520,75 @@ def test_shoreline_segment_submitter_passes_requested_variants(tmp_path: Path) -
     aux_vars = by_name["yolo12n_seg_shore_aux_head"]
     assert aux_vars["USE_SHORELINE_AUX_LOSS"] == "true"
     assert aux_vars["SHORELINE_AUX_WARMUP_EPOCHS"] == "2"
+
+
+def test_mamba_hrnet_shore_lw_input_submitter_limits_batch_and_workers(tmp_path: Path) -> None:
+    """Submit only the Mamba-HRNet shoreline input segment variants with reduced loader pressure."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+    scratch = tmp_path / "scratch"
+
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{\n"
+        "  echo CALL\n"
+        "  for arg in \"$@\"; do\n"
+        "    printf '%s\\n' \"$arg\"\n"
+        "  done\n"
+        "  echo END\n"
+        "} >> \"$QSUB_LOG\"\n",
+    )
+    _write_stub(bin_dir / "sleep", "#!/usr/bin/env bash\nexit 0\n")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["QSUB_LOG"] = str(qsub_log)
+    env["SCRATCH"] = str(scratch)
+    env["RUN_TAG"] = "testrun"
+
+    subprocess.run(
+        ["bash", "jobs/train/hpc/bash_scripts_seg/submit_mamba_hrnet_shore_lw_input_segment_models.sh"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == 2
+    for call in calls:
+        assert call[-1] == "jobs/train/hpc/planet_full.pbs"
+    by_name = {call[call.index("-N") + 1]: _parse_varlist(call) for call in calls}
+
+    expected_data = (
+        scratch
+        / "data_processed/Global/Annotated/variants/segment/"
+        / "planet_full_c448_ov35_kf20_10075-single_sh-lw-d-prx-cl-hz-sdw_seed0/data.yaml"
+    )
+    expected_configs = {
+        "mamba_hrnet_seg_shore_lw_input": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml",
+        "mamba_hrnet_yolo26_seg_shore_lw_input": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml",
+    }
+    assert set(by_name) == set(expected_configs)
+
+    for name, config_yaml in expected_configs.items():
+        vars_map = by_name[name]
+        assert vars_map["TASK"] == "segment"
+        assert vars_map["IMGSZ"] == "448"
+        assert vars_map["EPOCHS"] == "100"
+        assert vars_map["BATCH"] == "4"
+        assert vars_map["WORKERS"] == "1"
+        assert vars_map["PROJECT"] == "shoreline_segment_models"
+        assert vars_map["DATA_YAML"] == str(expected_data)
+        assert vars_map["CONFIG_YAML"] == config_yaml
+        assert vars_map["EXPERIMENT_MODE"] == f"testrun_{name}"
+        assert vars_map["USE_SHORELINE_INPUT"] == "true"
+        assert vars_map["USE_LAND_WATER_INPUT"] == "true"
+        assert vars_map["USE_SHORELINE_PRIOR_LOSS"] == "false"
+        assert vars_map["USE_LAND_WATER_PRIOR_LOSS"] == "false"
+        assert vars_map["USE_SHORELINE_AUX_LOSS"] == "false"
 
 
 def test_rhino_submitter_resolves_local_configs(tmp_path: Path) -> None:
@@ -651,6 +727,7 @@ def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
     env_base["OVERLAP"] = "35"
     env_base["KEEP_FRAC"] = "20"
     env_base["BATCH"] = "4"
+    env_base["WORKERS"] = "1"
     env_base["CHECKPOINT"] = str(checkpoint)
     env_base["FREEZE"] = "1"
     env_base["LORA"] = "true"
@@ -664,6 +741,7 @@ def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
     env_base["USE_LAND_WATER_PRIOR_LOSS"] = "true"
     env_base["USE_SHORELINE_AUX_LOSS"] = "true"
     env_base["SHORELINE_AUX_WARMUP_EPOCHS"] = "2"
+    env_base["SEGMENT_PRIOR_TOPK"] = "-1"
     env_base["SDICE"] = "1"
     env_base["GAUSSIAN_BLUR_P"] = "0.25"
     env_base["MOSAIC"] = "0.0"
@@ -702,6 +780,7 @@ def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
         assert train_map["model"] == str(checkpoint)
         assert train_map["data"] == str(dataset_dir / "data.yaml")
         assert train_map["time"] == "11"
+        assert train_map["workers"] == "1"
         assert train_map["freeze"] == "1"
         assert train_map["lora"] == "true"
         assert train_map["lora_rank"] == "8"
@@ -714,6 +793,7 @@ def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
         assert train_map["use_land_water_prior_loss"] == "true"
         assert train_map["use_shoreline_aux_loss"] == "true"
         assert train_map["shoreline_aux_warmup_epochs"] == "2"
+        assert train_map["segment_prior_topk"] == "-1"
         assert train_map["seg_w_dice"] == "1"
         assert train_map["gaussian_blur_p"] == "0.25"
         assert train_map["mosaic"] == "0.0"

@@ -948,6 +948,7 @@ class v8SegmentationLoss(v8DetectionLoss):
         self.land_water_prior_weight = float(_get_cfg_value(model.args, "land_water_prior_weight", 1.0))
         self.shoreline_prior_max_dist = float(_get_cfg_value(model.args, "shoreline_prior_max_dist", 128.0))
         self.shoreline_prior_gt_margin = float(_get_cfg_value(model.args, "shoreline_prior_gt_margin", 0.05))
+        self.segment_prior_topk = _normalize_segment_prior_topk(_get_cfg_value(model.args, "segment_prior_topk", 512))
         self.land_water_prior_land_threshold = float(_get_cfg_value(model.args, "land_water_prior_land_threshold", 0.05))
         self.land_water_prior_exp_beta = float(_get_cfg_value(model.args, "land_water_prior_exp_beta", 4.0))
         self.shoreline_aux_weight = float(_get_cfg_value(model.args, "shoreline_aux_weight", 0.20))
@@ -1070,6 +1071,7 @@ class v8SegmentationLoss(v8DetectionLoss):
                 batch_idx=batch_idx,
                 overlap=self.overlap,
                 shoreline_prior_gt_margin=self.shoreline_prior_gt_margin,
+                segment_prior_topk=self.segment_prior_topk,
             )
 
         if pred_semantic is not None:
@@ -1670,6 +1672,64 @@ def _compute_obb_spatial_prior_losses(
     return shoreline_penalty, land_penalty
 
 
+def _normalize_segment_prior_topk(segment_prior_topk: int | float | str) -> int | float:
+    """Validate segment prior top-k config and normalize finite values to int."""
+    try:
+        value = float(segment_prior_topk)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("segment_prior_topk must be a non-negative integer, -1, or inf.") from exc
+    if math.isnan(value):
+        raise ValueError("segment_prior_topk must not be NaN.")
+    if math.isinf(value):
+        if value > 0:
+            return math.inf
+        raise ValueError("segment_prior_topk must be a non-negative integer, -1, or inf.")
+    if value == -1:
+        return -1
+    if value < 0 or not value.is_integer():
+        raise ValueError("segment_prior_topk must be a non-negative integer, -1, or inf.")
+    return int(value)
+
+
+def _segment_prior_uses_all_anchors(segment_prior_topk: int | float) -> bool:
+    """Return True when segment spatial priors should preserve all-anchor behavior."""
+    return segment_prior_topk == -1 or (isinstance(segment_prior_topk, float) and math.isinf(segment_prior_topk))
+
+
+def _select_segment_prior_anchor_indices(
+    conf_i: torch.Tensor,
+    fg_i: torch.Tensor | None,
+    segment_prior_topk: int | float,
+) -> torch.Tensor:
+    """Select all foreground anchors plus top-k confident unassigned anchors for segment priors."""
+    segment_prior_topk = _normalize_segment_prior_topk(segment_prior_topk)
+    num_anchors = int(conf_i.shape[0])
+    if _segment_prior_uses_all_anchors(segment_prior_topk):
+        return torch.arange(num_anchors, device=conf_i.device)
+
+    if fg_i is None:
+        fg_bool = torch.zeros(num_anchors, dtype=torch.bool, device=conf_i.device)
+    else:
+        fg_bool = fg_i.to(device=conf_i.device, dtype=torch.bool)
+    fg_indices = fg_bool.nonzero(as_tuple=False).flatten()
+    unassigned_indices = (~fg_bool).nonzero(as_tuple=False).flatten()
+
+    if segment_prior_topk > 0 and unassigned_indices.numel():
+        k = min(int(segment_prior_topk), int(unassigned_indices.numel()))
+        topk_pos = torch.topk(conf_i.detach()[unassigned_indices], k=k).indices
+        unassigned_indices = unassigned_indices[topk_pos]
+    else:
+        unassigned_indices = unassigned_indices[:0]
+
+    if fg_indices.numel() and unassigned_indices.numel():
+        selected = torch.cat((fg_indices, unassigned_indices), dim=0)
+    elif fg_indices.numel():
+        selected = fg_indices
+    else:
+        selected = unassigned_indices
+    return selected.sort().values
+
+
 def _compute_segmentation_spatial_prior_losses(
     pred_scores: torch.Tensor,
     pred_masks: torch.Tensor,
@@ -1686,6 +1746,7 @@ def _compute_segmentation_spatial_prior_losses(
     batch_idx: torch.Tensor | None = None,
     overlap: bool = True,
     shoreline_prior_gt_margin: float = 0.05,
+    segment_prior_topk: int | float = 512,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute shoreline and land/water priors across all segmentation predictions."""
     zero = pred_scores.new_tensor(0.0)
@@ -1722,11 +1783,16 @@ def _compute_segmentation_spatial_prior_losses(
     for image_idx in range(batch_size):
         proto_i = proto[image_idx]
         conf_i = conf_scores[image_idx]
-        for start in range(0, pred_masks.shape[1], chunk_size):
-            end = min(start + chunk_size, pred_masks.shape[1])
-            coeff = pred_masks[image_idx, start:end]
+        fg_i = fg_mask[image_idx] if fg_mask is not None else None
+        anchor_indices = _select_segment_prior_anchor_indices(conf_i, fg_i, segment_prior_topk)
+        if anchor_indices.numel() == 0:
+            continue
+        for start in range(0, anchor_indices.numel(), chunk_size):
+            end = min(start + chunk_size, anchor_indices.numel())
+            chunk_indices = anchor_indices[start:end]
+            coeff = pred_masks[image_idx, chunk_indices]
             probs = torch.einsum("nc,chw->nhw", coeff, proto_i).div(proto_scale).sigmoid()
-            conf_chunk = conf_i[start:end]
+            conf_chunk = conf_i[chunk_indices]
             weight_den = weight_den + conf_chunk.sum()
 
             if land_water_mask is not None:
@@ -1745,9 +1811,9 @@ def _compute_segmentation_spatial_prior_losses(
                 gt_masks = None
                 fg_chunk = None
                 if masks is not None and target_gt_idx is not None and fg_mask is not None:
-                    fg_chunk = fg_mask[image_idx, start:end]
+                    fg_chunk = fg_mask[image_idx, chunk_indices]
                     if fg_chunk.any():
-                        mask_idx = target_gt_idx[image_idx, start:end][fg_chunk]
+                        mask_idx = target_gt_idx[image_idx, chunk_indices][fg_chunk]
                         if overlap:
                             gt_masks = masks[image_idx] == (mask_idx + 1).view(-1, 1, 1)
                         elif batch_idx is not None:
