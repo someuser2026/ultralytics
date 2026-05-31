@@ -523,7 +523,7 @@ def test_shoreline_segment_submitter_passes_requested_variants(tmp_path: Path) -
 
 
 def test_mamba_hrnet_shore_lw_submitter_limits_batch_and_workers(tmp_path: Path) -> None:
-    """Submit only the Mamba-HRNet shoreline input/loss segment variants with reduced loader pressure."""
+    """Submit selected Mamba-HRNet segment/cascade variants with reduced loader pressure."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     qsub_log = tmp_path / "qsub.log"
@@ -557,7 +557,7 @@ def test_mamba_hrnet_shore_lw_submitter_limits_batch_and_workers(tmp_path: Path)
     )
 
     calls = _parse_call_log(qsub_log)
-    assert len(calls) == 3
+    assert len(calls) == 4
     for call in calls:
         assert call[-1] == "jobs/train/hpc/planet_full.pbs"
     by_name = {call[call.index("-N") + 1]: _parse_varlist(call) for call in calls}
@@ -571,11 +571,13 @@ def test_mamba_hrnet_shore_lw_submitter_limits_batch_and_workers(tmp_path: Path)
         "mamba_hrnet_seg_shore_lw_loss": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml",
         "mamba_hrnet_seg_shore_lw_input": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml",
         "mamba_hrnet_yolo26_seg_shore_lw_input": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml",
+        "mamba_hrnet_cascade_mask_rcnn_normal": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-cascade-mask-rcnn.yaml",
     }
     expected_flags = {
         "mamba_hrnet_seg_shore_lw_loss": ("true", "true", "false", "false"),
         "mamba_hrnet_seg_shore_lw_input": ("false", "false", "true", "true"),
         "mamba_hrnet_yolo26_seg_shore_lw_input": ("false", "false", "true", "true"),
+        "mamba_hrnet_cascade_mask_rcnn_normal": ("false", "false", "false", "false"),
     }
     assert set(by_name) == set(expected_configs)
 

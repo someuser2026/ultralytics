@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Submit only the Mamba-HRNet shoreline + land/water input/loss segment runs.
+# Submit only the selected Mamba-HRNet segment/cascade runs with reduced loader pressure.
 #
 # Usage:
 #   bash jobs/train/hpc/bash_scripts_seg/submit_mamba_hrnet_shore_lw_input_segment_models.sh [BATCH] [EPOCHS] [SEED] [DRY_RUN] [WORKERS]
@@ -149,6 +149,7 @@ MODELS=(
   "mamba_hrnet_seg_shore_lw_loss|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|true|true|false|false"
   "mamba_hrnet_seg_shore_lw_input|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|false|false|true|true"
   "mamba_hrnet_yolo26_seg_shore_lw_input|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml|false|false|true|true"
+  "mamba_hrnet_cascade_mask_rcnn_normal|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-cascade-mask-rcnn.yaml|false|false|false|false"
 )
 
 for entry in "${MODELS[@]}"; do
@@ -156,7 +157,7 @@ for entry in "${MODELS[@]}"; do
   require_file "$cfg"
 done
 
-echo "Submitting ${#MODELS[@]} Mamba-HRNet shoreline+land-water input/loss segment jobs"
+echo "Submitting ${#MODELS[@]} selected Mamba-HRNet segment/cascade jobs"
 echo "DATA_YAML=${DATA_YAML}"
 echo "IMGSZ=${IMGSZ}, EPOCHS=${EPOCHS}, BATCH=${BATCH}, WORKERS=${WORKERS}, DEVICE=${DEVICE}, SEED=${SEED}, PROJECT=${PROJECT}, RUN_TAG=${RUN_TAG}, DRY_RUN=${DRY_RUN}"
 echo "Augmentations: CLAHE_P=${CLAHE_P}, UNSHARP_P=${UNSHARP_P}, GAUSSIAN_BLUR_P=${GAUSSIAN_BLUR_P}, MOTION_BLUR_P=${MOTION_BLUR_P}, MULTI_SPEC_NOISE_P=${MULTI_SPEC_NOISE_P}, MOSAIC=${MOSAIC}, MIXUP=${MIXUP}, COPY_PASTE=${COPY_PASTE}, CLOSE_MOSAIC=${CLOSE_MOSAIC}"
