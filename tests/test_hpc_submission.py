@@ -600,6 +600,56 @@ def test_mamba_hrnet_shore_lw_submitter_limits_batch_and_workers(tmp_path: Path)
         assert vars_map["USE_SHORELINE_AUX_LOSS"] == "false"
 
 
+def test_mamba_hrnet_shore_lw_only_submitter_uses_sh_lw_dataset(tmp_path: Path) -> None:
+    """Submit the selected Mamba-HRNet variants against the sh-lw-only dataset path."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+    scratch = tmp_path / "scratch"
+
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{\n"
+        "  echo CALL\n"
+        "  for arg in \"$@\"; do\n"
+        "    printf '%s\\n' \"$arg\"\n"
+        "  done\n"
+        "  echo END\n"
+        "} >> \"$QSUB_LOG\"\n",
+    )
+    _write_stub(bin_dir / "sleep", "#!/usr/bin/env bash\nexit 0\n")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["QSUB_LOG"] = str(qsub_log)
+    env["SCRATCH"] = str(scratch)
+    env["RUN_TAG"] = "testrun"
+
+    subprocess.run(
+        ["bash", "jobs/train/hpc/bash_scripts_seg/submit_mamba_hrnet_shore_lw_only_segment_models.sh"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == 4
+    expected_data = (
+        scratch
+        / "data_processed/Global/Annotated/variants/segment/"
+        / "planet_full_c448_ov35_kf20_10075-single_sh-lw_seed0/data.yaml"
+    )
+    for call in calls:
+        assert call[-1] == "jobs/train/hpc/planet_full.pbs"
+        vars_map = _parse_varlist(call)
+        assert vars_map["DATA_YAML"] == str(expected_data)
+        assert vars_map["BATCH"] == "4"
+        assert vars_map["WORKERS"] == "1"
+        assert vars_map["PROJECT"] == "shoreline_segment_models"
+
+
 def test_rhino_submitter_resolves_local_configs(tmp_path: Path) -> None:
     """Smoke-test the RHINO submitter with aliases, paths, and dry-run flows."""
     bin_dir = tmp_path / "bin"
