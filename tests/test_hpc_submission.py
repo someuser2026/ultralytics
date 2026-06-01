@@ -557,7 +557,7 @@ def test_mamba_hrnet_shore_lw_submitter_limits_batch_and_workers(tmp_path: Path)
     )
 
     calls = _parse_call_log(qsub_log)
-    assert len(calls) == 4
+    assert len(calls) == 3
     for call in calls:
         assert call[-1] == "jobs/train/hpc/planet_full.pbs"
     by_name = {call[call.index("-N") + 1]: _parse_varlist(call) for call in calls}
@@ -568,16 +568,14 @@ def test_mamba_hrnet_shore_lw_submitter_limits_batch_and_workers(tmp_path: Path)
         / "planet_full_c448_ov35_kf20_10075-single_sh-lw-d-prx-cl-hz-sdw_seed0/data.yaml"
     )
     expected_configs = {
-        "mamba_hrnet_seg_shore_lw_loss": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml",
         "mamba_hrnet_seg_shore_lw_input": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml",
         "mamba_hrnet_yolo26_seg_shore_lw_input": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml",
         "mamba_hrnet_cascade_mask_rcnn_normal": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-cascade-mask-rcnn.yaml",
     }
     expected_flags = {
-        "mamba_hrnet_seg_shore_lw_loss": ("true", "true", "false", "false"),
         "mamba_hrnet_seg_shore_lw_input": ("false", "false", "true", "true"),
         "mamba_hrnet_yolo26_seg_shore_lw_input": ("false", "false", "true", "true"),
-        "mamba_hrnet_cascade_mask_rcnn_normal": ("false", "false", "false", "false"),
+        "mamba_hrnet_cascade_mask_rcnn_normal": ("false", "false", "true", "true"),
     }
     assert set(by_name) == set(expected_configs)
 
@@ -635,7 +633,7 @@ def test_mamba_hrnet_shore_lw_only_submitter_uses_sh_lw_dataset(tmp_path: Path) 
     )
 
     calls = _parse_call_log(qsub_log)
-    assert len(calls) == 4
+    assert len(calls) == 3
     expected_data = (
         scratch
         / "data_processed/Global/Annotated/variants/segment/"
