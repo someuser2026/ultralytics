@@ -71,7 +71,9 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
             >>> model = trainer.get_model(cfg="yolo11n-seg.yaml")
             >>> model = trainer.get_model(weights="yolo11n-seg.pt", verbose=False)
         """
-        model = SegmentationModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        model = SegmentationModel(
+            cfg, nc=self.data["nc"], ch=self.data.get("input_channels", self.data["channels"]), verbose=verbose and RANK == -1
+        )
         return self._finalize_model_build(model, weights)
 
     def get_validator(self):

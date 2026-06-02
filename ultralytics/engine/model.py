@@ -244,10 +244,14 @@ class Model(torch.nn.Module):
             return None
         try:
             data_dict = data if isinstance(data, dict) else YAML.load(checks.check_yaml(str(data)))
-            channels = data_dict.get("channels")
+            channels = data_dict.get("input_channels")
+            if channels is None and data_dict.get("input_bands") is not None:
+                channels = len(data_dict["input_bands"])
             if channels is None:
-                bands = data_dict.get("bands") or {}
-                channels = max(3, *(int(k) for k in bands)) if bands else None
+                channels = data_dict.get("channels")
+                if channels is None:
+                    bands = data_dict.get("bands") or {}
+                    channels = max(3, *(int(k) for k in bands)) if bands else None
             return None if channels is None else int(channels)
         except Exception:
             return None

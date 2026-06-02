@@ -253,8 +253,6 @@ CFG_BOOL_KEYS = frozenset(
         "multi_scale",
         "seg_use_mixed_loss",
         "lora",
-        "use_shoreline_input",
-        "use_land_water_input",
         "use_shoreline_prior_loss",
         "use_land_water_prior_loss",
         "dual_input_backbone",

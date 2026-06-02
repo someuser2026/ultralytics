@@ -39,7 +39,7 @@ class YOLOESegTrainer(YOLOETrainer, SegmentationTrainer):
         # NOTE: Following the official config, nc hard-coded to 80 for now.
         model = YOLOESegModel(
             cfg["yaml_file"] if isinstance(cfg, dict) else cfg,
-            ch=self.data["channels"],
+            ch=self.data.get("input_channels", self.data["channels"]),
             nc=min(self.data["nc"], 80),
             verbose=verbose and RANK == -1,
         )
@@ -85,7 +85,7 @@ class YOLOEPESegTrainer(SegmentationTrainer):
         # NOTE: Following the official config, nc hard-coded to 80 for now.
         model = YOLOESegModel(
             cfg["yaml_file"] if isinstance(cfg, dict) else cfg,
-            ch=self.data["channels"],
+            ch=self.data.get("input_channels", self.data["channels"]),
             nc=self.data["nc"],
             verbose=verbose and RANK == -1,
         )

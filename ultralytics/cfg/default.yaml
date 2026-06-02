@@ -58,8 +58,6 @@ reset_args_keys:
 # Segmentation
 overlap_mask: true # (bool) merge instance masks into one mask during training (segment only)
 mask_ratio: 8 # (int) mask downsample ratio (segment only)
-use_shoreline_input: false # (bool) append shoreline mask as an additional model input channel
-use_land_water_input: false # (bool) append land/water one-hot mask channels as additional model inputs
 use_shoreline_aux_loss: false # (bool) force shoreline Gaussian auxiliary targets for compatible shore-aux heads (useful when training from checkpoints)
 use_shoreline_prior_loss: false # (bool) penalize confident OBB or segment predictions far from shoreline
 use_land_water_prior_loss: false # (bool) penalize confident OBB or segment predictions that place too much support over land/sand

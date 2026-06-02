@@ -2,6 +2,13 @@
 
 set -euo pipefail
 
+for deprecated_var in USE_SHORELINE_INPUT USE_LAND_WATER_INPUT; do
+  if [[ -n "${!deprecated_var:-}" ]]; then
+    echo "${deprecated_var} is no longer supported. Configure selected model input bands with input_bands in data.yaml." >&2
+    exit 1
+  fi
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 PBS_SCRIPT="jobs/train/hpc/planet_full.pbs"
@@ -178,8 +185,6 @@ USE_SOFT_IGNORE="${USE_SOFT_IGNORE:-}"
 SDICE="${SDICE:-}"
 SBCE="${SBCE:-}"
 SLOVHN="${SLOVHN:-}"
-USE_LAND_WATER_INPUT="${USE_LAND_WATER_INPUT:-}"
-USE_SHORELINE_INPUT="${USE_SHORELINE_INPUT:-}"
 
 CLAHE_P="${CLAHE_P:-0.25}"
 RAND_GAMMA_P="${RAND_GAMMA_P:-}"
@@ -228,8 +233,6 @@ append_if_set "USE_SOFT_IGNORE" "$USE_SOFT_IGNORE"
 append_if_set "SDICE" "$SDICE"
 append_if_set "SBCE" "$SBCE"
 append_if_set "SLOVHN" "$SLOVHN"
-append_if_set "USE_LAND_WATER_INPUT" "$USE_LAND_WATER_INPUT"
-append_if_set "USE_SHORELINE_INPUT" "$USE_SHORELINE_INPUT"
 
 append_if_set "CLAHE_P" "$CLAHE_P"
 append_if_set "RAND_GAMMA_P" "$RAND_GAMMA_P"

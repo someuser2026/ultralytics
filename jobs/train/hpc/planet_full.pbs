@@ -7,6 +7,13 @@
 
 set -euo pipefail
 
+for deprecated_var in USE_SHORELINE_INPUT USE_LAND_WATER_INPUT; do
+    if [[ -n "${!deprecated_var:-}" ]]; then
+        echo "${deprecated_var} is no longer supported. Configure selected model input bands with input_bands in data.yaml." >&2
+        exit 1
+    fi
+done
+
 if [[ "${SOURCE_USER_SHELL_RC:-0}" == "1" ]]; then
     source ~/.bashrc 2>/dev/null || true
     source ~/.profile 2>/dev/null || true
@@ -190,8 +197,6 @@ sdice="${SDICE:-}"
 sbce="${SBCE:-}"
 slovhn="${SLOVHN:-}"
 angle_mode="${ANGLE_MODE:-}"
-use_land_water_input="${USE_LAND_WATER_INPUT:-}"
-use_shoreline_input="${USE_SHORELINE_INPUT:-}"
 use_shoreline_prior_loss="${USE_SHORELINE_PRIOR_LOSS:-}"
 use_land_water_prior_loss="${USE_LAND_WATER_PRIOR_LOSS:-}"
 use_shoreline_aux_loss="${USE_SHORELINE_AUX_LOSS:-}"
@@ -275,8 +280,6 @@ echo "  Multispectral: ${multispectral}"
 echo "  WandB: ${wandb}"
 echo "  Project Name: ${project:-null}"
 echo "  Use soft ignore boundary loss: ${use_soft_ignore:-null}"
-echo "  Use shoreline input: ${use_shoreline_input:-null}"
-echo "  Use land/water input: ${use_land_water_input:-null}"
 echo "  Use shoreline prior loss: ${use_shoreline_prior_loss:-null}"
 echo "  Use land/water prior loss: ${use_land_water_prior_loss:-null}"
 echo "  Use shoreline aux loss: ${use_shoreline_aux_loss:-null}"
@@ -441,8 +444,6 @@ append_arg "seg_w_dice" "${sdice}"
 append_arg "seg_w_bce" "${sbce}"
 append_arg "seg_w_lovasz" "${slovhn}"
 append_arg "angle_mode" "${angle_mode}"
-append_arg "use_land_water_input" "${use_land_water_input}"
-append_arg "use_shoreline_input" "${use_shoreline_input}"
 append_arg "use_shoreline_prior_loss" "${use_shoreline_prior_loss}"
 append_arg "use_land_water_prior_loss" "${use_land_water_prior_loss}"
 append_arg "use_shoreline_aux_loss" "${use_shoreline_aux_loss}"

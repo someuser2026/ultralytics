@@ -2,6 +2,13 @@
 
 set -euo pipefail
 
+for deprecated_var in USE_SHORELINE_INPUT USE_LAND_WATER_INPUT; do
+  if [[ -n "${!deprecated_var:-}" ]]; then
+    echo "${deprecated_var} is no longer supported. Configure selected model input bands with input_bands in data.yaml." >&2
+    exit 1
+  fi
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
@@ -176,8 +183,6 @@ USE_SOFT_IGNORE="${USE_SOFT_IGNORE:-}"
 SDICE="${SDICE:-1}"
 SBCE="${SBCE:-}"
 SLOVHN="${SLOVHN:-}"
-USE_LAND_WATER_INPUT="${USE_LAND_WATER_INPUT:-}"
-USE_SHORELINE_INPUT="${USE_SHORELINE_INPUT:-}"
 SEGMENT_PRIOR_TOPK="${SEGMENT_PRIOR_TOPK:-}"
 
 CLAHE_P="${CLAHE_P:-0.0}"
@@ -226,8 +231,6 @@ append_if_set "USE_SOFT_IGNORE" "$USE_SOFT_IGNORE"
 append_if_set "SDICE" "$SDICE"
 append_if_set "SBCE" "$SBCE"
 append_if_set "SLOVHN" "$SLOVHN"
-append_if_set "USE_LAND_WATER_INPUT" "$USE_LAND_WATER_INPUT"
-append_if_set "USE_SHORELINE_INPUT" "$USE_SHORELINE_INPUT"
 append_if_set "SEGMENT_PRIOR_TOPK" "$SEGMENT_PRIOR_TOPK"
 
 append_if_set "CLAHE_P" "$CLAHE_P"

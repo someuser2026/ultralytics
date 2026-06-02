@@ -12,7 +12,9 @@ class RHINOOBBTrainer(RTDETROBBTrainer):
     def get_model(self, cfg: dict | None = None, weights: str | None = None, verbose: bool = True):
         from ultralytics.nn.tasks import RHINOOBBModel
 
-        model = RHINOOBBModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        model = RHINOOBBModel(
+            cfg, nc=self.data["nc"], ch=self.data.get("input_channels", self.data["channels"]), verbose=verbose and RANK == -1
+        )
         return self._finalize_model_build(model, weights)
 
     def get_validator(self):

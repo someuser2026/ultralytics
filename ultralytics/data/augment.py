@@ -2634,8 +2634,6 @@ class PrepareAuxiliaryMaskInputs:
         self,
         bands: dict[int, str] | None = None,
         band_scale_factors: dict[int, float] | None = None,
-        use_shoreline_input: bool = False,
-        use_land_water_input: bool = False,
         use_shoreline_prior_loss: bool = False,
         use_land_water_prior_loss: bool = False,
         use_shoreline_aux_loss: bool = False,
@@ -2646,8 +2644,6 @@ class PrepareAuxiliaryMaskInputs:
         bands = bands or {}
         self.band_name_to_index = {name: idx - 1 for idx, name in bands.items()}
         self.band_name_to_scale = {bands[idx]: float(scale) for idx, scale in (band_scale_factors or {}).items() if idx in bands}
-        self.use_shoreline_input = use_shoreline_input
-        self.use_land_water_input = use_land_water_input
         self.use_shoreline_prior_loss = use_shoreline_prior_loss
         self.use_land_water_prior_loss = use_land_water_prior_loss
         self.use_shoreline_aux_loss = use_shoreline_aux_loss
@@ -2730,16 +2726,6 @@ class PrepareAuxiliaryMaskInputs:
         shoreline_distance = self._band(img, "shoreline_distance")
         shoreline_proximity = self._band(img, "shoreline_proximity")
 
-        if self.use_shoreline_input:
-            shoreline_mask = self._require_band(
-                shoreline_mask,
-                "shoreline band is required when shoreline input is enabled.",
-            )
-        if self.use_land_water_input:
-            land_water_mask = self._require_band(
-                land_water_mask,
-                "land_water band is required when land/water input is enabled.",
-            )
         if self.use_land_water_prior_loss or self.use_shoreline_prior_loss:
             land_water_mask = self._require_band(
                 land_water_mask,
@@ -2788,6 +2774,28 @@ class PrepareAuxiliaryMaskInputs:
                 shoreline_proximity_field[None].astype(np.float32, copy=False)
             )
 
+        return labels
+
+
+class SelectInputBands:
+    """Select an ordered subset of raw image bands for model input after auxiliary targets are materialized."""
+
+    def __init__(self, input_bands: list[int] | tuple[int, ...] | None = None) -> None:
+        self.input_bands = list(input_bands or [])
+        self.indices = [idx - 1 for idx in self.input_bands]
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Replace labels['img'] with the configured 1-based raw input bands, preserving order."""
+        if not self.indices:
+            return labels
+        img = labels["img"]
+        img = img if img.ndim == 3 else img[..., None]
+        max_idx = max(self.indices)
+        if max_idx >= img.shape[2]:
+            raise ValueError(
+                f"input_bands expects channel index {max_idx + 1}, but image only has {img.shape[2]} channel(s)."
+            )
+        labels["img"] = img[..., self.indices]
         return labels
 
 

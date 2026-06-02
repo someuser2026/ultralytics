@@ -169,6 +169,10 @@ class WorldTrainerFromScratch(WorldTrainer):
         # NOTE: add path with lvis path
         final_data["path"] = data["val"]["path"]
         final_data["channels"] = data["val"]["channels"]
+        final_data["input_channels"] = data["val"].get("input_channels", data["val"]["channels"])
+        final_data["input_bands"] = data["val"].get("input_bands")
+        final_data["input_band_scale_factors"] = data["val"].get("input_band_scale_factors", {})
+        final_data["input_bands_explicit"] = data["val"].get("input_bands_explicit", False)
         self.data = final_data
         if self.args.single_cls:  # consistent with base trainer
             LOGGER.info("Overriding class names with single class.")

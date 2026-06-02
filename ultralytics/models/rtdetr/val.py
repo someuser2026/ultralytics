@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from ultralytics.data import YOLODataset
-from ultralytics.data.augment import Compose, Format, PrepareAuxiliaryMaskInputs, v8_transforms
+from ultralytics.data.augment import Compose, Format, PrepareAuxiliaryMaskInputs, SelectInputBands, v8_transforms
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.models.yolo.obb.val import OBBValidator
 from ultralytics.models.yolo.segment.val import SegmentationValidator
@@ -110,24 +110,26 @@ class RTDETRDataset(YOLODataset):
             PrepareAuxiliaryMaskInputs(
                 bands=self.data.get("bands", {}),
                 band_scale_factors=self.data.get("band_scale_factors", {}),
-                use_shoreline_input=bool(getattr(hyp, "use_shoreline_input", False)),
-                use_land_water_input=bool(getattr(hyp, "use_land_water_input", False)),
                 use_shoreline_prior_loss=bool(getattr(hyp, "use_shoreline_prior_loss", False)),
                 use_land_water_prior_loss=bool(getattr(hyp, "use_land_water_prior_loss", False)),
                 shoreline_prior_max_dist=int(getattr(hyp, "shoreline_prior_max_dist", 128)),
             )
         )
+        transforms.append(SelectInputBands(self.data.get("input_bands")))
         transforms.append(
             Format(
                 bbox_format="xywh",
                 normalize=True,
-                channel_scale_factors=self.data.get("band_scale_factors", {}),
+                channel_scale_factors=self.data.get(
+                    "input_band_scale_factors", self.data.get("band_scale_factors", {})
+                ),
                 return_mask=self.use_segments,
                 return_keypoint=self.use_keypoints,
                 batch_idx=True,
                 mask_ratio=hyp.mask_ratio,
                 mask_overlap=hyp.overlap_mask,
                 return_obb=self.use_obb,
+                bgr=1.0 if self.data.get("input_bands_explicit", False) else 0.0,
             )
         )
         return transforms

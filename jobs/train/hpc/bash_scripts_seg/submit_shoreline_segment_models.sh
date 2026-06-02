@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+for deprecated_var in USE_SHORELINE_INPUT USE_LAND_WATER_INPUT; do
+  if [[ -n "${!deprecated_var:-}" ]]; then
+    echo "${deprecated_var} is no longer supported. Configure selected model input bands with input_bands in data.yaml." >&2
+    exit 1
+  fi
+done
+
 # Submit full segment runs for the fixed Planet full c448 10075-single
 # shoreline-band dataset.
 #
@@ -87,10 +94,8 @@ submit_job() {
   local config_yaml="$2"
   local use_shoreline_prior_loss="$3"
   local use_land_water_prior_loss="$4"
-  local use_shoreline_input="$5"
-  local use_land_water_input="$6"
-  local use_shoreline_aux_loss="$7"
-  local shoreline_aux_warmup_epochs="$8"
+  local use_shoreline_aux_loss="$5"
+  local shoreline_aux_warmup_epochs="$6"
 
   VARS=()
   append_var "TASK" "segment"
@@ -116,8 +121,6 @@ submit_job() {
   append_if_set "SLOVHN" "$SLOVHN"
   append_var "USE_SHORELINE_PRIOR_LOSS" "$use_shoreline_prior_loss"
   append_var "USE_LAND_WATER_PRIOR_LOSS" "$use_land_water_prior_loss"
-  append_var "USE_SHORELINE_INPUT" "$use_shoreline_input"
-  append_var "USE_LAND_WATER_INPUT" "$use_land_water_input"
   append_var "USE_SHORELINE_AUX_LOSS" "$use_shoreline_aux_loss"
   append_if_set "SEGMENT_PRIOR_TOPK" "$SEGMENT_PRIOR_TOPK"
   if [[ "$shoreline_aux_warmup_epochs" != "null" ]]; then
@@ -153,20 +156,20 @@ submit_job() {
 }
 
 MODELS=(
-  "yolo12n_seg_shore_lw_loss|ultralytics/cfg/models/12/yolo12-seg.yaml|true|true|false|false|false|null"
-  "yolo12n_seg_shore_lw_input|ultralytics/cfg/models/12/yolo12-seg.yaml|false|false|true|true|false|null"
-  "yolo12n_seg_shore_aux_head|ultralytics/cfg/models/12/yolo12-seg-shoreaux.yaml|false|false|false|false|true|2"
-  "yolo26n_seg_normal|ultralytics/cfg/models/26/yolo26-seg.yaml|false|false|false|false|false|null"
-  "yolo26n_seg_shore_lw_input|ultralytics/cfg/models/26/yolo26-seg.yaml|false|false|true|true|false|null"
-  "mamba_hrnet_seg_shore_lw_loss|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|true|true|false|false|false|null"
-  "mamba_hrnet_seg_shore_lw_input|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|false|false|true|true|false|null"
-  "mamba_hrnet_yolo26_seg_normal|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml|false|false|false|false|false|null"
-  "mamba_hrnet_yolo26_seg_shore_lw_input|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml|false|false|true|true|false|null"
-  "mamba_hrnet_cascade_mask_rcnn_normal|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-cascade-mask-rcnn.yaml|false|false|false|false|false|null"
+  "yolo12n_seg_shore_lw_loss|ultralytics/cfg/models/12/yolo12-seg.yaml|true|true|false|null"
+  "yolo12n_seg_shore_lw_input|ultralytics/cfg/models/12/yolo12-seg.yaml|false|false|false|null"
+  "yolo12n_seg_shore_aux_head|ultralytics/cfg/models/12/yolo12-seg-shoreaux.yaml|false|false|true|2"
+  "yolo26n_seg_normal|ultralytics/cfg/models/26/yolo26-seg.yaml|false|false|false|null"
+  "yolo26n_seg_shore_lw_input|ultralytics/cfg/models/26/yolo26-seg.yaml|false|false|false|null"
+  "mamba_hrnet_seg_shore_lw_loss|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|true|true|false|null"
+  "mamba_hrnet_seg_shore_lw_input|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|false|false|false|null"
+  "mamba_hrnet_yolo26_seg_normal|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml|false|false|false|null"
+  "mamba_hrnet_yolo26_seg_shore_lw_input|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml|false|false|false|null"
+  "mamba_hrnet_cascade_mask_rcnn_normal|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-cascade-mask-rcnn.yaml|false|false|false|null"
 )
 
 for entry in "${MODELS[@]}"; do
-  IFS='|' read -r _label cfg _shore_prior _lw_prior _shore_input _lw_input _shore_aux _warmup <<< "$entry"
+  IFS='|' read -r _label cfg _shore_prior _lw_prior _shore_aux _warmup <<< "$entry"
   require_file "$cfg"
 done
 
@@ -178,9 +181,9 @@ echo "Augmentations: CLAHE_P=${CLAHE_P}, UNSHARP_P=${UNSHARP_P}, GAUSSIAN_BLUR_P
 count=0
 for entry in "${MODELS[@]}"; do
   count=$((count + 1))
-  IFS='|' read -r label cfg shore_prior lw_prior shore_input lw_input shore_aux warmup <<< "$entry"
+  IFS='|' read -r label cfg shore_prior lw_prior shore_aux warmup <<< "$entry"
   printf '[%02d/%02d] ' "$count" "${#MODELS[@]}"
-  submit_job "$label" "$cfg" "$shore_prior" "$lw_prior" "$shore_input" "$lw_input" "$shore_aux" "$warmup"
+  submit_job "$label" "$cfg" "$shore_prior" "$lw_prior" "$shore_aux" "$warmup"
 done
 
 echo "Done. Monitor with: qstat -u \"$USER\""

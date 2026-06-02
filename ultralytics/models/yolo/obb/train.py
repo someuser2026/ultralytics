@@ -81,7 +81,9 @@ class OBBTrainer(yolo.detect.DetectionTrainer):
             >>> trainer = OBBTrainer()
             >>> model = trainer.get_model(cfg="yolo11n-obb.yaml", weights="yolo11n-obb.pt")
         """
-        model = OBBModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        model = OBBModel(
+            cfg, nc=self.data["nc"], ch=self.data.get("input_channels", self.data["channels"]), verbose=verbose and RANK == -1
+        )
         self.args.angle_mode = model.yaml.get("angle_mode", getattr(self.args, "angle_mode", "oc"))
         return self._finalize_model_build(model, weights)
 

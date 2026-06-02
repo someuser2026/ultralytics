@@ -44,6 +44,9 @@ FORMATS_HELP_MSG = f"Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID
 AUX_MASK_SPLITS = ("train", "val", "test", "minival")
 BAND_KEY = "bands"
 BAND_SCALE_FACTORS_KEY = "band_scale_factors"
+INPUT_BANDS_KEY = "input_bands"
+INPUT_CHANNELS_KEY = "input_channels"
+INPUT_BAND_SCALE_FACTORS_KEY = "input_band_scale_factors"
 METADATA_KEY = "metadata"
 RGB_BAND_COUNT = 3
 DEFAULT_BAND_SCALE_FACTOR = 255.0
@@ -119,27 +122,28 @@ def _model_uses_shoreline_aux_loss(model_spec: Any) -> bool:
     return isinstance(last, (list, tuple)) and len(last) >= 3 and last[2] in {"OBBShoreAux", "SegmentShoreAux"}
 
 
+def _get_hyp_value(hyp: Any, key: str, default: Any = None) -> Any:
+    """Read a value from a dict-like config or namespace."""
+    if hyp is None:
+        return default
+    return hyp.get(key, default) if isinstance(hyp, dict) else getattr(hyp, key, default)
+
+
 def get_auxiliary_mask_flags(hyp: Any = None) -> dict[str, bool]:
     """Return mask-input and prior-loss requirements derived from the current args/config."""
-    use_shoreline_input = bool(getattr(hyp, "use_shoreline_input", False))
-    use_land_water_input = bool(getattr(hyp, "use_land_water_input", False))
-    use_shoreline_prior_loss = bool(getattr(hyp, "use_shoreline_prior_loss", False))
-    use_land_water_prior_loss = bool(getattr(hyp, "use_land_water_prior_loss", False))
-    model_spec = hyp.get("model") if isinstance(hyp, dict) else getattr(hyp, "model", None)
-    use_shoreline_aux_loss = bool(getattr(hyp, "use_shoreline_aux_loss", False)) or _model_uses_shoreline_aux_loss(
+    use_shoreline_prior_loss = bool(_get_hyp_value(hyp, "use_shoreline_prior_loss", False))
+    use_land_water_prior_loss = bool(_get_hyp_value(hyp, "use_land_water_prior_loss", False))
+    model_spec = _get_hyp_value(hyp, "model", None)
+    use_shoreline_aux_loss = bool(_get_hyp_value(hyp, "use_shoreline_aux_loss", False)) or _model_uses_shoreline_aux_loss(
         model_spec
     )
     return {
-        "use_shoreline_input": use_shoreline_input,
-        "use_land_water_input": use_land_water_input,
         "use_shoreline_prior_loss": use_shoreline_prior_loss,
         "use_land_water_prior_loss": use_land_water_prior_loss,
         "use_shoreline_aux_loss": use_shoreline_aux_loss,
-        "require_shoreline": use_shoreline_input or use_shoreline_prior_loss or use_shoreline_aux_loss,
-        "require_land_water": use_land_water_input or use_land_water_prior_loss or use_shoreline_prior_loss,
-        "enabled": any(
-            (use_shoreline_input, use_land_water_input, use_shoreline_prior_loss, use_land_water_prior_loss, use_shoreline_aux_loss)
-        ),
+        "require_shoreline": use_shoreline_prior_loss or use_shoreline_aux_loss,
+        "require_land_water": use_land_water_prior_loss or use_shoreline_prior_loss,
+        "enabled": any((use_shoreline_prior_loss, use_land_water_prior_loss, use_shoreline_aux_loss)),
     }
 
 
@@ -211,6 +215,39 @@ def normalize_band_scale_factors_config(data: dict[str, Any]) -> None:
         normalized[idx] = scale
 
     data[BAND_SCALE_FACTORS_KEY] = dict(sorted(normalized.items()))
+
+
+def _normalize_input_bands_list(raw_input_bands: Any) -> list[int] | None:
+    """Normalize optional 1-based input band selectors from data.yaml."""
+    if raw_input_bands is None:
+        return None
+    if not isinstance(raw_input_bands, (list, tuple)) or not raw_input_bands:
+        raise SyntaxError("input_bands must be a non-empty list of unique 1-based integer band indices.")
+
+    normalized = []
+    seen = set()
+    for raw_idx in raw_input_bands:
+        if isinstance(raw_idx, bool) or not isinstance(raw_idx, int):
+            raise SyntaxError("input_bands entries must be 1-based integer band indices.")
+        if raw_idx < 1:
+            raise SyntaxError("input_bands entries must be >= 1.")
+        if raw_idx in seen:
+            raise SyntaxError(f"input_bands contains duplicate band index {raw_idx}.")
+        seen.add(raw_idx)
+        normalized.append(raw_idx)
+    return normalized
+
+
+def get_input_band_scale_factors(
+    input_bands: list[int], band_scale_factors: dict[int, float] | None = None
+) -> dict[int, float]:
+    """Remap raw 1-based band scale factors onto selected 1-based input channel positions."""
+    raw_scales = band_scale_factors or {}
+    return {
+        input_idx: float(raw_scales[raw_idx])
+        for input_idx, raw_idx in enumerate(input_bands, start=1)
+        if raw_idx in raw_scales
+    }
 
 
 def get_channel_scale_factors(channels: int, band_scale_factors: dict[int, float] | None = None) -> np.ndarray:
@@ -368,24 +405,32 @@ def validate_bands_config(data: dict[str, Any], hyp: Any = None) -> None:
     bands = data.get(BAND_KEY, {})
     band_names = set(bands.values())
     max_band_index = max(bands, default=RGB_BAND_COUNT)
+    raw_input_bands = data.get(INPUT_BANDS_KEY)
+    input_bands = _normalize_input_bands_list(raw_input_bands)
+    max_input_band = max(input_bands, default=RGB_BAND_COUNT) if input_bands is not None else RGB_BAND_COUNT
+    min_required_channels = max(RGB_BAND_COUNT, max_band_index, max_input_band)
 
     raw_channels = data.get("channels")
     if raw_channels is None:
-        raw_channels = max(RGB_BAND_COUNT, max_band_index)
+        raw_channels = min_required_channels
     try:
         raw_channels = int(raw_channels)
     except (TypeError, ValueError) as exc:
         raise SyntaxError("channels must be an integer when present in data.yaml.") from exc
-    if raw_channels < max_band_index:
-        raise SyntaxError(f"channels={raw_channels} is invalid because bands require at least {max_band_index} channels.")
+    if raw_channels < min_required_channels:
+        raise SyntaxError(
+            f"channels={raw_channels} is invalid because bands/input_bands require at least "
+            f"{min_required_channels} channels."
+        )
     data["channels"] = raw_channels
     normalize_band_scale_factors_config(data)
+    input_bands = input_bands or list(range(1, raw_channels + 1))
+    data[INPUT_BANDS_KEY] = input_bands
+    data[INPUT_CHANNELS_KEY] = len(input_bands)
+    data["input_bands_explicit"] = raw_input_bands is not None
+    data[INPUT_BAND_SCALE_FACTORS_KEY] = get_input_band_scale_factors(input_bands, data.get(BAND_SCALE_FACTORS_KEY))
 
     flags = get_auxiliary_mask_flags(hyp)
-    if flags["use_shoreline_input"] and "shoreline" not in band_names:
-        raise SyntaxError("use_shoreline_input requires bands to define 'shoreline'.")
-    if flags["use_land_water_input"] and "land_water" not in band_names:
-        raise SyntaxError("use_land_water_input requires bands to define 'land_water'.")
     if flags["use_land_water_prior_loss"] and "land_water" not in band_names:
         raise SyntaxError("use_land_water_prior_loss requires bands to define 'land_water'.")
     if flags["use_shoreline_prior_loss"]:

@@ -20,7 +20,9 @@ class RCNNSegmentationTrainer(yolo.segment.SegmentationTrainer):
         super().__init__(cfg, {**(overrides or {}), "task": "segment"}, _callbacks)
 
     def get_model(self, cfg: dict | str | None = None, weights: str | Path | None = None, verbose: bool = True):
-        model = RCNNSegmentationModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        model = RCNNSegmentationModel(
+            cfg, nc=self.data["nc"], ch=self.data.get("input_channels", self.data["channels"]), verbose=verbose and RANK == -1
+        )
         return self._finalize_model_build(model, weights)
 
     def get_validator(self):
@@ -36,7 +38,9 @@ class RCNNOBBTrainer(yolo.obb.OBBTrainer):
         super().__init__(cfg, {**(overrides or {}), "task": "obb"}, _callbacks)
 
     def get_model(self, cfg: str | dict | None = None, weights: str | Path | None = None, verbose: bool = True):
-        model = RCNNOBBModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        model = RCNNOBBModel(
+            cfg, nc=self.data["nc"], ch=self.data.get("input_channels", self.data["channels"]), verbose=verbose and RANK == -1
+        )
         self.args.angle_mode = model.yaml.get("angle_mode", getattr(self.args, "angle_mode", "le90"))
         return self._finalize_model_build(model, weights)
 

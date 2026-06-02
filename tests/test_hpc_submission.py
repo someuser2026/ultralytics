@@ -38,6 +38,25 @@ def _parse_varlist(call: List[str]) -> Dict[str, str]:
     return values
 
 
+def test_hpc_wrappers_reject_removed_input_env_vars() -> None:
+    """Old shoreline/land-water input env vars should fail instead of being ignored or forwarded."""
+    for key in ("USE_SHORELINE_INPUT", "USE_LAND_WATER_INPUT"):
+        env = os.environ.copy()
+        env[key] = "true"
+        result = subprocess.run(
+            ["bash", "jobs/train/hpc/bash_scripts_seg/submit_yolo_mamba_seg.sh"],
+            cwd=REPO_ROOT,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode != 0
+        assert key in result.stderr
+        assert "input_bands" in result.stderr
+
+
 def test_hpc_wrappers_submit_local_configs(tmp_path: Path) -> None:
     """Smoke-test representative migrated wrappers with a stubbed qsub."""
     bin_dir = tmp_path / "bin"
@@ -503,8 +522,6 @@ def test_shoreline_segment_submitter_passes_requested_variants(tmp_path: Path) -
     for name in ("yolo12n_seg_shore_lw_loss", "mamba_hrnet_seg_shore_lw_loss"):
         assert by_name[name]["USE_SHORELINE_PRIOR_LOSS"] == "true"
         assert by_name[name]["USE_LAND_WATER_PRIOR_LOSS"] == "true"
-        assert by_name[name]["USE_SHORELINE_INPUT"] == "false"
-        assert by_name[name]["USE_LAND_WATER_INPUT"] == "false"
 
     for name in (
         "yolo12n_seg_shore_lw_input",
@@ -512,10 +529,12 @@ def test_shoreline_segment_submitter_passes_requested_variants(tmp_path: Path) -
         "mamba_hrnet_seg_shore_lw_input",
         "mamba_hrnet_yolo26_seg_shore_lw_input",
     ):
-        assert by_name[name]["USE_SHORELINE_INPUT"] == "true"
-        assert by_name[name]["USE_LAND_WATER_INPUT"] == "true"
         assert by_name[name]["USE_SHORELINE_PRIOR_LOSS"] == "false"
         assert by_name[name]["USE_LAND_WATER_PRIOR_LOSS"] == "false"
+
+    for vars_map in by_name.values():
+        assert "USE_SHORELINE_INPUT" not in vars_map
+        assert "USE_LAND_WATER_INPUT" not in vars_map
 
     aux_vars = by_name["yolo12n_seg_shore_aux_head"]
     assert aux_vars["USE_SHORELINE_AUX_LOSS"] == "true"
@@ -573,15 +592,15 @@ def test_mamba_hrnet_shore_lw_submitter_limits_batch_and_workers(tmp_path: Path)
         "mamba_hrnet_cascade_mask_rcnn_normal": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-cascade-mask-rcnn.yaml",
     }
     expected_flags = {
-        "mamba_hrnet_seg_shore_lw_input": ("false", "false", "true", "true"),
-        "mamba_hrnet_yolo26_seg_shore_lw_input": ("false", "false", "true", "true"),
-        "mamba_hrnet_cascade_mask_rcnn_normal": ("false", "false", "true", "true"),
+        "mamba_hrnet_seg_shore_lw_input": ("false", "false"),
+        "mamba_hrnet_yolo26_seg_shore_lw_input": ("false", "false"),
+        "mamba_hrnet_cascade_mask_rcnn_normal": ("false", "false"),
     }
     assert set(by_name) == set(expected_configs)
 
     for name, config_yaml in expected_configs.items():
         vars_map = by_name[name]
-        shore_prior, lw_prior, shore_input, lw_input = expected_flags[name]
+        shore_prior, lw_prior = expected_flags[name]
         assert vars_map["TASK"] == "segment"
         assert vars_map["IMGSZ"] == "448"
         assert vars_map["EPOCHS"] == "100"
@@ -593,9 +612,9 @@ def test_mamba_hrnet_shore_lw_submitter_limits_batch_and_workers(tmp_path: Path)
         assert vars_map["EXPERIMENT_MODE"] == f"testrun_{name}"
         assert vars_map["USE_SHORELINE_PRIOR_LOSS"] == shore_prior
         assert vars_map["USE_LAND_WATER_PRIOR_LOSS"] == lw_prior
-        assert vars_map["USE_SHORELINE_INPUT"] == shore_input
-        assert vars_map["USE_LAND_WATER_INPUT"] == lw_input
         assert vars_map["USE_SHORELINE_AUX_LOSS"] == "false"
+        assert "USE_SHORELINE_INPUT" not in vars_map
+        assert "USE_LAND_WATER_INPUT" not in vars_map
 
 
 def test_mamba_hrnet_shore_lw_only_submitter_uses_sh_lw_dataset(tmp_path: Path) -> None:
@@ -792,8 +811,6 @@ def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
     env_base["LORA_ALPHA"] = "16"
     env_base["LORA_DROPOUT"] = "0.1"
     env_base["USE_SOFT_IGNORE"] = "true"
-    env_base["USE_SHORELINE_INPUT"] = "true"
-    env_base["USE_LAND_WATER_INPUT"] = "true"
     env_base["USE_SHORELINE_PRIOR_LOSS"] = "true"
     env_base["USE_LAND_WATER_PRIOR_LOSS"] = "true"
     env_base["USE_SHORELINE_AUX_LOSS"] = "true"
@@ -844,11 +861,11 @@ def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
         assert train_map["lora_alpha"] == "16"
         assert train_map["lora_dropout"] == "0.1"
         assert train_map["use_soft_ignore_band"] == "true"
-        assert train_map["use_shoreline_input"] == "true"
-        assert train_map["use_land_water_input"] == "true"
         assert train_map["use_shoreline_prior_loss"] == "true"
         assert train_map["use_land_water_prior_loss"] == "true"
         assert train_map["use_shoreline_aux_loss"] == "true"
+        assert "use_shoreline_input" not in train_map
+        assert "use_land_water_input" not in train_map
         assert train_map["shoreline_aux_warmup_epochs"] == "2"
         assert train_map["segment_prior_topk"] == "-1"
         assert train_map["seg_w_dice"] == "1"

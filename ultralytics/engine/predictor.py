@@ -179,6 +179,36 @@ class BasePredictor:
         if actual != expected:
             raise ValueError(f"Predict source has {actual} channel(s), but model expects {expected}.")
 
+    def _uses_explicit_predict_input_bands(self) -> bool:
+        """Return True when predict metadata explicitly selects raw bands for model input."""
+        return isinstance(self.data, dict) and bool(self.data.get("input_bands_explicit", False))
+
+    def _predict_load_channels(self) -> int:
+        """Return raw source channels for predict loading, falling back to model input channels."""
+        if self._uses_explicit_predict_input_bands():
+            return int(self.data.get("channels", getattr(self.model, "ch", 3)))
+        return int(getattr(self.model, "ch", 3))
+
+    def _select_predict_input_bands(self, images: list[np.ndarray]) -> list[np.ndarray]:
+        """Select configured 1-based input_bands from raw predict images after geometric transforms."""
+        if not self._uses_explicit_predict_input_bands():
+            return images
+        indices = [int(idx) - 1 for idx in self.data.get("input_bands", [])]
+        if not indices:
+            return images
+
+        selected = []
+        max_idx = max(indices)
+        for img in images:
+            img = img if img.ndim == 3 else img[..., None]
+            if max_idx >= img.shape[2]:
+                raise ValueError(
+                    f"input_bands expects channel index {max_idx + 1}, but predict source only has "
+                    f"{img.shape[2]} channel(s)."
+                )
+            selected.append(img[..., indices])
+        return selected
+
     def _resolve_predict_data(self) -> None:
         """Resolve dataset metadata for predict-time channel scaling when a local YAML is available."""
         if isinstance(self.args.data, dict):
@@ -202,7 +232,10 @@ class BasePredictor:
 
     def _predict_channel_scale_factors(self, channels: int) -> np.ndarray:
         """Return per-channel predict-time input divisors."""
-        band_scale_factors = self.data.get("band_scale_factors", {}) if isinstance(self.data, dict) else {}
+        if isinstance(self.data, dict) and channels == int(self.data.get("input_channels", channels)):
+            band_scale_factors = self.data.get("input_band_scale_factors", self.data.get("band_scale_factors", {}))
+        else:
+            band_scale_factors = self.data.get("band_scale_factors", {}) if isinstance(self.data, dict) else {}
         return get_channel_scale_factors(channels, band_scale_factors)
 
     def preprocess(self, im: torch.Tensor | list[np.ndarray]) -> torch.Tensor:
@@ -218,9 +251,10 @@ class BasePredictor:
         not_tensor = not isinstance(im, torch.Tensor)
         if not_tensor:
             transformed = self.pre_transform(im)
+            transformed = self._select_predict_input_bands(transformed)
             self._validate_predict_channels(transformed)
             im = np.stack(transformed)
-            if im.shape[-1] == 3:
+            if im.shape[-1] == 3 and not self._uses_explicit_predict_input_bands():
                 im = im[..., ::-1]  # BGR to RGB
             im = im.transpose((0, 3, 1, 2))  # BHWC to BCHW, (n, 3, h, w)
             im = np.ascontiguousarray(im)  # contiguous
@@ -329,7 +363,7 @@ class BasePredictor:
             batch=self.args.batch,
             vid_stride=self.args.vid_stride,
             buffer=self.args.stream_buffer,
-            channels=getattr(self.model, "ch", 3),
+            channels=self._predict_load_channels(),
         )
         self.source_type = self.dataset.source_type
         long_sequence = (

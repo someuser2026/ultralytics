@@ -7,6 +7,13 @@
 
 set -euo pipefail
 
+for deprecated_var in USE_SHORELINE_INPUT USE_LAND_WATER_INPUT; do
+    if [[ -n "${!deprecated_var:-}" ]]; then
+        echo "${deprecated_var} is no longer supported. Configure selected model input bands with input_bands in data.yaml." >&2
+        exit 1
+    fi
+done
+
 if [[ "${SOURCE_USER_SHELL_RC:-0}" == "1" ]]; then
     source ~/.bashrc 2>/dev/null || true
     source ~/.profile 2>/dev/null || true
@@ -136,8 +143,6 @@ sdice="${SDICE:-}"
 sbce="${SBCE:-}"
 slovhn="${SLOVHN:-}"
 angle_mode="${ANGLE_MODE:-}"
-use_land_water_input="${USE_LAND_WATER_INPUT:-}"
-use_shoreline_input="${USE_SHORELINE_INPUT:-}"
 
 clahe_p="${CLAHE_P:-}"
 rand_gamma_p="${RAND_GAMMA_P:-}"
@@ -349,8 +354,6 @@ append_arg "seg_w_dice" "${sdice}"
 append_arg "seg_w_bce" "${sbce}"
 append_arg "seg_w_lovasz" "${slovhn}"
 append_arg "angle_mode" "${angle_mode}"
-append_arg "use_land_water_input" "${use_land_water_input}"
-append_arg "use_shoreline_input" "${use_shoreline_input}"
 
 append_arg "clahe_p" "${clahe_p}"
 append_arg "rand_gamma_p" "${rand_gamma_p}"

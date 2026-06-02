@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+for deprecated_var in USE_SHORELINE_INPUT USE_LAND_WATER_INPUT; do
+  if [[ -n "${!deprecated_var:-}" ]]; then
+    echo "${deprecated_var} is no longer supported. Configure selected model input bands with input_bands in data.yaml." >&2
+    exit 1
+  fi
+done
+
 # Submit only the selected Mamba-HRNet segment/cascade runs with reduced loader pressure.
 #
 # Usage:
@@ -84,8 +91,6 @@ submit_job() {
   local config_yaml="$2"
   local use_shoreline_prior_loss="$3"
   local use_land_water_prior_loss="$4"
-  local use_shoreline_input="$5"
-  local use_land_water_input="$6"
 
   VARS=()
   append_var "TASK" "segment"
@@ -112,8 +117,6 @@ submit_job() {
   append_if_set "SLOVHN" "$SLOVHN"
   append_var "USE_SHORELINE_PRIOR_LOSS" "$use_shoreline_prior_loss"
   append_var "USE_LAND_WATER_PRIOR_LOSS" "$use_land_water_prior_loss"
-  append_var "USE_SHORELINE_INPUT" "$use_shoreline_input"
-  append_var "USE_LAND_WATER_INPUT" "$use_land_water_input"
   append_var "USE_SHORELINE_AUX_LOSS" "false"
   append_if_set "SEGMENT_PRIOR_TOPK" "$SEGMENT_PRIOR_TOPK"
   append_if_set "CLAHE_P" "$CLAHE_P"
@@ -146,13 +149,13 @@ submit_job() {
 }
 
 MODELS=(
-  "mamba_hrnet_seg_shore_lw_input|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|false|false|true|true"
-  "mamba_hrnet_yolo26_seg_shore_lw_input|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml|false|false|true|true"
-  "mamba_hrnet_cascade_mask_rcnn_normal|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-cascade-mask-rcnn.yaml|false|false|true|true"
+  "mamba_hrnet_seg_shore_lw_input|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|false|false"
+  "mamba_hrnet_yolo26_seg_shore_lw_input|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml|false|false"
+  "mamba_hrnet_cascade_mask_rcnn_normal|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-cascade-mask-rcnn.yaml|false|false"
 )
 
 for entry in "${MODELS[@]}"; do
-  IFS='|' read -r _label cfg _shore_prior _lw_prior _shore_input _lw_input <<< "$entry"
+  IFS='|' read -r _label cfg _shore_prior _lw_prior <<< "$entry"
   require_file "$cfg"
 done
 
@@ -164,9 +167,9 @@ echo "Augmentations: CLAHE_P=${CLAHE_P}, UNSHARP_P=${UNSHARP_P}, GAUSSIAN_BLUR_P
 count=0
 for entry in "${MODELS[@]}"; do
   count=$((count + 1))
-  IFS='|' read -r label cfg shore_prior lw_prior shore_input lw_input <<< "$entry"
+  IFS='|' read -r label cfg shore_prior lw_prior <<< "$entry"
   printf '[%02d/%02d] ' "$count" "${#MODELS[@]}"
-  submit_job "$label" "$cfg" "$shore_prior" "$lw_prior" "$shore_input" "$lw_input"
+  submit_job "$label" "$cfg" "$shore_prior" "$lw_prior"
 done
 
 echo "Done. Monitor with: qstat -u \"$USER\""

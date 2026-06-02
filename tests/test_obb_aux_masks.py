@@ -12,7 +12,7 @@ import torch
 import tifffile
 
 from tests import TMP
-from ultralytics.cfg import check_cfg
+from ultralytics.cfg import check_cfg, get_cfg
 from ultralytics.data.augment import (
     Albumentations,
     LetterBox,
@@ -173,6 +173,9 @@ def test_check_det_dataset_normalizes_bands_and_infers_channels() -> None:
 
     assert data["bands"] == {4: "shoreline", 5: "land_water", 6: "shoreline_distance", 7: "shoreline_proximity"}
     assert data["channels"] == 7
+    assert data["input_channels"] == 7
+    assert data["input_bands"] == [1, 2, 3, 4, 5, 6, 7]
+    assert data["input_bands_explicit"] is False
 
 
 def test_check_det_dataset_normalizes_band_scale_factors() -> None:
@@ -207,6 +210,88 @@ def test_check_det_dataset_normalizes_band_scale_factors() -> None:
     data = check_det_dataset(str(data_yaml), autodownload=False)
 
     assert data["band_scale_factors"] == {6: 103.0, 7: 65535.0}
+
+
+def test_check_det_dataset_normalizes_explicit_input_bands_and_scale_factors() -> None:
+    """Explicit input_bands should select model channels without changing raw channel metadata."""
+    root = TMP / "obb_aux_yaml_input_bands"
+    (root / "images" / "train").mkdir(parents=True, exist_ok=True)
+    (root / "images" / "val").mkdir(parents=True, exist_ok=True)
+    data_yaml = root / "data.yaml"
+    data_yaml.write_text(
+        "\n".join(
+            [
+                f"path: {root}",
+                "train: images/train",
+                "val: images/val",
+                "channels: 10",
+                "input_bands: [3, 1, 7]",
+                "bands:",
+                "  7: shoreline_proximity",
+                "band_scale_factors:",
+                "  1: 10",
+                "  3: 30",
+                "  7: 7000",
+                "names:",
+                "  0: foreground",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    data = check_det_dataset(str(data_yaml), autodownload=False)
+
+    assert data["channels"] == 10
+    assert data["input_channels"] == 3
+    assert data["input_bands"] == [3, 1, 7]
+    assert data["input_bands_explicit"] is True
+    assert data["input_band_scale_factors"] == {1: 30.0, 2: 10.0, 3: 7000.0}
+
+
+@pytest.mark.parametrize(
+    ("input_bands", "match"),
+    [
+        ("[1, 1]", "duplicate"),
+        ("[0]", ">= 1"),
+        ("[-1]", ">= 1"),
+        ("['1']", "integer"),
+        ("[]", "non-empty"),
+        ("[11]", "at least 11 channels"),
+    ],
+)
+def test_check_det_dataset_rejects_invalid_input_bands(input_bands: str, match: str) -> None:
+    """input_bands must be a valid ordered subset of raw 1-based channel indices."""
+    root = TMP / f"obb_aux_yaml_bad_input_bands_{abs(hash(input_bands))}"
+    (root / "images" / "train").mkdir(parents=True, exist_ok=True)
+    (root / "images" / "val").mkdir(parents=True, exist_ok=True)
+    data_yaml = root / "data.yaml"
+    data_yaml.write_text(
+        "\n".join(
+            [
+                f"path: {root}",
+                "train: images/train",
+                "val: images/val",
+                "channels: 10",
+                f"input_bands: {input_bands}",
+                "names:",
+                "  0: foreground",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SyntaxError, match=match):
+        check_det_dataset(str(data_yaml), autodownload=False)
+
+
+def test_removed_shoreline_input_cfg_keys_are_invalid() -> None:
+    """Old shoreline/land-water input knobs should hard-fail instead of silently changing behavior."""
+    with pytest.raises(SyntaxError, match="use_shoreline_input"):
+        get_cfg(overrides={"use_shoreline_input": True})
+    with pytest.raises(SyntaxError, match="use_land_water_input"):
+        get_cfg(overrides={"use_land_water_input": True})
 
 
 def test_check_det_dataset_rejects_reserved_rgb_band_indices() -> None:
@@ -266,8 +351,6 @@ def test_prepare_auxiliary_mask_inputs_emit_prior_tensors_from_embedded_bands() 
     """Embedded TIFF bands should drive prior-loss tensors without appending new image channels."""
     transform = PrepareAuxiliaryMaskInputs(
         bands={4: "shoreline", 5: "land_water", 6: "shoreline_distance", 7: "shoreline_proximity"},
-        use_shoreline_input=True,
-        use_land_water_input=True,
         use_shoreline_prior_loss=True,
         use_land_water_prior_loss=True,
         use_shoreline_aux_loss=True,
@@ -654,6 +737,73 @@ def test_multiband_segment_dataset_sample_scales_prior_targets_and_model_inputs(
     assert sample["land_water_mask"].dtype == torch.int64
     assert sample["land_water_mask"].shape == (1, 16, 16)
     assert sample["shoreline_distance_map"][0, 0, 0].item() == pytest.approx(1.0, abs=1e-6)
+    assert sample["shoreline_proximity_field"][0, 0, 0].item() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_multiband_dataset_sample_selects_ordered_input_bands_after_aux_extraction() -> None:
+    """input_bands should select ordered model inputs while aux targets still come from raw TIFF bands."""
+    root = TMP / "multiband_segment_dataset_input_bands"
+    image_path = root / "images" / "train" / "sample.tif"
+    label_path = root / "labels" / "train" / "sample.txt"
+    val_image_path = root / "images" / "val" / "sample.tif"
+    val_label_path = root / "labels" / "val" / "sample.txt"
+    for path in (image_path, val_image_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    for path in (label_path, val_label_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    image = np.zeros((16, 16, 10), dtype=np.uint16)
+    image[..., 0] = 20
+    image[..., 2] = 30
+    image[..., 6] = 7000
+    _write_tiff(image_path, image)
+    _write_tiff(val_image_path, image)
+    segment_row = "0 0.25 0.25 0.75 0.25 0.75 0.75 0.25 0.75\n"
+    label_path.write_text(segment_row, encoding="utf-8")
+    val_label_path.write_text(segment_row, encoding="utf-8")
+
+    data_yaml = root / "data.yaml"
+    data_yaml.write_text(
+        "\n".join(
+            [
+                f"path: {root}",
+                "train: images/train",
+                "val: images/val",
+                "channels: 10",
+                "input_bands: [3, 1, 7]",
+                "bands:",
+                "  7: shoreline_proximity",
+                "band_scale_factors:",
+                "  1: 10",
+                "  3: 30",
+                "  7: 7000",
+                "names:",
+                "  0: foreground",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    data = check_det_dataset(str(data_yaml), autodownload=False, hyp=_shoreaux_args(use_shoreline_aux_loss=True))
+    dataset = YOLODataset(
+        img_path=data["train"],
+        imgsz=16,
+        batch_size=1,
+        augment=False,
+        rect=False,
+        hyp=_shoreaux_args(use_shoreline_aux_loss=True),
+        prefix="test: ",
+        data=data,
+        task="segment",
+    )
+
+    sample = dataset[0]
+
+    assert sample["img"].shape == (3, 16, 16)
+    assert sample["img"][0, 0, 0].item() == pytest.approx(1.0, abs=1e-6)
+    assert sample["img"][1, 0, 0].item() == pytest.approx(2.0, abs=1e-6)
+    assert sample["img"][2, 0, 0].item() == pytest.approx(1.0, abs=1e-6)
+    assert sample["shoreline_proximity_field"].shape == (1, 16, 16)
     assert sample["shoreline_proximity_field"][0, 0, 0].item() == pytest.approx(1.0, abs=1e-6)
 
 

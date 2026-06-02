@@ -54,7 +54,9 @@ class RTDETRTrainer(DetectionTrainer):
         Returns:
             (RTDETRDetectionModel): Initialized model.
         """
-        model = RTDETRDetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        model = RTDETRDetectionModel(
+            cfg, nc=self.data["nc"], ch=self.data.get("input_channels", self.data["channels"]), verbose=verbose and RANK == -1
+        )
         return self._finalize_model_build(model, weights)
 
     def build_dataset(self, img_path: str, mode: str = "val", batch: int | None = None):
@@ -128,7 +130,7 @@ class RTDETRSegmentTrainer(RTDETRTrainer):
         from ultralytics.nn.tasks import RTDETRSegmentModel
 
         model = RTDETRSegmentModel(
-            cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1
+            cfg, nc=self.data["nc"], ch=self.data.get("input_channels", self.data["channels"]), verbose=verbose and RANK == -1
         )
         return self._finalize_model_build(model, weights)
 
@@ -177,7 +179,7 @@ class RTDETROBBTrainer(RTDETRTrainer):
         from ultralytics.nn.tasks import RTDETROBBModel
 
         model = RTDETROBBModel(
-            cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1
+            cfg, nc=self.data["nc"], ch=self.data.get("input_channels", self.data["channels"]), verbose=verbose and RANK == -1
         )
         return self._finalize_model_build(model, weights)
 
