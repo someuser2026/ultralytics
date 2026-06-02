@@ -541,6 +541,101 @@ def test_shoreline_segment_submitter_passes_requested_variants(tmp_path: Path) -
     assert aux_vars["SHORELINE_AUX_WARMUP_EPOCHS"] == "2"
 
 
+def test_input_band_segment_submitter_crosses_models_and_data_yamls(tmp_path: Path) -> None:
+    """Submit the shoreline segment model set across RGB, sh/lw, and all-band dataset YAMLs."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+    scratch = tmp_path / "scratch"
+
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{\n"
+        "  echo CALL\n"
+        "  for arg in \"$@\"; do\n"
+        "    printf '%s\\n' \"$arg\"\n"
+        "  done\n"
+        "  echo END\n"
+        "} >> \"$QSUB_LOG\"\n",
+    )
+    _write_stub(bin_dir / "sleep", "#!/usr/bin/env bash\nexit 0\n")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["QSUB_LOG"] = str(qsub_log)
+    env["SCRATCH"] = str(scratch)
+    env["RUN_TAG"] = "testrun"
+    env["SEGMENT_PRIOR_TOPK"] = "-1"
+
+    subprocess.run(
+        ["bash", "jobs/train/hpc/bash_scripts_seg/submit_input_band_segment_models.sh", "4", "100", "0", "0", "1"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == 30
+    for call in calls:
+        assert call[-1] == "jobs/train/hpc/planet_full.pbs"
+    by_name = {call[call.index("-N") + 1]: _parse_varlist(call) for call in calls}
+
+    data_root = (
+        scratch
+        / "data_processed/Global/Annotated/variants/segment/"
+        / "planet_full_c448_ov35_kf20_10075-single_sh-lw-d-prx-cl-hz-sdw_seed0"
+    )
+    expected_data = {
+        "rgb": data_root / "data.yaml",
+        "sh_lw": data_root / "data_sh_lw.yaml",
+        "all": data_root / "data_all.yaml",
+    }
+    expected_configs = {
+        "yolo12n_seg_shore_lw_loss": "ultralytics/cfg/models/12/yolo12-seg.yaml",
+        "yolo12n_seg_shore_lw_input": "ultralytics/cfg/models/12/yolo12-seg.yaml",
+        "yolo12n_seg_shore_aux_head": "ultralytics/cfg/models/12/yolo12-seg-shoreaux.yaml",
+        "yolo26n_seg_normal": "ultralytics/cfg/models/26/yolo26-seg.yaml",
+        "yolo26n_seg_shore_lw_input": "ultralytics/cfg/models/26/yolo26-seg.yaml",
+        "mamba_hrnet_seg_shore_lw_loss": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml",
+        "mamba_hrnet_seg_shore_lw_input": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml",
+        "mamba_hrnet_yolo26_seg_normal": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml",
+        "mamba_hrnet_yolo26_seg_shore_lw_input": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml",
+        "mamba_hrnet_cascade_mask_rcnn_normal": "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-cascade-mask-rcnn.yaml",
+    }
+    expected_names = {f"{model_label}_{data_tag}" for data_tag in expected_data for model_label in expected_configs}
+    assert set(by_name) == expected_names
+
+    for data_tag, data_yaml in expected_data.items():
+        for model_label, config_yaml in expected_configs.items():
+            name = f"{model_label}_{data_tag}"
+            vars_map = by_name[name]
+            assert vars_map["TASK"] == "segment"
+            assert vars_map["IMGSZ"] == "448"
+            assert vars_map["EPOCHS"] == "100"
+            assert vars_map["BATCH"] == "4"
+            assert vars_map["WORKERS"] == "1"
+            assert vars_map["PROJECT"] == "input_band_segment_models"
+            assert vars_map["DATA_YAML"] == str(data_yaml)
+            assert vars_map["CONFIG_YAML"] == config_yaml
+            assert vars_map["EXPERIMENT_MODE"] == f"testrun_{name}"
+            assert vars_map["SDICE"] == "1"
+            assert vars_map["SEGMENT_PRIOR_TOPK"] == "-1"
+            assert "USE_SHORELINE_INPUT" not in vars_map
+            assert "USE_LAND_WATER_INPUT" not in vars_map
+
+    for data_tag in expected_data:
+        for model_label in ("yolo12n_seg_shore_lw_loss", "mamba_hrnet_seg_shore_lw_loss"):
+            vars_map = by_name[f"{model_label}_{data_tag}"]
+            assert vars_map["USE_SHORELINE_PRIOR_LOSS"] == "true"
+            assert vars_map["USE_LAND_WATER_PRIOR_LOSS"] == "true"
+
+        aux_vars = by_name[f"yolo12n_seg_shore_aux_head_{data_tag}"]
+        assert aux_vars["USE_SHORELINE_AUX_LOSS"] == "true"
+        assert aux_vars["SHORELINE_AUX_WARMUP_EPOCHS"] == "2"
+
+
 def test_mamba_hrnet_shore_lw_submitter_limits_batch_and_workers(tmp_path: Path) -> None:
     """Submit selected Mamba-HRNet segment/cascade variants with reduced loader pressure."""
     bin_dir = tmp_path / "bin"
