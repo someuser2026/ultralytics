@@ -8,8 +8,9 @@ for deprecated_var in USE_SHORELINE_INPUT USE_LAND_WATER_INPUT; do
   fi
 done
 
-# Submit the fixed shoreline segment model set across dataset YAMLs that select
-# different model input bands from the same 10-band TIFF files.
+# Submit the fixed shoreline segment model set with explicit dataset YAMLs for
+# each experiment type. The TIFFs still contain all 10 raw bands; data.yaml
+# input_bands controls which channels reach the model.
 #
 # Usage:
 #   bash jobs/train/hpc/bash_scripts_seg/submit_input_band_segment_models.sh [BATCH] [EPOCHS] [SEED] [DRY_RUN] [WORKERS]
@@ -17,13 +18,12 @@ done
 # Expected dataset YAMLs:
 #   data.yaml        -> input_bands: [1, 2, 3]
 #   data_sh_lw.yaml  -> input_bands: [1, 2, 3, 4, 5]
-#   data_all.yaml    -> no input_bands key, model receives all raw channels
+#   data_all.yaml    -> intentionally not scheduled by this launcher
 #
 # Optional environment overrides:
 #   DATA_ROOT=/path/to/dataset/root
 #   DATA_RGB_YAML=/path/to/data.yaml
 #   DATA_SH_LW_YAML=/path/to/data_sh_lw.yaml
-#   DATA_ALL_YAML=/path/to/data_all.yaml
 #   PROJECT=input_band_segment_models
 #   DEVICE=0
 #   WANDB=true
@@ -66,10 +66,10 @@ PBS_SCRIPT="jobs/train/hpc/planet_full.pbs"
 [[ "$WORKERS" =~ ^[0-9]+$ ]] || { echo "WORKERS must be a non-negative integer"; exit 1; }
 
 if [[ -z "${DATA_ROOT:-}" ]]; then
-  if [[ -n "${DATA_RGB_YAML:-}" && -n "${DATA_SH_LW_YAML:-}" && -n "${DATA_ALL_YAML:-}" ]]; then
+  if [[ -n "${DATA_RGB_YAML:-}" && -n "${DATA_SH_LW_YAML:-}" ]]; then
     :
   elif [[ -z "${SCRATCH:-}" ]]; then
-    echo "SCRATCH must be set unless DATA_ROOT or all DATA_*_YAML paths are provided" >&2
+    echo "SCRATCH must be set unless DATA_ROOT or DATA_RGB_YAML and DATA_SH_LW_YAML are provided" >&2
     exit 1
   else
     DATA_ROOT="${SCRATCH}/data_processed/Global/Annotated/variants/segment/planet_full_c448_ov35_kf20_10075-single_sh-lw-d-prx-cl-hz-sdw_seed0"
@@ -78,7 +78,6 @@ fi
 
 DATA_RGB_YAML="${DATA_RGB_YAML:-${DATA_ROOT}/data.yaml}"
 DATA_SH_LW_YAML="${DATA_SH_LW_YAML:-${DATA_ROOT}/data_sh_lw.yaml}"
-DATA_ALL_YAML="${DATA_ALL_YAML:-${DATA_ROOT}/data_all.yaml}"
 
 require_file() {
   local path="$1"
@@ -100,15 +99,13 @@ append_if_set() {
 }
 
 submit_job() {
-  local data_tag="$1"
+  local label="$1"
   local data_yaml="$2"
-  local model_label="$3"
-  local config_yaml="$4"
-  local use_shoreline_prior_loss="$5"
-  local use_land_water_prior_loss="$6"
-  local use_shoreline_aux_loss="$7"
-  local shoreline_aux_warmup_epochs="$8"
-  local label="${model_label}_${data_tag}"
+  local config_yaml="$3"
+  local use_shoreline_prior_loss="$4"
+  local use_land_water_prior_loss="$5"
+  local use_shoreline_aux_loss="$6"
+  local shoreline_aux_warmup_epochs="$7"
 
   VARS=()
   append_var "TASK" "segment"
@@ -169,47 +166,37 @@ submit_job() {
   fi
 }
 
-DATASETS=(
-  "rgb|${DATA_RGB_YAML}"
-  "sh_lw|${DATA_SH_LW_YAML}"
-  "all|${DATA_ALL_YAML}"
-)
-
 MODELS=(
-  "yolo12n_seg_shore_lw_loss|ultralytics/cfg/models/12/yolo12-seg.yaml|true|true|false|null"
-  "yolo12n_seg_shore_lw_input|ultralytics/cfg/models/12/yolo12-seg.yaml|false|false|false|null"
-  "yolo12n_seg_shore_aux_head|ultralytics/cfg/models/12/yolo12-seg-shoreaux.yaml|false|false|true|2"
-  "yolo26n_seg_normal|ultralytics/cfg/models/26/yolo26-seg.yaml|false|false|false|null"
-  "yolo26n_seg_shore_lw_input|ultralytics/cfg/models/26/yolo26-seg.yaml|false|false|false|null"
-  "mamba_hrnet_seg_shore_lw_loss|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|true|true|false|null"
-  "mamba_hrnet_seg_shore_lw_input|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|false|false|false|null"
-  "mamba_hrnet_yolo26_seg_normal|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml|false|false|false|null"
-  "mamba_hrnet_yolo26_seg_shore_lw_input|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml|false|false|false|null"
-  "mamba_hrnet_cascade_mask_rcnn_normal|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-cascade-mask-rcnn.yaml|false|false|false|null"
+  "yolo12n_seg_shore_lw_loss|${DATA_RGB_YAML}|ultralytics/cfg/models/12/yolo12-seg.yaml|true|true|false|null"
+  "yolo12n_seg_shore_lw_input|${DATA_SH_LW_YAML}|ultralytics/cfg/models/12/yolo12-seg.yaml|false|false|false|null"
+  "yolo12n_seg_shore_aux_head|${DATA_RGB_YAML}|ultralytics/cfg/models/12/yolo12-seg-shoreaux.yaml|false|false|true|2"
+  "yolo26n_seg_normal|${DATA_RGB_YAML}|ultralytics/cfg/models/26/yolo26-seg.yaml|false|false|false|null"
+  "yolo26n_seg_shore_lw_input|${DATA_SH_LW_YAML}|ultralytics/cfg/models/26/yolo26-seg.yaml|false|false|false|null"
+  "mamba_hrnet_seg_shore_lw_loss|${DATA_RGB_YAML}|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|true|true|false|null"
+  "mamba_hrnet_seg_shore_lw_input|${DATA_SH_LW_YAML}|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|false|false|false|null"
+  "mamba_hrnet_yolo26_seg_normal|${DATA_RGB_YAML}|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml|false|false|false|null"
+  "mamba_hrnet_yolo26_seg_shore_lw_input|${DATA_SH_LW_YAML}|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-yolo26-seg.yaml|false|false|false|null"
+  "mamba_hrnet_cascade_mask_rcnn_normal|${DATA_RGB_YAML}|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-cascade-mask-rcnn.yaml|false|false|false|null"
 )
 
 for entry in "${MODELS[@]}"; do
-  IFS='|' read -r _label cfg _shore_prior _lw_prior _shore_aux _warmup <<< "$entry"
+  IFS='|' read -r _label _data_yaml cfg _shore_prior _lw_prior _shore_aux _warmup <<< "$entry"
   require_file "$cfg"
 done
 
-echo "Submitting $((${#DATASETS[@]} * ${#MODELS[@]})) input-band segment jobs"
+echo "Submitting ${#MODELS[@]} input-band segment jobs"
 echo "DATA_RGB_YAML=${DATA_RGB_YAML}"
 echo "DATA_SH_LW_YAML=${DATA_SH_LW_YAML}"
-echo "DATA_ALL_YAML=${DATA_ALL_YAML}"
 echo "IMGSZ=${IMGSZ}, EPOCHS=${EPOCHS}, BATCH=${BATCH}, WORKERS=${WORKERS}, DEVICE=${DEVICE}, SEED=${SEED}, PROJECT=${PROJECT}, RUN_TAG=${RUN_TAG}, DRY_RUN=${DRY_RUN}"
 echo "Augmentations: CLAHE_P=${CLAHE_P}, UNSHARP_P=${UNSHARP_P}, GAUSSIAN_BLUR_P=${GAUSSIAN_BLUR_P}, MOTION_BLUR_P=${MOTION_BLUR_P}, MULTI_SPEC_NOISE_P=${MULTI_SPEC_NOISE_P}, MOSAIC=${MOSAIC}, MIXUP=${MIXUP}, COPY_PASTE=${COPY_PASTE}, CLOSE_MOSAIC=${CLOSE_MOSAIC}"
 
 count=0
-total=$((${#DATASETS[@]} * ${#MODELS[@]}))
-for dataset_entry in "${DATASETS[@]}"; do
-  IFS='|' read -r data_tag data_yaml <<< "$dataset_entry"
-  for model_entry in "${MODELS[@]}"; do
-    count=$((count + 1))
-    IFS='|' read -r label cfg shore_prior lw_prior shore_aux warmup <<< "$model_entry"
-    printf '[%02d/%02d] ' "$count" "$total"
-    submit_job "$data_tag" "$data_yaml" "$label" "$cfg" "$shore_prior" "$lw_prior" "$shore_aux" "$warmup"
-  done
+total=${#MODELS[@]}
+for entry in "${MODELS[@]}"; do
+  count=$((count + 1))
+  IFS='|' read -r label data_yaml cfg shore_prior lw_prior shore_aux warmup <<< "$entry"
+  printf '[%02d/%02d] ' "$count" "$total"
+  submit_job "$label" "$data_yaml" "$cfg" "$shore_prior" "$lw_prior" "$shore_aux" "$warmup"
 done
 
 echo "Done. Monitor with: qstat -u \"$USER\""
