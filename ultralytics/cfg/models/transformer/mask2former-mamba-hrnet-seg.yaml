@@ -1,0 +1,108 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Mask2Former instance segmentation with a faithful HRNet-style Mamba backbone.
+# The final HR branches provide P2-P5 features directly to Mask2FormerHead.
+
+nc: 80
+scales:
+  T: [0.33, 0.25, 1024]
+  B: [0.33, 0.50, 1024]
+  L: [0.67, 0.75, 768]
+
+backbone:
+  - [-1, 1, SimpleStem, [128, 3]]  # 0-P2/4
+  - [-1, 2, VSSBlock, [128]]
+
+  - [1, 1, VSSBlock, [128]]
+  - [1, 1, Conv, [256, 3, 2]]
+  - [-1, 1, VSSBlock, [256]]
+  - [2, 2, VSSBlock, [128]]
+  - [4, 2, VSSBlock, [256]]
+
+  - [6, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[5, 7], 1, Concat, [1]]
+  - [-1, 2, VSSBlock, [128]]
+  - [5, 1, Conv, [256, 3, 2]]
+  - [[10, 6], 1, Concat, [1]]
+  - [-1, 2, VSSBlock, [256]]
+
+  - [12, 1, Conv, [512, 3, 2]]
+  - [-1, 1, VSSBlock, [512]]
+  - [9, 2, VSSBlock, [128]]
+  - [12, 2, VSSBlock, [256]]
+  - [14, 2, VSSBlock, [512]]
+
+  - [16, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [17, 1, nn.Upsample, [None, 4, "nearest"]]
+  - [[15, 18, 19], 1, Concat, [1]]
+  - [-1, 2, VSSBlock, [128]]
+  - [15, 1, Conv, [256, 3, 2]]
+  - [17, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[22, 16, 23], 1, Concat, [1]]
+  - [-1, 2, VSSBlock, [256]]
+  - [15, 1, Conv, [256, 3, 2]]
+  - [26, 1, Conv, [512, 3, 2]]
+  - [16, 1, Conv, [512, 3, 2]]
+  - [[27, 28, 17], 1, Concat, [1]]
+  - [-1, 2, VSSBlock, [512]]
+
+  - [30, 1, Conv, [1024, 3, 2]]
+  - [-1, 1, VSSBlock, [1024]]
+  - [21, 2, VSSBlock, [128]]
+  - [25, 2, VSSBlock, [256]]
+  - [30, 2, VSSBlock, [512]]
+  - [32, 2, VSSBlock, [1024]]
+
+  - [34, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [35, 1, nn.Upsample, [None, 4, "nearest"]]
+  - [36, 1, nn.Upsample, [None, 8, "nearest"]]
+  - [[33, 37, 38, 39], 1, Concat, [1]]
+  - [-1, 2, VSSBlock, [128]]  # 41-P2/4
+
+  - [33, 1, Conv, [256, 3, 2]]
+  - [35, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [36, 1, nn.Upsample, [None, 4, "nearest"]]
+  - [[42, 34, 43, 44], 1, Concat, [1]]
+  - [-1, 2, VSSBlock, [256]]  # 46-P3/8
+
+  - [33, 1, Conv, [256, 3, 2]]
+  - [47, 1, Conv, [512, 3, 2]]
+  - [34, 1, Conv, [512, 3, 2]]
+  - [36, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[48, 49, 35, 50], 1, Concat, [1]]
+  - [-1, 2, VSSBlock, [512]]  # 52-P4/16
+
+  - [33, 1, Conv, [256, 3, 2]]
+  - [53, 1, Conv, [512, 3, 2]]
+  - [54, 1, Conv, [1024, 3, 2]]
+  - [34, 1, Conv, [512, 3, 2]]
+  - [56, 1, Conv, [1024, 3, 2]]
+  - [35, 1, Conv, [1024, 3, 2]]
+  - [[55, 57, 58, 36], 1, Concat, [1]]
+  - [-1, 2, VSSBlock, [1024]]
+  - [-1, 1, SPPF, [1024, 5]]  # 61-P5/32
+
+head:
+  - [[41, 46, 52, 61], 1, Mask2FormerHead, [nc, {
+        feature_strides: [4, 8, 16, 32],
+        transformer_in_features: [1, 2, 3],
+        common_stride: 4,
+        conv_dim: 256,
+        mask_dim: 256,
+        hidden_dim: 256,
+        num_queries: 100,
+        nheads: 8,
+        dec_layers: 10,
+        enc_layers: 6,
+        dim_feedforward: 2048,
+        encoder_dim_feedforward: 1024,
+        dropout: 0.0,
+        pre_norm: false,
+        class_weight: 2.0,
+        mask_weight: 5.0,
+        dice_weight: 5.0,
+        no_object_weight: 0.1,
+        train_num_points: 12544,
+        oversample_ratio: 3.0,
+        importance_sample_ratio: 0.75
+  }]]

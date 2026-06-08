@@ -139,9 +139,7 @@ from .neck import (
 from .legnet import LWEGNet
 from .rcnn import CascadeMaskRCNNHead, MaskRCNNHead, OrientedRCNNHead, RotatedFasterRCNNHead
 from .rcnn_backbone import ResNetBackbone, UnravelNetBackbone
-# from .mask2formerhead import (
-#     Mask2FormerHead
-# )
+from .mask2former import Mask2FormerHead
 
 from .rpn import AnchorGenerator, RPNHead
 
@@ -281,12 +279,12 @@ __all__ = (
     "RHINOOBBDecoder",
     "RTDETROBBDecoder",
     "RTDETRSegmentDecoder",
+    "Mask2FormerHead",
     "EdgeStem",
     "EdgeVSSBlock",
     "SimpleStem",
     "VisionClueMerge",
     "VSSBlock",
     "XSSBlock",
-    # "Mask2FormerHead",
     # "CascadeRCNNHead"
 )

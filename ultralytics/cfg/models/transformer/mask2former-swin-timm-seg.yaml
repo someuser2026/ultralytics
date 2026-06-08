@@ -1,0 +1,46 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Mask2Former instance segmentation with a timm Swin-T backbone.
+# The backbone is swappable; the Mask2Former head consumes P2-P5 feature maps.
+
+nc: 80
+stride: 224
+patch_size: 4
+
+backbone:
+  - [-1, 1, Timm, ["swin_tiny_patch4_window7_224.ms_in22k", False, 3, True, [0, 1, 2, 3], 28, null, "auto", False, False, True, True, 0.0]]
+
+head:
+  - [0, 1, Index, [0]]  # 1-P2/4
+  - [0, 1, Index, [1]]  # 2-P3/8
+  - [0, 1, Index, [2]]  # 3-P4/16
+  - [0, 1, Index, [3]]  # 4-P5/32
+
+  - [1, 1, torchvision.ops.Permute, [[0, 3, 1, 2]]]
+  - [2, 1, torchvision.ops.Permute, [[0, 3, 1, 2]]]
+  - [3, 1, torchvision.ops.Permute, [[0, 3, 1, 2]]]
+  - [4, 1, torchvision.ops.Permute, [[0, 3, 1, 2]]]
+
+  - [[5, 6, 7, 8], 1, Mask2FormerHead, [nc, {
+        feature_strides: [4, 8, 16, 32],
+        transformer_in_features: [1, 2, 3],
+        common_stride: 4,
+        conv_dim: 256,
+        mask_dim: 256,
+        hidden_dim: 256,
+        num_queries: 100,
+        nheads: 8,
+        dec_layers: 10,
+        enc_layers: 6,
+        dim_feedforward: 2048,
+        encoder_dim_feedforward: 1024,
+        dropout: 0.0,
+        pre_norm: false,
+        class_weight: 2.0,
+        mask_weight: 5.0,
+        dice_weight: 5.0,
+        no_object_weight: 0.1,
+        train_num_points: 12544,
+        oversample_ratio: 3.0,
+        importance_sample_ratio: 0.75
+  }]]

@@ -111,7 +111,7 @@ from ultralytics.nn.modules import (
     RTDETROBBDecoder,
     RTDETRSegmentDecoder,
     LWEGNet,
-    # Mask2FormerHead,
+    Mask2FormerHead,
     # CascadeRCNNHead,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
@@ -735,6 +735,10 @@ class SegmentationModel(DetectionModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the SegmentationModel."""
+        if isinstance(self.model[-1], Mask2FormerHead):
+            from ultralytics.utils.loss import Mask2FormerInstanceLoss
+
+            return Mask2FormerInstanceLoss(self)
         return E2ELoss(self, v8SegmentationLoss) if getattr(self, "end2end", False) else v8SegmentationLoss(self)
 
 
@@ -2559,7 +2563,7 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, Segment26, SegmentShoreAux, YOLOESegment, Pose, OBB, OBB26, OBBShoreAux, RotatedFCOS, ImagePoolingAttn, v10Detect}#, Mask2FormerHead}
+            {Detect, WorldDetect, YOLOEDetect, Segment, Segment26, SegmentShoreAux, YOLOESegment, Pose, OBB, OBB26, OBBShoreAux, RotatedFCOS, ImagePoolingAttn, v10Detect}
         ):
             # print("f:", f)
             # print("ch:", ch)
@@ -2570,6 +2574,10 @@ def parse_model(d, ch, verbose=True):
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {Detect, YOLOEDetect, Segment, Segment26, SegmentShoreAux, YOLOESegment, Pose, OBB, OBB26, OBBShoreAux, RotatedFCOS}:
                 m.legacy = legacy
+        elif m is Mask2FormerHead:
+            args.append([ch[x] for x in f])
+            cfg_arg = args[1] if len(args) > 1 and isinstance(args[1], dict) else {}
+            c2 = int(cfg_arg.get("mask_dim", cfg_arg.get("conv_dim", 256)))
         elif m in frozenset({RTDETRDecoder, RTDETRSegmentDecoder, RTDETROBBDecoder, RHINOOBBDecoder}):  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
         elif m in frozenset({MaskRCNNHead, CascadeMaskRCNNHead, RotatedFasterRCNNHead, OrientedRCNNHead}):
@@ -2771,7 +2779,7 @@ def guess_model_task(model):
         m = cfg["head"][-1][-2].lower()  # output module name
         if m in {"classify", "classifier", "cls", "fc"}:
             return "classify"
-        if "segment" in m or "maskrcnn" in m:
+        if "segment" in m or "maskrcnn" in m or "mask2former" in m:
             return "segment"
         if "obb" in m or "rotatedfcos" in m or "orientedrcnn" in m or "rotatedfasterrcnn" in m:
             return "obb"
@@ -2793,7 +2801,7 @@ def guess_model_task(model):
             with contextlib.suppress(Exception):
                 return cfg2task(eval(x))
         for m in model.modules():
-            if isinstance(m, (Segment, Segment26, YOLOESegment, MaskRCNNHead, CascadeMaskRCNNHead)):
+            if isinstance(m, (Segment, Segment26, YOLOESegment, MaskRCNNHead, CascadeMaskRCNNHead, Mask2FormerHead)):
                 return "segment"
             elif isinstance(m, RTDETRSegmentDecoder):
                 return "segment"

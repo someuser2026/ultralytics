@@ -78,7 +78,18 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
 
     def get_validator(self):
         """Return an instance of SegmentationValidator for validation of YOLO model."""
-        self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "shoreline_prior_loss", "land_water_prior_loss", "shore_aux_loss"
+        if self._uses_mask2former_head():
+            self.loss_names = "cls_loss", "mask_loss", "dice_loss"
+        else:
+            self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "shoreline_prior_loss", "land_water_prior_loss", "shore_aux_loss"
         return yolo.segment.SegmentationValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
+
+    def _uses_mask2former_head(self) -> bool:
+        """Return True when the current model ends with the native Mask2Former head."""
+        model = getattr(self, "model", None)
+        if model is None:
+            return False
+        model = unwrap_model(model)
+        return bool(getattr(model, "model", None)) and model.model[-1].__class__.__name__ == "Mask2FormerHead"

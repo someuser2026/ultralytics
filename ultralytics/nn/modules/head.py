@@ -2800,3 +2800,7 @@ class Mask2FormerHead(nn.Module):
         
         # Return final predictions and auxiliary outputs
         return {"pred_logits": cls, "pred_masks": masks, "aux_outputs": aux}
+
+
+# Keep direct imports from ultralytics.nn.modules.head on the faithful native implementation.
+from .mask2former import Mask2FormerHead  # noqa: E402,F811

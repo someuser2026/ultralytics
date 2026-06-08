@@ -3837,3 +3837,373 @@ class Mask2FormerLoss(nn.Module):
         # Return total loss and individual components for logging
         return loss, torch.tensor([lcls.detach(), lbce.detach(), ldice.detach()],
                                   device=outputs["pred_masks"].device)
+
+
+# --- Faithful Mask2Former instance-segmentation criterion --------------------
+
+def _m2f_point_sample(input: torch.Tensor, point_coords: torch.Tensor, align_corners: bool = False) -> torch.Tensor:
+    """Detectron2 PointRend-compatible point sampling wrapper."""
+    add_dim = False
+    if point_coords.dim() == 3:
+        add_dim = True
+        point_coords = point_coords.unsqueeze(2)
+    output = F.grid_sample(input, 2.0 * point_coords - 1.0, mode="bilinear", align_corners=align_corners)
+    if add_dim:
+        output = output.squeeze(3)
+    return output
+
+
+def _m2f_calculate_uncertainty(logits: torch.Tensor) -> torch.Tensor:
+    """Mask2Former uncertainty: logits nearest zero are most uncertain."""
+    if logits.shape[1] != 1:
+        raise ValueError(f"Expected uncertainty logits with channel dimension 1, got {tuple(logits.shape)}.")
+    return -torch.abs(logits)
+
+
+def _m2f_uncertain_point_coords(
+    logits: torch.Tensor,
+    num_points: int,
+    oversample_ratio: float,
+    importance_sample_ratio: float,
+) -> torch.Tensor:
+    """Port of PointRend get_uncertain_point_coords_with_randomness used by Mask2Former."""
+    num_boxes = logits.shape[0]
+    num_sampled = int(num_points * oversample_ratio)
+    point_coords = torch.rand(num_boxes, num_sampled, 2, device=logits.device, dtype=logits.dtype)
+    point_logits = _m2f_point_sample(logits, point_coords, align_corners=False)
+    point_uncertainties = _m2f_calculate_uncertainty(point_logits)
+
+    num_uncertain = int(importance_sample_ratio * num_points)
+    num_random = num_points - num_uncertain
+    if num_uncertain > 0:
+        idx = torch.topk(point_uncertainties[:, 0, :], k=num_uncertain, dim=1)[1]
+        shift = num_sampled * torch.arange(num_boxes, dtype=torch.long, device=logits.device)
+        idx = idx + shift[:, None]
+        point_coords = point_coords.view(-1, 2)[idx.view(-1), :].view(num_boxes, num_uncertain, 2)
+    else:
+        point_coords = point_coords[:, :0]
+    if num_random > 0:
+        point_coords = torch.cat(
+            [point_coords, torch.rand(num_boxes, num_random, 2, device=logits.device, dtype=logits.dtype)],
+            dim=1,
+        )
+    return point_coords
+
+
+def _m2f_dice_loss(inputs: torch.Tensor, targets: torch.Tensor, num_masks: float) -> torch.Tensor:
+    """Reference Mask2Former Dice loss over sampled points."""
+    inputs = inputs.sigmoid().flatten(1)
+    targets = targets.flatten(1)
+    numerator = 2 * (inputs * targets).sum(-1)
+    denominator = inputs.sum(-1) + targets.sum(-1)
+    return (1 - (numerator + 1) / (denominator + 1)).sum() / num_masks
+
+
+def _m2f_sigmoid_ce_loss(inputs: torch.Tensor, targets: torch.Tensor, num_masks: float) -> torch.Tensor:
+    """Reference Mask2Former point-wise sigmoid CE loss."""
+    loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    return loss.mean(1).sum() / num_masks
+
+
+def _m2f_batch_dice_loss(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Pairwise Dice matching cost used by the reference Hungarian matcher."""
+    inputs = inputs.sigmoid().flatten(1)
+    targets = targets.flatten(1)
+    numerator = 2 * torch.einsum("nc,mc->nm", inputs, targets)
+    denominator = inputs.sum(-1)[:, None] + targets.sum(-1)[None, :]
+    return 1 - (numerator + 1) / (denominator + 1)
+
+
+def _m2f_batch_sigmoid_ce_loss(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Pairwise sigmoid CE matching cost used by the reference Hungarian matcher."""
+    hw = inputs.shape[1]
+    pos = F.binary_cross_entropy_with_logits(inputs, torch.ones_like(inputs), reduction="none")
+    neg = F.binary_cross_entropy_with_logits(inputs, torch.zeros_like(inputs), reduction="none")
+    loss = torch.einsum("nc,mc->nm", pos, targets) + torch.einsum("nc,mc->nm", neg, (1 - targets))
+    return loss / hw
+
+
+def _m2f_nested_masks(masks: list[torch.Tensor]) -> torch.Tensor:
+    """Pad variable per-image instance masks to a common tensor."""
+    if not masks:
+        return torch.zeros(0)
+    max_n = max((m.shape[0] if m.numel() else 0) for m in masks)
+    max_h = max((m.shape[-2] if m.numel() else 0) for m in masks)
+    max_w = max((m.shape[-1] if m.numel() else 0) for m in masks)
+    if max_n == 0 or max_h == 0 or max_w == 0:
+        device = masks[0].device
+        return torch.zeros((len(masks), 0, 0, 0), device=device)
+    batch = []
+    for m in masks:
+        padded = torch.zeros((max_n, max_h, max_w), device=m.device, dtype=m.dtype)
+        if m.numel():
+            padded[: m.shape[0], : m.shape[-2], : m.shape[-1]] = m
+        batch.append(padded)
+    return torch.stack(batch, 0)
+
+
+class Mask2FormerHungarianMatcher(nn.Module):
+    """Faithful Mask2Former Hungarian matcher for instance masks."""
+
+    def __init__(self, cost_class: float = 1.0, cost_mask: float = 1.0, cost_dice: float = 1.0, num_points: int = 12544):
+        super().__init__()
+        if cost_class == 0 and cost_mask == 0 and cost_dice == 0:
+            raise ValueError("All Mask2Former matching costs cannot be zero.")
+        self.cost_class = float(cost_class)
+        self.cost_mask = float(cost_mask)
+        self.cost_dice = float(cost_dice)
+        self.num_points = int(num_points)
+
+    @torch.no_grad()
+    def forward(self, outputs: dict[str, torch.Tensor], targets: list[dict[str, torch.Tensor]]) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Compute per-image query-to-target assignments."""
+        from scipy.optimize import linear_sum_assignment
+
+        bs, num_queries = outputs["pred_logits"].shape[:2]
+        indices = []
+        for b in range(bs):
+            out_prob = outputs["pred_logits"][b].softmax(-1)
+            tgt_ids = targets[b]["labels"]
+            if tgt_ids.numel() == 0:
+                empty = torch.zeros(0, dtype=torch.int64)
+                indices.append((empty, empty))
+                continue
+            cost_class = -out_prob[:, tgt_ids]
+            out_mask = outputs["pred_masks"][b][:, None]
+            tgt_mask = targets[b]["masks"].to(out_mask)[:, None]
+            point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device, dtype=out_mask.dtype)
+            tgt_mask = _m2f_point_sample(
+                tgt_mask, point_coords.repeat(tgt_mask.shape[0], 1, 1), align_corners=False
+            ).squeeze(1)
+            out_mask = _m2f_point_sample(
+                out_mask, point_coords.repeat(out_mask.shape[0], 1, 1), align_corners=False
+            ).squeeze(1)
+            with autocast(enabled=False):
+                out_mask = out_mask.float()
+                tgt_mask = tgt_mask.float()
+                cost_mask = _m2f_batch_sigmoid_ce_loss(out_mask, tgt_mask)
+                cost_dice = _m2f_batch_dice_loss(out_mask, tgt_mask)
+            cost = self.cost_mask * cost_mask + self.cost_class * cost_class + self.cost_dice * cost_dice
+            row_ind, col_ind = linear_sum_assignment(cost.reshape(num_queries, -1).detach().cpu())
+            indices.append((torch.as_tensor(row_ind, dtype=torch.int64), torch.as_tensor(col_ind, dtype=torch.int64)))
+        return indices
+
+
+class Mask2FormerSetCriterion(nn.Module):
+    """Reference Mask2Former SetCriterion without Detectron2 dependencies."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        matcher: Mask2FormerHungarianMatcher,
+        eos_coef: float,
+        num_points: int,
+        oversample_ratio: float,
+        importance_sample_ratio: float,
+    ):
+        super().__init__()
+        self.num_classes = int(num_classes)
+        self.matcher = matcher
+        empty_weight = torch.ones(self.num_classes + 1)
+        empty_weight[-1] = float(eos_coef)
+        self.register_buffer("empty_weight", empty_weight)
+        self.num_points = int(num_points)
+        self.oversample_ratio = float(oversample_ratio)
+        self.importance_sample_ratio = float(importance_sample_ratio)
+
+    @staticmethod
+    def _get_src_permutation_idx(indices: list[tuple[torch.Tensor, torch.Tensor]], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return batch/query indices for matched predictions."""
+        batch_idx = []
+        src_idx = []
+        for i, (src, _) in enumerate(indices):
+            if src.numel():
+                src = src.to(device)
+                batch_idx.append(torch.full_like(src, i))
+                src_idx.append(src)
+        if not batch_idx:
+            empty = torch.zeros(0, dtype=torch.long, device=device)
+            return empty, empty
+        return torch.cat(batch_idx), torch.cat(src_idx)
+
+    @staticmethod
+    def _get_tgt_permutation_idx(indices: list[tuple[torch.Tensor, torch.Tensor]], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return batch/target indices for matched targets."""
+        batch_idx = []
+        tgt_idx = []
+        for i, (_, tgt) in enumerate(indices):
+            if tgt.numel():
+                tgt = tgt.to(device)
+                batch_idx.append(torch.full_like(tgt, i))
+                tgt_idx.append(tgt)
+        if not batch_idx:
+            empty = torch.zeros(0, dtype=torch.long, device=device)
+            return empty, empty
+        return torch.cat(batch_idx), torch.cat(tgt_idx)
+
+    def loss_labels(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        indices: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> dict[str, torch.Tensor]:
+        """Reference classification CE loss with explicit no-object class."""
+        src_logits = outputs["pred_logits"].float()
+        idx = self._get_src_permutation_idx(indices, src_logits.device)
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
+        if idx[0].numel():
+            target_classes_o = torch.cat(
+                [t["labels"][j.to(t["labels"].device)] for t, (_, j) in zip(targets, indices) if j.numel()]
+            ).to(src_logits.device)
+            target_classes[idx] = target_classes_o
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+        return {"loss_ce": loss_ce}
+
+    def loss_masks(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        indices: list[tuple[torch.Tensor, torch.Tensor]],
+        num_masks: float,
+    ) -> dict[str, torch.Tensor]:
+        """Reference point-sampled BCE and Dice mask losses."""
+        src_masks_all = outputs["pred_masks"]
+        src_idx = self._get_src_permutation_idx(indices, src_masks_all.device)
+        if src_idx[0].numel() == 0:
+            z = src_masks_all.sum() * 0.0
+            return {"loss_mask": z, "loss_dice": z}
+
+        tgt_idx = self._get_tgt_permutation_idx(indices, src_masks_all.device)
+        src_masks = src_masks_all[src_idx]
+        target_masks_list = [t["masks"].to(src_masks_all.device) for t in targets]
+        target_masks_padded = _m2f_nested_masks(target_masks_list)
+        target_masks = target_masks_padded[tgt_idx].to(src_masks)
+
+        src_masks = src_masks[:, None]
+        target_masks = target_masks[:, None]
+        with torch.no_grad():
+            point_coords = _m2f_uncertain_point_coords(
+                src_masks,
+                self.num_points,
+                self.oversample_ratio,
+                self.importance_sample_ratio,
+            )
+            point_labels = _m2f_point_sample(target_masks, point_coords, align_corners=False).squeeze(1)
+        point_logits = _m2f_point_sample(src_masks, point_coords, align_corners=False).squeeze(1)
+        return {
+            "loss_mask": _m2f_sigmoid_ce_loss(point_logits, point_labels, num_masks),
+            "loss_dice": _m2f_dice_loss(point_logits, point_labels, num_masks),
+        }
+
+    def forward(self, outputs: dict[str, torch.Tensor], targets: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        """Compute final and auxiliary Mask2Former losses."""
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
+        indices = self.matcher(outputs_without_aux, targets)
+        num_masks = sum(len(t["labels"]) for t in targets)
+        num_masks_t = torch.as_tensor([num_masks], dtype=torch.float, device=outputs["pred_masks"].device)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(num_masks_t)
+            world_size = torch.distributed.get_world_size()
+        else:
+            world_size = 1
+        num_masks_f = torch.clamp(num_masks_t / world_size, min=1).item()
+
+        losses = {}
+        losses.update(self.loss_labels(outputs_without_aux, targets, indices))
+        losses.update(self.loss_masks(outputs_without_aux, targets, indices, num_masks_f))
+        for i, aux_outputs in enumerate(outputs.get("aux_outputs", [])):
+            indices = self.matcher(aux_outputs, targets)
+            for name, value in self.loss_labels(aux_outputs, targets, indices).items():
+                losses[f"{name}_{i}"] = value
+            for name, value in self.loss_masks(aux_outputs, targets, indices, num_masks_f).items():
+                losses[f"{name}_{i}"] = value
+        return losses
+
+
+class Mask2FormerInstanceLoss(nn.Module):
+    """Ultralytics loss adapter for the faithful Mask2Former instance-segmentation criterion."""
+
+    def __init__(self, model):
+        super().__init__()
+        head = model.model[-1]
+        self.device = next(head.parameters()).device
+        cfg = getattr(head, "loss_cfg", {})
+        args = getattr(model, "args", None)
+        get_arg = args.get if isinstance(args, dict) else lambda k, d=None: getattr(args, k, d)
+        self.num_classes = int(getattr(head, "nc", model.yaml["nc"]))
+        self.class_weight = float(cfg.get("class_weight", 2.0))
+        self.mask_weight = float(cfg.get("mask_weight", 5.0))
+        self.dice_weight = float(cfg.get("dice_weight", 5.0))
+        self.overlap_mask = bool(get_arg("overlap_mask", cfg.get("overlap_mask", True)))
+        num_points = int(cfg.get("train_num_points", 12544))
+        matcher = Mask2FormerHungarianMatcher(
+            cost_class=self.class_weight,
+            cost_mask=self.mask_weight,
+            cost_dice=self.dice_weight,
+            num_points=num_points,
+        )
+        self.criterion = Mask2FormerSetCriterion(
+            self.num_classes,
+            matcher=matcher,
+            eos_coef=float(cfg.get("no_object_weight", 0.1)),
+            num_points=num_points,
+            oversample_ratio=float(cfg.get("oversample_ratio", 3.0)),
+            importance_sample_ratio=float(cfg.get("importance_sample_ratio", 0.75)),
+        )
+
+    def _build_targets(self, batch: dict[str, torch.Tensor]) -> list[dict[str, torch.Tensor]]:
+        """Convert Ultralytics segment batches to Mask2Former per-image targets."""
+        imgs = batch["img"]
+        bs = imgs.shape[0]
+        cls = batch["cls"].view(-1).to(device=imgs.device, dtype=torch.long)
+        batch_idx = batch["batch_idx"].view(-1).to(device=imgs.device, dtype=torch.long)
+        masks = batch.get("masks")
+        if masks is None:
+            raise TypeError("Mask2Former instance segmentation requires batch['masks'].")
+        masks = masks.to(device=imgs.device).float()
+
+        targets = []
+        overlap = self.overlap_mask and masks.ndim == 3 and masks.shape[0] == bs
+        for i in range(bs):
+            sel = batch_idx == i
+            labels_i = cls[sel]
+            if labels_i.numel() == 0:
+                h = int(masks.shape[-2]) if masks.ndim >= 2 else int(imgs.shape[-2])
+                w = int(masks.shape[-1]) if masks.ndim >= 2 else int(imgs.shape[-1])
+                masks_i = masks.new_zeros((0, h, w))
+            elif overlap:
+                overlap_i = masks[i]
+                if overlap_i.ndim == 3:
+                    overlap_i = overlap_i[0]
+                ids = torch.arange(1, labels_i.numel() + 1, device=masks.device, dtype=overlap_i.dtype)
+                masks_i = (overlap_i[None] == ids[:, None, None]).float()
+            else:
+                masks_i = masks[sel].float()
+            targets.append({"labels": labels_i, "masks": masks_i})
+        return targets
+
+    @staticmethod
+    def _weighted_components(losses: dict[str, torch.Tensor], class_weight: float, mask_weight: float, dice_weight: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Group final and auxiliary loss terms by component."""
+        device = next(iter(losses.values())).device
+        cls = torch.zeros((), device=device)
+        mask = torch.zeros((), device=device)
+        dice = torch.zeros((), device=device)
+        for name, value in losses.items():
+            if name.startswith("loss_ce"):
+                cls = cls + value * class_weight
+            elif name.startswith("loss_mask"):
+                mask = mask + value * mask_weight
+            elif name.startswith("loss_dice"):
+                dice = dice + value * dice_weight
+        return cls, mask, dice
+
+    def forward(self, outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute weighted Mask2Former instance segmentation loss."""
+        if not isinstance(outputs, dict) or "pred_logits" not in outputs or "pred_masks" not in outputs:
+            raise TypeError("Mask2FormerInstanceLoss expects raw Mask2Former dict outputs from the head.")
+        targets = self._build_targets(batch)
+        losses = self.criterion(outputs, targets)
+        lcls, lmask, ldice = self._weighted_components(losses, self.class_weight, self.mask_weight, self.dice_weight)
+        total = lcls + lmask + ldice
+        return total, torch.stack((lcls.detach(), lmask.detach(), ldice.detach()))
