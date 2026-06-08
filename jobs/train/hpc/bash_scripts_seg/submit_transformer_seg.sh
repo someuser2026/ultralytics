@@ -15,12 +15,13 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 usage() {
   cat <<'EOF'
 Usage:
-  bash jobs/train/hpc/bash_scripts_seg/submit_transformer_seg.sh [MODEL_OR_CONFIG|all] [BATCH] [DRY_RUN]
+  bash jobs/train/hpc/bash_scripts_seg/submit_transformer_seg.sh [MODEL_OR_CONFIG|all] [BATCH] [DRY_RUN] [DATA_YAML]
 
 Examples:
   bash jobs/train/hpc/bash_scripts_seg/submit_transformer_seg.sh
   bash jobs/train/hpc/bash_scripts_seg/submit_transformer_seg.sh all 4 1
   bash jobs/train/hpc/bash_scripts_seg/submit_transformer_seg.sh 4 1
+  bash jobs/train/hpc/bash_scripts_seg/submit_transformer_seg.sh all 4 1 /path/to/data.yaml
   bash jobs/train/hpc/bash_scripts_seg/submit_transformer_seg.sh mask2former-yolo12-seg 4 1
   bash jobs/train/hpc/bash_scripts_seg/submit_transformer_seg.sh mask2former-swin-timm-seg 4 0
   bash jobs/train/hpc/bash_scripts_seg/submit_transformer_seg.sh rtdetr-l-instance-seg 4 0
@@ -44,6 +45,7 @@ Optional environment overrides:
   FREEZE=0
   SEED=0
   CHECKPOINT=null
+  DATA_YAML=/path/to/data.yaml
   PROJECT=transformer_segment
   WANDB=true
   JOB_LABEL=<config-stem>_<MS_TAG>
@@ -53,16 +55,20 @@ Optional environment overrides:
   SBCE=1
   SLOVHN=0.0
 
-Common augmentation overrides:
+Common augmentation overrides, only forwarded when changed from off:
   CLAHE_P=0.0
-  RAND_GAMMA_P=
-  UNSHARP_P=0.50
-  EDGEBOOST_P=
-  HOMOMORPHIC_P=
-  GAUSSIAN_BLUR_P=0.25
-  MOTION_BLUR_P=0.50
-  ADDITIVE_NOISE_P=
-  MULTI_SPEC_NOISE_P=0.10
+  RAND_GAMMA_P=0.0
+  UNSHARP_P=0.0
+  EDGEBOOST_P=0.0
+  HOMOMORPHIC_P=0.0
+  GAUSSIAN_BLUR_P=0.0
+  MOTION_BLUR_P=0.0
+  ADDITIVE_NOISE_P=0.0
+  MULTI_SPEC_NOISE_P=0.0
+  MOSAIC=0.0
+  MIXUP=0.0
+  COPY_PASTE=0.0
+  CLOSE_MOSAIC=0
 EOF
 }
 
@@ -76,16 +82,19 @@ if [[ -z "${1:-}" || "${1:-}" == "all" ]]; then
   MODEL_OR_CONFIG="all"
   BATCH="${2:-${BATCH:-4}}"
   DRY_RUN="${3:-${DRY_RUN:-0}}"
+  DATA_YAML_OVERRIDE="${4:-${DATA_YAML:-}}"
 elif [[ "${1:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   RUN_ALL=1
   MODEL_OR_CONFIG="all"
   BATCH="$1"
   DRY_RUN="${2:-${DRY_RUN:-0}}"
+  DATA_YAML_OVERRIDE="${3:-${DATA_YAML:-}}"
 else
   RUN_ALL=0
   MODEL_OR_CONFIG="$1"
   BATCH="${2:-${BATCH:-4}}"
   DRY_RUN="${3:-${DRY_RUN:-0}}"
+  DATA_YAML_OVERRIDE="${4:-${DATA_YAML:-}}"
 fi
 
 [[ "$BATCH" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "BATCH must be numeric"; exit 1; }
@@ -150,6 +159,17 @@ resolve_config() {
   to_repo_relative "$resolved"
 }
 
+resolve_data_yaml() {
+  local data_yaml="$1"
+  local resolved
+  resolved="$(resolve_path "$data_yaml")"
+  [[ -f "$resolved" ]] || {
+    echo "Could not resolve DATA_YAML to an existing file: $data_yaml" >&2
+    return 1
+  }
+  to_repo_relative "$resolved"
+}
+
 all_transformer_configs() {
   local cfg
   while IFS= read -r cfg; do
@@ -171,6 +191,27 @@ append_if_set() {
   fi
 }
 
+is_zero_value() {
+  [[ "${1:-}" =~ ^0+([.][0]+)?$ ]]
+}
+
+append_aug_if_changed() {
+  local key="$1"
+  local value="${2:-}"
+  local default="$3"
+
+  if [[ -z "$value" ]]; then
+    return 0
+  fi
+  if is_zero_value "$default" && is_zero_value "$value"; then
+    return 0
+  fi
+  if [[ "$value" == "$default" ]]; then
+    return 0
+  fi
+  VARS+=("${key}=${value}")
+}
+
 EPOCHS="${EPOCHS:-100}"
 TIME_FLOAT="${TIME_FLOAT:-null}"
 DEVICE="${DEVICE:-0}"
@@ -186,14 +227,23 @@ SLOVHN="${SLOVHN:-}"
 SEGMENT_PRIOR_TOPK="${SEGMENT_PRIOR_TOPK:-}"
 
 CLAHE_P="${CLAHE_P:-0.0}"
-RAND_GAMMA_P="${RAND_GAMMA_P:-}"
-UNSHARP_P="${UNSHARP_P:-0.50}"
-EDGEBOOST_P="${EDGEBOOST_P:-}"
-HOMOMORPHIC_P="${HOMOMORPHIC_P:-}"
-GAUSSIAN_BLUR_P="${GAUSSIAN_BLUR_P:-0.25}"
-MOTION_BLUR_P="${MOTION_BLUR_P:-0.50}"
-ADDITIVE_NOISE_P="${ADDITIVE_NOISE_P:-}"
-MULTI_SPEC_NOISE_P="${MULTI_SPEC_NOISE_P:-0.10}"
+RAND_GAMMA_P="${RAND_GAMMA_P:-0.0}"
+UNSHARP_P="${UNSHARP_P:-0.0}"
+EDGEBOOST_P="${EDGEBOOST_P:-0.0}"
+HOMOMORPHIC_P="${HOMOMORPHIC_P:-0.0}"
+GAUSSIAN_BLUR_P="${GAUSSIAN_BLUR_P:-0.0}"
+MOTION_BLUR_P="${MOTION_BLUR_P:-0.0}"
+ADDITIVE_NOISE_P="${ADDITIVE_NOISE_P:-0.0}"
+MULTI_SPEC_NOISE_P="${MULTI_SPEC_NOISE_P:-0.0}"
+MOSAIC="${MOSAIC:-0.0}"
+MIXUP="${MIXUP:-0.0}"
+COPY_PASTE="${COPY_PASTE:-0.0}"
+CLOSE_MOSAIC="${CLOSE_MOSAIC:-0}"
+
+DATA_YAML_RESOLVED=""
+if [[ -n "$DATA_YAML_OVERRIDE" ]]; then
+  DATA_YAML_RESOLVED="$(resolve_data_yaml "$DATA_YAML_OVERRIDE")"
+fi
 
 if [[ "$EPOCHS" == "null" && "$TIME_FLOAT" == "null" ]]; then
   echo "Either EPOCHS or TIME_FLOAT must be set"
@@ -242,6 +292,7 @@ submit_config() {
   append_var "KEEP_FRAC" "$KEEP_FRAC"
   append_var "MULTISPECTRAL" "$MS_CODE"
   append_var "BATCH" "$BATCH"
+  append_if_set "DATA_YAML" "$DATA_YAML_RESOLVED"
   append_var "CONFIG_YAML" "$config_yaml"
   append_var "FREEZE" "$FREEZE"
   append_var "SEED" "$SEED"
@@ -254,15 +305,19 @@ submit_config() {
   append_if_set "SLOVHN" "$SLOVHN"
   append_if_set "SEGMENT_PRIOR_TOPK" "$SEGMENT_PRIOR_TOPK"
 
-  append_if_set "CLAHE_P" "$CLAHE_P"
-  append_if_set "RAND_GAMMA_P" "$RAND_GAMMA_P"
-  append_if_set "UNSHARP_P" "$UNSHARP_P"
-  append_if_set "EDGEBOOST_P" "$EDGEBOOST_P"
-  append_if_set "HOMOMORPHIC_P" "$HOMOMORPHIC_P"
-  append_if_set "GAUSSIAN_BLUR_P" "$GAUSSIAN_BLUR_P"
-  append_if_set "MOTION_BLUR_P" "$MOTION_BLUR_P"
-  append_if_set "ADDITIVE_NOISE_P" "$ADDITIVE_NOISE_P"
-  append_if_set "MULTI_SPEC_NOISE_P" "$MULTI_SPEC_NOISE_P"
+  append_aug_if_changed "CLAHE_P" "$CLAHE_P" "0.0"
+  append_aug_if_changed "RAND_GAMMA_P" "$RAND_GAMMA_P" "0.0"
+  append_aug_if_changed "UNSHARP_P" "$UNSHARP_P" "0.0"
+  append_aug_if_changed "EDGEBOOST_P" "$EDGEBOOST_P" "0.0"
+  append_aug_if_changed "HOMOMORPHIC_P" "$HOMOMORPHIC_P" "0.0"
+  append_aug_if_changed "GAUSSIAN_BLUR_P" "$GAUSSIAN_BLUR_P" "0.0"
+  append_aug_if_changed "MOTION_BLUR_P" "$MOTION_BLUR_P" "0.0"
+  append_aug_if_changed "ADDITIVE_NOISE_P" "$ADDITIVE_NOISE_P" "0.0"
+  append_aug_if_changed "MULTI_SPEC_NOISE_P" "$MULTI_SPEC_NOISE_P" "0.0"
+  append_aug_if_changed "MOSAIC" "$MOSAIC" "0.0"
+  append_aug_if_changed "MIXUP" "$MIXUP" "0.0"
+  append_aug_if_changed "COPY_PASTE" "$COPY_PASTE" "0.0"
+  append_aug_if_changed "CLOSE_MOSAIC" "$CLOSE_MOSAIC" "0"
 
   varlist="$(IFS=,; echo "${VARS[*]}")"
   CMD=(qsub -V -v "$varlist" -N "$job_label" "$PBS_SCRIPT")
@@ -273,6 +328,7 @@ submit_config() {
   echo "  Image size: ${IMGSZ}"
   echo "  Batch: ${BATCH}"
   echo "  Data: ${MS_DESC} (${MS_TAG})"
+  echo "  Data YAML: ${DATA_YAML_RESOLVED:-auto from MULTISPECTRAL}"
   echo "  Project: ${PROJECT}"
   echo "  Experiment mode: ${experiment_mode}"
   echo "============================================================"
@@ -302,7 +358,7 @@ if [[ "${#CONFIGS[@]}" -eq 0 ]]; then
   exit 1
 fi
 
-echo "Submitting ${#CONFIGS[@]} transformer segment job(s) for ${MS_DESC} (${MS_TAG}), IMGSZ=${IMGSZ}, OVERLAP=${OVERLAP}, KEEP_FRAC=${KEEP_FRAC}, BATCH=${BATCH}"
+echo "Submitting ${#CONFIGS[@]} transformer segment job(s) for ${MS_DESC} (${MS_TAG}), IMGSZ=${IMGSZ}, OVERLAP=${OVERLAP}, KEEP_FRAC=${KEEP_FRAC}, BATCH=${BATCH}, DATA_YAML=${DATA_YAML_RESOLVED:-auto}"
 for config_yaml in "${CONFIGS[@]}"; do
   submit_config "$config_yaml"
 done
