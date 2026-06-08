@@ -259,6 +259,26 @@ def test_save_predictions_json_matches_callback_shape(inference_module, tmp_path
     assert len(entry["predictions"]) == 1
 
 
+def test_save_predictions_json_streams_one_aggregate_file(inference_module, tmp_path: Path):
+    split_root = tmp_path / "images" / "val"
+    image_paths = [split_root / "site_a.png", split_root / "nested" / "site_b.png"]
+    for image_path in image_paths:
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        image_path.write_bytes(b"")
+
+    output_dir = tmp_path / "predictions" / "val"
+    results = (make_obb_result(image_path) for image_path in image_paths)
+
+    inference_module.save_predictions_json(results, output_dir, source_root=split_root)
+
+    json_files = sorted(path.name for path in output_dir.glob("*.json"))
+    payload = json.loads((output_dir / "predictions.json").read_text(encoding="utf-8"))
+
+    assert json_files == ["predictions.json"]
+    assert payload["count"] == 2
+    assert sorted(payload["predictions"]) == ["nested/site_b", "site_a"]
+
+
 def test_initialize_wandb_run_uses_default_inference_name(inference_module, tmp_path: Path):
     run_dir, weights_path = write_run_layout(tmp_path)
     data_yaml, _, _ = write_dataset_yaml(tmp_path / "dataset")

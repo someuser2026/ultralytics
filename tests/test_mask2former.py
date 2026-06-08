@@ -97,6 +97,32 @@ def test_mask2former_loss_is_finite_and_backpropagates():
 
 
 @pytest.mark.skipif(not TORCH_READY, reason="torch is required")
+def test_mask2former_label_loss_moves_empty_weight_to_logits_device(monkeypatch):
+    from ultralytics.utils.loss import Mask2FormerHungarianMatcher, Mask2FormerSetCriterion
+    import ultralytics.utils.loss as loss_module
+
+    criterion = Mask2FormerSetCriterion(
+        1,
+        matcher=Mask2FormerHungarianMatcher(cost_class=1.0, cost_mask=1.0, cost_dice=1.0, num_points=8),
+        eos_coef=0.1,
+        num_points=8,
+        oversample_ratio=2.0,
+        importance_sample_ratio=0.5,
+    )
+    outputs = {"pred_logits": torch.randn(1, 3, 2)}
+    targets = [{"labels": torch.zeros(1, dtype=torch.long)}]
+    indices = [(torch.tensor([0]), torch.tensor([0]))]
+
+    def cross_entropy(input, target, weight):
+        assert weight.device == input.device
+        return input.sum() * 0.0
+
+    monkeypatch.setattr(loss_module.F, "cross_entropy", cross_entropy)
+    loss = criterion.loss_labels(outputs, targets, indices)["loss_ce"]
+    assert torch.isfinite(loss)
+
+
+@pytest.mark.skipif(not TORCH_READY, reason="torch is required")
 def test_mask2former_builds_from_segmentation_yaml_style_config():
     from ultralytics.nn.tasks import SegmentationModel
     from ultralytics.utils.loss import Mask2FormerInstanceLoss

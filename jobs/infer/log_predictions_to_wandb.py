@@ -272,7 +272,7 @@ def prediction_result_key(result, source_root: Path | None, index: int, used_key
 
 
 def save_predictions_json(results, output_dir: str | Path, source_root=None) -> Path:
-    """Save prediction summaries as one aggregate JSON file for the entire split."""
+    """Stream prediction summaries into one aggregate JSON file for the entire split."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     if isinstance(source_root, (list, tuple)):
@@ -281,15 +281,28 @@ def save_predictions_json(results, output_dir: str | Path, source_root=None) -> 
         source_root = Path(source_root) if source_root is not None else None
 
     used_keys: set[str] = set()
-    payload = {"count": 0, "predictions": {}}
+    count = 0
+    output_path = output_dir / "predictions.json"
+    tmp_path = output_dir / "predictions.json.tmp"
 
-    for index, result in enumerate(results):
-        key = prediction_result_key(result, source_root, index, used_keys)
-        payload["predictions"][key] = prediction_json_payload(result)
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        handle.write('{\n  "predictions": {')
 
-    payload["count"] = len(payload["predictions"])
-    with open(output_dir / "predictions.json", "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
+        for index, result in enumerate(results):
+            key = prediction_result_key(result, source_root, index, used_keys)
+            if count:
+                handle.write(",")
+            handle.write("\n    ")
+            handle.write(json.dumps(key))
+            handle.write(": ")
+            handle.write(json.dumps(prediction_json_payload(result), indent=2).replace("\n", "\n    "))
+            count += 1
+
+        if count:
+            handle.write("\n  ")
+        handle.write(f'}},\n  "count": {count}\n}}\n')
+
+    tmp_path.replace(output_path)
     return output_dir
 
 
@@ -336,7 +349,7 @@ def export_split_predictions(
 
     try:
         LOGGER.info(f"Exporting {subset} predictions from source: {format_context_value(split_source)}")
-        prediction_results = list(model.predict(split_source, stream=True, **predict_kwargs))
+        prediction_results = model.predict(split_source, stream=True, **predict_kwargs)
         save_predictions_json(prediction_results, output_dir, source_root=split_source)
         return log_predictions(output_dir, run_name, subset, wandb_module=wandb_module)
     except Exception as exc:

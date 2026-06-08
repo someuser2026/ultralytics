@@ -4056,7 +4056,7 @@ class Mask2FormerSetCriterion(nn.Module):
                 [t["labels"][j.to(t["labels"].device)] for t, (_, j) in zip(targets, indices) if j.numel()]
             ).to(src_logits.device)
             target_classes[idx] = target_classes_o
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight.to(src_logits.device))
         return {"loss_ce": loss_ce}
 
     def loss_masks(
