@@ -1,6 +1,8 @@
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -510,6 +512,69 @@ def test_segment_rcnn_heads_do_not_use_rotated_roi_align(monkeypatch, head_name)
     assert torch.isfinite(loss_items).all()
     assert calls["rotated"] == 0
     assert calls["axis"] >= 2
+
+
+def test_autobackend_preserves_single_rcnn_prediction_dict():
+    from ultralytics.nn.autobackend import AutoBackend
+
+    class FakeRCNNModel(torch.nn.Module):
+        uses_batch_dict = True
+
+        def forward(self, batch, mode="auto", **kwargs):
+            assert mode == "predict"
+            assert set(batch) == {"img"}
+            assert batch["img"].shape[0] == 1
+            device = batch["img"].device
+            return [
+                {
+                    "bboxes": torch.tensor([[1.0, 2.0, 10.0, 12.0]], device=device),
+                    "conf": torch.tensor([0.9], device=device),
+                    "cls": torch.tensor([0.0], device=device),
+                    "masks": None,
+                }
+            ]
+
+    backend = AutoBackend.__new__(AutoBackend)
+    torch.nn.Module.__init__(backend)
+    backend.fp16 = False
+    backend.nhwc = False
+    backend.pt = True
+    backend.nn_module = False
+    backend.model = FakeRCNNModel()
+    backend.names = {i: f"class{i}" for i in range(999)}
+    backend.task = "segment"
+    backend.device = torch.device("cpu")
+
+    out = backend.forward(torch.zeros(1, 3, 32, 32))
+
+    assert isinstance(out, list)
+    assert len(out) == 1
+    assert isinstance(out[0], dict)
+    assert {"bboxes", "conf", "cls", "masks"} <= set(out[0])
+
+
+def test_rcnn_segmentation_predictor_wraps_single_prediction_dict():
+    from ultralytics.models.rcnn.predict import RCNNSegmentationPredictor
+
+    predictor = RCNNSegmentationPredictor.__new__(RCNNSegmentationPredictor)
+    predictor.batch = (["example.png"],)
+    predictor.model = SimpleNamespace(names={0: "rip"})
+
+    pred = {
+        "bboxes": torch.tensor([[4.0, 5.0, 18.0, 20.0]], dtype=torch.float32),
+        "conf": torch.tensor([0.95], dtype=torch.float32),
+        "cls": torch.tensor([0.0], dtype=torch.float32),
+        "masks": None,
+    }
+    img = torch.zeros(1, 3, 32, 32)
+    orig_imgs = [np.zeros((32, 32, 3), dtype=np.uint8)]
+
+    results = predictor.postprocess(pred, img, orig_imgs)
+
+    assert len(results) == 1
+    assert results[0].path == "example.png"
+    assert results[0].boxes is not None
+    assert results[0].boxes.shape[0] == 1
 
 
 def _segment_batch():
