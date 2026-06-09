@@ -634,9 +634,9 @@ def _crop_mask_targets(gt_masks: Tensor | None, proposals: Tensor, matched_gt_in
     return torch.stack(targets, dim=0) if targets else proposals.new_zeros((0, mask_size, mask_size))
 
 
-def _paste_masks(mask_logits: Tensor, boxes: Tensor, image_shape: tuple[int, int]) -> Tensor:
+def _paste_masks(mask_logits: Tensor, boxes: Tensor, image_shape: tuple[int, int], mask_threshold: float = 0.5) -> Tensor:
     if mask_logits.numel() == 0:
-        return mask_logits.new_zeros((0, image_shape[0], image_shape[1]))
+        return mask_logits.new_zeros((0, image_shape[0], image_shape[1]), dtype=torch.bool)
     masks = []
     probs = mask_logits.sigmoid()
     for mask, box in zip(probs, boxes):
@@ -650,7 +650,18 @@ def _paste_masks(mask_logits: Tensor, boxes: Tensor, image_shape: tuple[int, int
             resized = F.interpolate(mask[None, None], size=(y2 - y1, x2 - x1), mode="bilinear", align_corners=False)[0, 0]
             canvas[y1:y2, x1:x2] = resized
         masks.append(canvas)
-    return torch.stack(masks, dim=0)
+    return torch.stack(masks, dim=0) > mask_threshold
+
+
+def _filter_empty_mask_predictions(
+    bboxes: Tensor, scores: Tensor, labels: Tensor, masks: Tensor | None
+) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+    if masks is None:
+        return bboxes[:0], scores[:0], labels[:0], masks
+    if masks.numel() == 0:
+        return bboxes[:0], scores[:0], labels[:0], masks[:0]
+    keep = masks.flatten(1).any(dim=1)
+    return bboxes[keep], scores[keep], labels[keep], masks[keep]
 
 
 class _AxisRCNNBase(nn.Module):
@@ -673,7 +684,7 @@ class _AxisRCNNBase(nn.Module):
         },
         "roi": {"pool_size": 7, "mask_pool_size": 14, "sampling_ratio": 2, "featmap_strides": [4, 8, 16, 32]},
         "train": {"pos_iou": 0.5, "neg_iou": 0.5, "samples_per_img": 512, "pos_fraction": 0.25},
-        "test": {"score_thresh": 0.05, "nms_iou": 0.5, "max_dets": 300},
+        "test": {"score_thresh": 0.05, "nms_iou": 0.5, "max_dets": 300, "mask_threshold": 0.5},
         "bbox_head": {"hidden_dim": 1024, "loss": "smooth_l1", "beta": 1.0},
         "mask_head": {"dim": 256, "num_convs": 4, "resolution": 28},
         "cascade": {"iou_thresholds": [0.5, 0.6, 0.7], "bbox_stds": [[0.1, 0.1, 0.2, 0.2], [0.05, 0.05, 0.1, 0.1], [0.033, 0.033, 0.067, 0.067]]},
@@ -931,10 +942,14 @@ class _AxisRCNNBase(nn.Module):
             pred_scores = all_scores[keep_nms]
             pred_labels = all_labels[keep_nms]
             pred_masks = None
-            if self.with_mask and pred_boxes.numel():
-                rois = torch.cat((pred_boxes.new_full((pred_boxes.shape[0], 1), bi), pred_boxes), dim=1)
-                pooled = _roi_align_multilevel(feats[:4], rois, self.cfg["roi"]["mask_pool_size"], self.cfg["roi"]["sampling_ratio"], self.cfg["roi"]["featmap_strides"])
-                pred_masks = _paste_masks(self.mask_head(pooled).squeeze(1), pred_boxes, image_shape)
+            if self.with_mask:
+                if pred_boxes.numel():
+                    rois = torch.cat((pred_boxes.new_full((pred_boxes.shape[0], 1), bi), pred_boxes), dim=1)
+                    pooled = _roi_align_multilevel(feats[:4], rois, self.cfg["roi"]["mask_pool_size"], self.cfg["roi"]["sampling_ratio"], self.cfg["roi"]["featmap_strides"])
+                    pred_masks = _paste_masks(self.mask_head(pooled).squeeze(1), pred_boxes, image_shape, self.cfg["test"]["mask_threshold"])
+                    pred_boxes, pred_scores, pred_labels, pred_masks = _filter_empty_mask_predictions(pred_boxes, pred_scores, pred_labels, pred_masks)
+                else:
+                    pred_masks = pred_boxes.new_zeros((0, image_shape[0], image_shape[1]), dtype=torch.bool)
             outputs.append({"bboxes": pred_boxes, "conf": pred_scores, "cls": pred_labels.float(), "masks": pred_masks})
         return outputs
 

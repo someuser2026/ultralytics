@@ -10,6 +10,8 @@ from ultralytics.models.yolo.obb.predict import OBBPredictor
 from ultralytics.models.yolo.segment.predict import SegmentationPredictor
 from ultralytics.utils import DEFAULT_CFG, ops
 
+_RCNN_MASK_THRESHOLD = 0.5
+
 
 class RCNNSegmentationPredictor(SegmentationPredictor):
     """Prediction adapter for Mask R-CNN and Cascade Mask R-CNN."""
@@ -39,9 +41,13 @@ class RCNNSegmentationPredictor(SegmentationPredictor):
                 masks.permute(1, 2, 0).contiguous().float().cpu().numpy(),
                 orig_img.shape,
             )
-            masks = torch.as_tensor(np.transpose(masks, (2, 0, 1)))
+            masks = torch.as_tensor(np.transpose(masks, (2, 0, 1))) > _RCNN_MASK_THRESHOLD
+            keep = masks.flatten(1).any(dim=1)
+            det = det[keep.to(det.device)]
+            masks = masks[keep]
         else:
-            masks = None
+            det = det[:0]
+            masks = det.new_zeros((0, orig_img.shape[0], orig_img.shape[1]), dtype=torch.bool)
         return Results(orig_img, path=img_path, names=self.model.names, boxes=det, masks=masks)
 
 

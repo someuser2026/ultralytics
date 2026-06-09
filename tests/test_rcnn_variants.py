@@ -553,18 +553,55 @@ def test_autobackend_preserves_single_rcnn_prediction_dict():
     assert {"bboxes", "conf", "cls", "masks"} <= set(out[0])
 
 
-def test_rcnn_segmentation_predictor_wraps_single_prediction_dict():
+def test_paste_masks_thresholds_to_binary_masks():
+    import ultralytics.nn.modules.rcnn as rcnn_module
+
+    logits = torch.logit(torch.tensor([0.49, 0.50, 0.51], dtype=torch.float32)).view(3, 1, 1).expand(3, 2, 2).clone()
+    boxes = torch.tensor([[0.0, 0.0, 2.0, 2.0], [0.0, 0.0, 2.0, 2.0], [0.0, 0.0, 2.0, 2.0]], dtype=torch.float32)
+
+    masks = rcnn_module._paste_masks(logits, boxes, image_shape=(2, 2), mask_threshold=0.5)
+
+    assert masks.dtype == torch.bool
+    assert masks.flatten(1).sum(1).tolist() == [0, 0, 4]
+
+
+def test_filter_empty_mask_predictions_keeps_only_non_empty_masks():
+    import ultralytics.nn.modules.rcnn as rcnn_module
+
+    bboxes = torch.tensor([[1.0, 2.0, 8.0, 9.0], [3.0, 4.0, 10.0, 11.0]], dtype=torch.float32)
+    scores = torch.tensor([0.8, 0.7], dtype=torch.float32)
+    labels = torch.tensor([0, 1], dtype=torch.long)
+    masks = torch.zeros(2, 6, 6, dtype=torch.bool)
+    masks[0, 2:4, 1:3] = True
+
+    kept_boxes, kept_scores, kept_labels, kept_masks = rcnn_module._filter_empty_mask_predictions(bboxes, scores, labels, masks)
+
+    assert torch.equal(kept_boxes, bboxes[:1])
+    assert torch.equal(kept_scores, scores[:1])
+    assert torch.equal(kept_labels, labels[:1])
+    assert torch.equal(kept_masks, masks[:1])
+
+    empty_boxes, empty_scores, empty_labels, empty_masks = rcnn_module._filter_empty_mask_predictions(bboxes, scores, labels, masks & False)
+    assert empty_boxes.shape == (0, 4)
+    assert empty_scores.shape == (0,)
+    assert empty_labels.shape == (0,)
+    assert empty_masks.shape == (0, 6, 6)
+
+
+def test_rcnn_segmentation_predictor_keeps_fractional_non_empty_masks():
     from ultralytics.models.rcnn.predict import RCNNSegmentationPredictor
 
     predictor = RCNNSegmentationPredictor.__new__(RCNNSegmentationPredictor)
     predictor.batch = (["example.png"],)
     predictor.model = SimpleNamespace(names={0: "rip"})
 
+    masks = torch.zeros(1, 32, 32, dtype=torch.float32)
+    masks[0, 5:20, 4:18] = 0.9
     pred = {
         "bboxes": torch.tensor([[4.0, 5.0, 18.0, 20.0]], dtype=torch.float32),
         "conf": torch.tensor([0.95], dtype=torch.float32),
         "cls": torch.tensor([0.0], dtype=torch.float32),
-        "masks": None,
+        "masks": masks,
     }
     img = torch.zeros(1, 3, 32, 32)
     orig_imgs = [np.zeros((32, 32, 3), dtype=np.uint8)]
@@ -575,6 +612,35 @@ def test_rcnn_segmentation_predictor_wraps_single_prediction_dict():
     assert results[0].path == "example.png"
     assert results[0].boxes is not None
     assert results[0].boxes.shape[0] == 1
+    assert results[0].masks is not None
+    assert results[0].masks.data.dtype == torch.bool
+    assert int(results[0].masks.data.sum()) > 0
+
+
+@pytest.mark.parametrize("masks", [None, torch.zeros(1, 32, 32, dtype=torch.float32)])
+def test_rcnn_segmentation_predictor_drops_predictions_without_masks(masks):
+    from ultralytics.models.rcnn.predict import RCNNSegmentationPredictor
+
+    predictor = RCNNSegmentationPredictor.__new__(RCNNSegmentationPredictor)
+    predictor.batch = (["example.png"],)
+    predictor.model = SimpleNamespace(names={0: "rip"})
+
+    pred = {
+        "bboxes": torch.tensor([[4.0, 5.0, 18.0, 20.0]], dtype=torch.float32),
+        "conf": torch.tensor([0.95], dtype=torch.float32),
+        "cls": torch.tensor([0.0], dtype=torch.float32),
+        "masks": masks,
+    }
+    img = torch.zeros(1, 3, 32, 32)
+    orig_imgs = [np.zeros((32, 32, 3), dtype=np.uint8)]
+
+    results = predictor.postprocess(pred, img, orig_imgs)
+
+    assert len(results) == 1
+    assert results[0].boxes is not None
+    assert results[0].boxes.shape[0] == 0
+    assert results[0].masks is not None
+    assert results[0].masks.data.shape == (0, 32, 32)
 
 
 def _segment_batch():
@@ -676,6 +742,10 @@ def test_rcnn_variant_forward_and_loss_smoke(model_name, task):
         assert {"bboxes", "conf", "cls"} <= set(pred)
         if task == "segment":
             assert "masks" in pred
+            assert pred["masks"] is not None
+            assert pred["masks"].shape[0] == pred["bboxes"].shape[0]
+            if pred["masks"].numel():
+                assert pred["masks"].flatten(1).any(dim=1).all()
         else:
             if pred["bboxes"].numel():
                 assert pred["bboxes"].shape[1] == 5
