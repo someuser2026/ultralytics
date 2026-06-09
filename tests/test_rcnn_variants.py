@@ -565,6 +565,13 @@ def test_paste_masks_thresholds_to_binary_masks():
     assert masks.flatten(1).sum(1).tolist() == [0, 0, 4]
 
 
+def test_mask_threshold_falls_back_for_old_checkpoint_cfg():
+    import ultralytics.nn.modules.rcnn as rcnn_module
+
+    assert rcnn_module._mask_threshold_from_cfg({"test": {"score_thresh": 0.05}}) == pytest.approx(0.5)
+    assert rcnn_module._mask_threshold_from_cfg({"test": {"mask_threshold": 0.25}}) == pytest.approx(0.25)
+
+
 def test_filter_empty_mask_predictions_keeps_only_non_empty_masks():
     import ultralytics.nn.modules.rcnn as rcnn_module
 
@@ -732,6 +739,8 @@ def test_rcnn_variant_forward_and_loss_smoke(model_name, task):
     assert torch.isfinite(loss_items).all()
     loss.backward()
 
+    if task == "segment":
+        model.model[-1].cfg["test"].pop("mask_threshold", None)
     model.eval()
     with torch.no_grad():
         with pytest.raises(TypeError, match="batch dict"):

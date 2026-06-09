@@ -653,6 +653,11 @@ def _paste_masks(mask_logits: Tensor, boxes: Tensor, image_shape: tuple[int, int
     return torch.stack(masks, dim=0) > mask_threshold
 
 
+def _mask_threshold_from_cfg(cfg: dict) -> float:
+    test_cfg = cfg.get("test", {}) if isinstance(cfg, dict) else {}
+    return float(test_cfg.get("mask_threshold", 0.5)) if isinstance(test_cfg, dict) else 0.5
+
+
 def _filter_empty_mask_predictions(
     bboxes: Tensor, scores: Tensor, labels: Tensor, masks: Tensor | None
 ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
@@ -946,7 +951,7 @@ class _AxisRCNNBase(nn.Module):
                 if pred_boxes.numel():
                     rois = torch.cat((pred_boxes.new_full((pred_boxes.shape[0], 1), bi), pred_boxes), dim=1)
                     pooled = _roi_align_multilevel(feats[:4], rois, self.cfg["roi"]["mask_pool_size"], self.cfg["roi"]["sampling_ratio"], self.cfg["roi"]["featmap_strides"])
-                    pred_masks = _paste_masks(self.mask_head(pooled).squeeze(1), pred_boxes, image_shape, self.cfg["test"]["mask_threshold"])
+                    pred_masks = _paste_masks(self.mask_head(pooled).squeeze(1), pred_boxes, image_shape, _mask_threshold_from_cfg(self.cfg))
                     pred_boxes, pred_scores, pred_labels, pred_masks = _filter_empty_mask_predictions(pred_boxes, pred_scores, pred_labels, pred_masks)
                 else:
                     pred_masks = pred_boxes.new_zeros((0, image_shape[0], image_shape[1]), dtype=torch.bool)

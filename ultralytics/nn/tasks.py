@@ -1288,7 +1288,7 @@ class RTDETRDetectionModel(DetectionModel):
         }
 
         if preds is None:
-            preds = self.predict(img, batch=targets)
+            preds = self.predict(img, batch=targets, metadata_vec=batch.get("metadata_vec"))
         dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = preds if self.training else preds[1]
         if dn_meta is None:
             dn_bboxes, dn_scores = None, None
@@ -1307,7 +1307,7 @@ class RTDETRDetectionModel(DetectionModel):
             [loss[k].detach() for k in ["loss_giou", "loss_class", "loss_bbox"]], device=img.device
         )
 
-    def predict(self, x, profile=False, visualize=False, batch=None, augment=False, embed=None):
+    def predict(self, x, profile=False, visualize=False, batch=None, augment=False, embed=None, metadata_vec=None):
         """
         Perform a forward pass through the model.
 
@@ -1318,10 +1318,12 @@ class RTDETRDetectionModel(DetectionModel):
             batch (dict, optional): Ground truth data for evaluation.
             augment (bool): If True, perform data augmentation during inference.
             embed (list, optional): A list of feature vectors/embeddings to return.
+            metadata_vec (torch.Tensor, optional): Per-image metadata for metadata-conditioned neck modules.
 
         Returns:
             (torch.Tensor): Model's output tensor.
         """
+        metadata_vec = self._resolve_metadata_vec(metadata_vec)
         y, dt, embeddings = [], [], []  # outputs
         embed = frozenset(embed) if embed is not None else {-1}
         max_idx = max(embed)
@@ -1330,7 +1332,7 @@ class RTDETRDetectionModel(DetectionModel):
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
             if profile:
                 self._profile_one_layer(m, x, dt)
-            x = m(x)  # run
+            x = m(x, metadata_vec=metadata_vec) if isinstance(m, BaseNeck) else m(x)  # run
             y.append(x if m.i in self.save else None)  # save output
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
@@ -1434,7 +1436,7 @@ class RTDETRSegmentModel(RTDETRDetectionModel):
             targets["masks"] = batch["masks"].to(device=img.device)
 
         if preds is None:
-            preds = self.predict(img, batch=targets)
+            preds = self.predict(img, batch=targets, metadata_vec=batch.get("metadata_vec"))
         dec_bboxes, dec_scores, enc_bboxes, enc_scores, dec_mask_coeffs, enc_mask_coeffs, protos, dn_meta = (
             preds if self.training else preds[1]
         )
@@ -1570,6 +1572,7 @@ class RTDETROBBModel(RTDETRDetectionModel):
                     "batch_idx": targets["batch_idx"],
                     "gt_groups": targets["gt_groups"],
                 },
+                metadata_vec=batch.get("metadata_vec"),
             )
         dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = preds if self.training else preds[1]
         if dn_meta is None:

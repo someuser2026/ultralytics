@@ -20,7 +20,13 @@ from ultralytics.data.utils import (
     resolve_metadata_path,
 )
 from ultralytics.nn.modules import FPN
-from ultralytics.nn.tasks import OBBModel, SegmentationModel
+from ultralytics.nn.tasks import (
+    OBBModel,
+    RTDETRDetectionModel,
+    RTDETROBBModel,
+    RTDETRSegmentModel,
+    SegmentationModel,
+)
 
 ULTRA_READY = find_spec("cv2") is not None and find_spec("torch") is not None
 METADATA_DIM = len(DEFAULT_METADATA_FIELDS) + 2  # two azimuth fields expand to sin/cos pairs
@@ -132,6 +138,127 @@ def _metadata_enabled_segment_cfg(mode: str) -> dict:
     }
 
 
+class _ConstantFeature(torch.nn.Module):
+    """Small predict-loop test module that returns a deterministic feature map."""
+
+    def __init__(self, idx: int, channels: int, size: int) -> None:
+        super().__init__()
+        self.f = -1
+        self.i = idx
+        self.type = self.__class__.__name__
+        self.register_buffer("value", torch.randn(1, channels, size, size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.value.to(device=x.device, dtype=x.dtype).expand(x.shape[0], -1, -1, -1)
+
+
+class _IndexFeature(torch.nn.Module):
+    """Extract one level from a neck output list."""
+
+    def __init__(self, idx: int, source: int, level: int) -> None:
+        super().__init__()
+        self.f = source
+        self.i = idx
+        self.level = level
+        self.type = self.__class__.__name__
+
+    def forward(self, x: list[torch.Tensor]) -> torch.Tensor:
+        return x[self.level]
+
+
+class _RTDETRHeadStub(torch.nn.Module):
+    """Head stub that preserves RT-DETR's list-of-feature input contract."""
+
+    def __init__(self, sources: list[int]) -> None:
+        super().__init__()
+        self.f = sources
+
+    def forward(self, x: list[torch.Tensor], batch: dict | None = None) -> list[torch.Tensor]:
+        return x
+
+
+class _SpyFPN(FPN):
+    """FPN that records the metadata tensor routed through RT-DETR predict."""
+
+    last_metadata_vec: torch.Tensor | None
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.last_metadata_vec = None
+
+    def forward(self, xs: list[torch.Tensor], metadata_vec: torch.Tensor | None = None) -> list[torch.Tensor]:
+        self.last_metadata_vec = metadata_vec
+        return super().forward(xs, metadata_vec=metadata_vec)
+
+
+class _DummyRTDETRCriterion:
+    """Return finite scalar loss values for RT-DETR loss-path plumbing tests."""
+
+    def __init__(self, keys: tuple[str, ...]) -> None:
+        self.keys = keys
+
+    def __call__(self, *args, **kwargs) -> dict[str, torch.Tensor]:
+        return {k: torch.tensor(1.0) for k in self.keys}
+
+
+def _new_rtdetr_stub(model_cls=RTDETRDetectionModel) -> RTDETRDetectionModel:
+    model = model_cls.__new__(model_cls)
+    torch.nn.Module.__init__(model)
+    model.save = []
+    model._building_strides = False
+    return model
+
+
+def _plain_rtdetr_stub() -> RTDETRDetectionModel:
+    model = _new_rtdetr_stub()
+    modules = torch.nn.ModuleList(
+        [
+            _ConstantFeature(0, 8, 16),
+            _ConstantFeature(1, 16, 8),
+            _ConstantFeature(2, 32, 4),
+            _RTDETRHeadStub([0, 1, 2]),
+        ]
+    )
+    model.model = modules
+    model.save = [0, 1, 2]
+    return model
+
+
+def _metadata_rtdetr_stub() -> RTDETRDetectionModel:
+    torch.manual_seed(0)
+    model = _new_rtdetr_stub()
+    neck = _SpyFPN([8, 16, 32], 8, {"metadata_cfg": {"enabled": True, "mode": "film_affine", "hidden_dim": 16}})
+    neck.f = [0, 1, 2]
+    neck.i = 3
+    neck.type = neck.__class__.__name__
+    modules = torch.nn.ModuleList(
+        [
+            _ConstantFeature(0, 8, 16),
+            _ConstantFeature(1, 16, 8),
+            _ConstantFeature(2, 32, 4),
+            neck,
+            _IndexFeature(4, 3, 0),
+            _IndexFeature(5, 3, 1),
+            _IndexFeature(6, 3, 2),
+            _RTDETRHeadStub([4, 5, 6]),
+        ]
+    )
+    model.model = modules
+    model.save = list(range(7))
+    model.eval()
+    return model
+
+
+def _build_detection_batch(batch_size: int = 1) -> dict[str, torch.Tensor]:
+    return {
+        "img": torch.randn(batch_size, 3, 64, 64),
+        "batch_idx": torch.zeros((1, 1), dtype=torch.float32),
+        "cls": torch.zeros((1, 1), dtype=torch.float32),
+        "bboxes": torch.tensor([[0.5, 0.5, 0.25, 0.2]], dtype=torch.float32),
+        "metadata_vec": torch.randn(batch_size, METADATA_DIM),
+    }
+
+
 def _build_obb_batch(batch_size: int = 1) -> dict[str, torch.Tensor]:
     return {
         "img": torch.randn(batch_size, 3, 64, 64),
@@ -155,6 +282,39 @@ def _build_segment_batch(batch_size: int = 1) -> dict[str, torch.Tensor]:
         "masks": masks,
         "metadata_vec": torch.randn(batch_size, METADATA_DIM),
     }
+
+
+def _rtdetr_detection_preds() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None]:
+    return (
+        torch.rand(1, 1, 2, 4),
+        torch.rand(1, 1, 2, 1),
+        torch.rand(1, 2, 4),
+        torch.rand(1, 2, 1),
+        None,
+    )
+
+
+def _rtdetr_segment_preds() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, None, None, None]:
+    return (
+        torch.rand(1, 1, 2, 4),
+        torch.rand(1, 1, 2, 1),
+        torch.rand(1, 2, 4),
+        torch.rand(1, 2, 1),
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+def _rtdetr_obb_preds() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None]:
+    return (
+        torch.rand(1, 1, 2, 5),
+        torch.rand(1, 1, 2, 1),
+        torch.rand(1, 2, 5),
+        torch.rand(1, 2, 1),
+        None,
+    )
 
 
 @pytest.mark.skipif(not ULTRA_READY, reason="cv2 and torch are required")
@@ -274,6 +434,80 @@ def test_fpn_metadata_modulation_changes_outputs(mode: str) -> None:
     assert all(torch.isfinite(out).all() for out in outs_zero)
     assert outs_zero[0].shape == (1, 64, 32, 32)
     assert any(not torch.allclose(a, b) for a, b in zip(outs_zero, outs_one))
+
+
+@pytest.mark.skipif(not ULTRA_READY, reason="cv2 and torch are required")
+def test_plain_rtdetr_predict_accepts_metadata_keyword() -> None:
+    """Plain RT-DETR predict should tolerate metadata_vec from shared validator plumbing."""
+    model = _plain_rtdetr_stub()
+
+    preds = model.predict(torch.randn(1, 3, 64, 64), metadata_vec=torch.randn(1, METADATA_DIM))
+
+    assert len(preds) == 3
+    assert all(torch.isfinite(pred).all() for pred in preds)
+
+
+@pytest.mark.skipif(not ULTRA_READY, reason="cv2 and torch are required")
+def test_rtdetr_predict_routes_metadata_to_neck() -> None:
+    """RT-DETR should pass metadata only into BaseNeck modules."""
+    model = _metadata_rtdetr_stub()
+    image = torch.randn(1, 3, 64, 64)
+    zero_meta = torch.zeros(1, METADATA_DIM)
+    one_meta = torch.ones(1, METADATA_DIM)
+
+    outs_zero = model.predict(image, metadata_vec=zero_meta)
+    neck = model.model[3]
+    outs_one = model.predict(image, metadata_vec=one_meta)
+
+    assert neck.last_metadata_vec is one_meta
+    assert all(torch.isfinite(out).all() for out in outs_zero)
+    assert any(not torch.allclose(a, b) for a, b in zip(outs_zero, outs_one))
+
+
+@pytest.mark.skipif(not ULTRA_READY, reason="cv2 and torch are required")
+def test_rtdetr_metadata_enabled_model_raises_when_metadata_missing() -> None:
+    """A metadata-conditioned RT-DETR neck should require metadata_vec."""
+    model = _metadata_rtdetr_stub()
+
+    with pytest.raises(ValueError, match="metadata-conditioned neck"):
+        model.predict(torch.randn(1, 3, 64, 64))
+
+
+@pytest.mark.skipif(not ULTRA_READY, reason="cv2 and torch are required")
+@pytest.mark.parametrize(
+    ("model_cls", "batch_builder", "preds_builder", "loss_keys"),
+    [
+        (
+            RTDETRDetectionModel,
+            _build_detection_batch,
+            _rtdetr_detection_preds,
+            ("loss_giou", "loss_class", "loss_bbox"),
+        ),
+        (RTDETRSegmentModel, _build_segment_batch, _rtdetr_segment_preds, ("loss_giou", "loss_class", "loss_bbox")),
+        (RTDETROBBModel, _build_obb_batch, _rtdetr_obb_preds, ("loss_giou", "loss_class", "loss_bbox")),
+    ],
+)
+def test_rtdetr_loss_forwards_metadata_vec(model_cls, batch_builder, preds_builder, loss_keys, monkeypatch) -> None:
+    """RT-DETR loss should pass batch metadata into internally generated predictions."""
+    model = _new_rtdetr_stub(model_cls)
+    model.yaml = {"nc": 1}
+    model.criterion = _DummyRTDETRCriterion(loss_keys)
+    batch = batch_builder()
+    seen = {}
+
+    def fake_predict(img: torch.Tensor, **kwargs):
+        seen["metadata_vec"] = kwargs.get("metadata_vec")
+        seen["batch"] = kwargs.get("batch")
+        return preds_builder()
+
+    monkeypatch.setattr(model, "predict", fake_predict)
+
+    loss, loss_items = model.loss(batch)
+
+    assert seen["metadata_vec"] is batch["metadata_vec"]
+    assert seen["batch"]["gt_groups"] == [1]
+    assert torch.isfinite(loss)
+    assert torch.isfinite(loss_items).all()
 
 
 @pytest.mark.skipif(not ULTRA_READY, reason="cv2 and torch are required")
