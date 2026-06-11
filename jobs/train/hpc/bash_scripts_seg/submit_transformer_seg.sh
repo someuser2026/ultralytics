@@ -20,6 +20,7 @@ Usage:
 Examples:
   bash jobs/train/hpc/bash_scripts_seg/submit_transformer_seg.sh
   bash jobs/train/hpc/bash_scripts_seg/submit_transformer_seg.sh all 4 1
+  bash jobs/train/hpc/bash_scripts_seg/submit_transformer_seg.sh mask2former 4 0
   bash jobs/train/hpc/bash_scripts_seg/submit_transformer_seg.sh 4 1
   bash jobs/train/hpc/bash_scripts_seg/submit_transformer_seg.sh all 4 1 /path/to/data.yaml
   bash jobs/train/hpc/bash_scripts_seg/submit_transformer_seg.sh mask2former-yolo12-seg 4 1
@@ -29,6 +30,8 @@ Examples:
 
 Supported aliases:
   all
+  mask2former
+  mask2former-only
   mask2former-mamba-hrnet-seg
   mask2former_mamba_hrnet_seg
   mask2former-swin-timm-seg
@@ -77,9 +80,18 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
+RUN_MASK2FORMER=0
+
 if [[ -z "${1:-}" || "${1:-}" == "all" ]]; then
   RUN_ALL=1
   MODEL_OR_CONFIG="all"
+  BATCH="${2:-${BATCH:-4}}"
+  DRY_RUN="${3:-${DRY_RUN:-0}}"
+  DATA_YAML_OVERRIDE="${4:-${DATA_YAML:-}}"
+elif [[ "${1:-}" == "mask2former" || "${1:-}" == "mask2former-only" ]]; then
+  RUN_ALL=0
+  RUN_MASK2FORMER=1
+  MODEL_OR_CONFIG="mask2former"
   BATCH="${2:-${BATCH:-4}}"
   DRY_RUN="${3:-${DRY_RUN:-0}}"
   DATA_YAML_OVERRIDE="${4:-${DATA_YAML:-}}"
@@ -177,6 +189,16 @@ all_transformer_configs() {
   done < <(find "${REPO_ROOT}/ultralytics/cfg/models/transformer" -maxdepth 1 -type f -name '*.yaml' | sort)
 }
 
+mask2former_configs() {
+  resolve_config mask2former-mamba-hrnet-seg
+  resolve_config mask2former-swin-timm-seg
+  resolve_config mask2former-yolo12-seg
+}
+
+is_mask2former_config() {
+  [[ "$(basename "$1")" == mask2former-*.yaml ]]
+}
+
 append_var() {
   local key="$1"
   local value="$2"
@@ -261,7 +283,7 @@ submit_config() {
   safe_config_stem="${config_stem//[^A-Za-z0-9_.-]/_}"
 
   if [[ -n "${JOB_LABEL:-}" ]]; then
-    if [[ "$RUN_ALL" == "1" ]]; then
+    if [[ "$RUN_ALL" == "1" || "$RUN_MASK2FORMER" == "1" ]]; then
       job_label="${JOB_LABEL}_${safe_config_stem}"
     else
       job_label="$JOB_LABEL"
@@ -271,7 +293,7 @@ submit_config() {
   fi
 
   if [[ -n "${EXPERIMENT_MODE:-}" ]]; then
-    if [[ "$RUN_ALL" == "1" ]]; then
+    if [[ "$RUN_ALL" == "1" || "$RUN_MASK2FORMER" == "1" ]]; then
       experiment_mode="${EXPERIMENT_MODE}_${safe_config_stem}"
     else
       experiment_mode="$EXPERIMENT_MODE"
@@ -298,6 +320,9 @@ submit_config() {
   append_var "SEED" "$SEED"
   append_var "WANDB" "$WANDB"
   append_var "PROJECT" "$PROJECT"
+  if is_mask2former_config "$config_yaml"; then
+    append_var "OVERLAP_MASK" "False"
+  fi
 
   append_if_set "USE_SOFT_IGNORE" "$USE_SOFT_IGNORE"
   append_if_set "SDICE" "$SDICE"
@@ -349,6 +374,10 @@ if [[ "$RUN_ALL" == "1" ]]; then
   while IFS= read -r config_yaml; do
     CONFIGS+=("$config_yaml")
   done < <(all_transformer_configs)
+elif [[ "$RUN_MASK2FORMER" == "1" ]]; then
+  while IFS= read -r config_yaml; do
+    CONFIGS+=("$config_yaml")
+  done < <(mask2former_configs)
 else
   CONFIGS+=("$(resolve_config "$MODEL_OR_CONFIG")")
 fi
