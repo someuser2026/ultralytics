@@ -291,8 +291,21 @@ class SPPF(nn.Module):
         self.n = n
         self.add = shortcut and c1 == c2
 
+    def _ensure_backward_compatible_attrs(self) -> None:
+        """Restore attributes missing from older pickled SPPF checkpoints."""
+        if not hasattr(self, "n"):
+            self.n = 3
+        if not hasattr(self, "add"):
+            self.add = False
+
+    def __setstate__(self, state):
+        """Restore pickled state and repair legacy SPPF instances."""
+        super().__setstate__(state)
+        self._ensure_backward_compatible_attrs()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply sequential pooling operations to input and return concatenated feature maps."""
+        self._ensure_backward_compatible_attrs()
         y = [self.cv1(x)]
         y.extend(self.m(y[-1]) for _ in range(self.n))
         y = self.cv2(torch.cat(y, 1))
