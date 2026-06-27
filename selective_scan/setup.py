@@ -60,9 +60,15 @@ def get_ext():
             multi_threads = False
             
     cc_flag.extend(["-gencode", "arch=compute_70,code=sm_70"])
+    cc_flag.extend(["-gencode", "arch=compute_75,code=sm_75"])
     cc_flag.extend(["-gencode", "arch=compute_80,code=sm_80"])
+    cc_flag.extend(["-gencode", "arch=compute_86,code=sm_86"])
     if gencode_sm90:
         cc_flag.extend(["-gencode", "arch=compute_90,code=sm_90"])
+    if CUDA_HOME is not None and bare_metal_version >= Version("12.8"):
+        cc_flag.extend(["-gencode", "arch=compute_100,code=sm_100"])
+        cc_flag.extend(["-gencode", "arch=compute_120,code=sm_120"])
+        cc_flag.extend(["-gencode", "arch=compute_120,code=compute_120"])
     if multi_threads:
         cc_flag.extend(["--threads", "4"])
 
