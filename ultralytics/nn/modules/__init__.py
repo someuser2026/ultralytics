@@ -144,7 +144,7 @@ from .mask2former import Mask2FormerHead
 from .rpn import AnchorGenerator, RPNHead
 
 try:
-    from .mamba_yolo import EdgeStem, EdgeVSSBlock, SimpleStem, VisionClueMerge, VSSBlock, XSSBlock
+    from .mamba_yolo import DVSSBlock, EdgeStem, EdgeVSSBlock, SimpleStem, VisionClueMerge, VSSBlock, XSSBlock
     _MAMBA_IMPORT_ERROR = None
 except Exception as exc:
     _MAMBA_IMPORT_ERROR = exc
@@ -162,6 +162,7 @@ except Exception as exc:
 
     EdgeStem = _missing_mamba_module("EdgeStem")
     EdgeVSSBlock = _missing_mamba_module("EdgeVSSBlock")
+    DVSSBlock = _missing_mamba_module("DVSSBlock")
     SimpleStem = _missing_mamba_module("SimpleStem")
     VisionClueMerge = _missing_mamba_module("VisionClueMerge")
     VSSBlock = _missing_mamba_module("VSSBlock")
@@ -282,6 +283,7 @@ __all__ = (
     "Mask2FormerHead",
     "EdgeStem",
     "EdgeVSSBlock",
+    "DVSSBlock",
     "SimpleStem",
     "VisionClueMerge",
     "VSSBlock",

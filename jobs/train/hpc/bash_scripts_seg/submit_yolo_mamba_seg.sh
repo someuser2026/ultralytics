@@ -21,6 +21,7 @@ Examples:
   bash jobs/train/hpc/bash_scripts_seg/submit_yolo_mamba_seg.sh
   bash jobs/train/hpc/bash_scripts_seg/submit_yolo_mamba_seg.sh yolo-mamba-seg 224 8 pn10075s 1
   bash jobs/train/hpc/bash_scripts_seg/submit_yolo_mamba_seg.sh mamba-hrnet-seg 448 8 pn10075s 0
+  bash jobs/train/hpc/bash_scripts_seg/submit_yolo_mamba_seg.sh mamba-hrnet-seg-dvss 448 8 pn10075s 0
   bash jobs/train/hpc/bash_scripts_seg/submit_yolo_mamba_seg.sh ultralytics/cfg/models/mamba-yolo/yolo-mamba-seg.yaml 256 4 0 0
 
 Supported aliases:
@@ -28,6 +29,8 @@ Supported aliases:
   yolo_mamba_seg
   mamba-hrnet-seg
   mamba_hrnet_seg
+  mamba-hrnet-seg-dvss
+  mamba_hrnet_seg_dvss
 
 Optional environment overrides:
   EPOCHS=100
@@ -140,6 +143,10 @@ resolve_config() {
       ;;
     mamba-hrnet-seg|mamba-hrnet-seg.yaml|mamba_hrnet_seg|mamba_hrnet_seg.yaml)
       printf 'ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml\n'
+      return 0
+      ;;
+    mamba-hrnet-seg-dvss|mamba-hrnet-seg-dvss.yaml|mamba_hrnet_seg_dvss|mamba_hrnet_seg_dvss.yaml)
+      printf 'ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg-dvss.yaml\n'
       return 0
       ;;
   esac

@@ -382,6 +382,21 @@ def test_mamba_yolo_submitters_resolve_local_configs(tmp_path: Path) -> None:
         (
             [
                 "bash",
+                "jobs/train/hpc/bash_scripts_seg/submit_yolo_mamba_seg.sh",
+                "mamba-hrnet-seg-dvss",
+                "448",
+                "8",
+                "pn10075s",
+                "0",
+            ],
+            "segment",
+            "mamba_yolo_segment",
+            "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg-dvss.yaml",
+            "21",
+        ),
+        (
+            [
+                "bash",
                 "jobs/train/hpc/bash_scripts_obb/submit_mamba_yolo_obb.sh",
                 str(REPO_ROOT / "ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-L-obb-demo.yaml"),
                 "256",

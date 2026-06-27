@@ -240,6 +240,7 @@ def cross_selective_scan(
         SelectiveScan=None,
         scan_mode_type='default',
         allow_cpu_fallback_for_build=False,
+        no_einsum=False,
 ):
     # out_norm: whatever fits (B, L, C); LayerNorm; Sigmoid; Softmax(dim=1);...
 
@@ -258,11 +259,25 @@ def cross_selective_scan(
 
     xs = CrossScan.apply(x)
 
-    x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs, x_proj_weight)
-    if x_proj_bias is not None:
-        x_dbl = x_dbl + x_proj_bias.view(1, K, -1, 1)
-    dts, Bs, Cs = torch.split(x_dbl, [R, N, N], dim=2)
-    dts = torch.einsum("b k r l, k d r -> b k d l", dts, dt_projs_weight)
+    if no_einsum:
+        x_dbl = F.conv1d(
+            xs.view(B, -1, L),
+            x_proj_weight.view(-1, D, 1),
+            bias=(x_proj_bias.view(-1) if x_proj_bias is not None else None),
+            groups=K,
+        )
+        dts, Bs, Cs = torch.split(x_dbl.view(B, K, -1, L), [R, N, N], dim=2)
+        dts = F.conv1d(
+            dts.contiguous().view(B, -1, L),
+            dt_projs_weight.view(K * D, -1, 1),
+            groups=K,
+        )
+    else:
+        x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs, x_proj_weight)
+        if x_proj_bias is not None:
+            x_dbl = x_dbl + x_proj_bias.view(1, K, -1, 1)
+        dts, Bs, Cs = torch.split(x_dbl, [R, N, N], dim=2)
+        dts = torch.einsum("b k r l, k d r -> b k d l", dts, dt_projs_weight)
     xs = xs.view(B, -1, L)
     dts = dts.contiguous().view(B, -1, L)
     # HiPPO matrix

@@ -12,6 +12,7 @@ __pycache__/
 /RHINO
 /Mamba-YOLO
 /Mask2Former
+/HRVMamba
 
 # C extensions
 *.so

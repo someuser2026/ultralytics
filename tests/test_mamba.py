@@ -17,6 +17,7 @@ MAMBA_BUILD_CASES = (
     ("mamba-hrnet-obb-edgevss.yaml", "obb"),
     ("mamba-hrnet-obb-shoreaux.yaml", "obb"),
     ("mamba-hrnet-seg.yaml", "segment"),
+    ("mamba-hrnet-seg-dvss.yaml", "segment"),
     ("yolo-mamba-seg-edgevss-backbone.yaml", "segment"),
     ("yolo-mamba-seg-edgevss-all.yaml", "segment"),
     ("mamba-hrnet-seg-edgevss.yaml", "segment"),
@@ -30,7 +31,8 @@ def test_mamba_model_yaml_parses(model_name):
     from ultralytics.nn.tasks import parse_model, yaml_model_load
 
     model_cfg = yaml_model_load(MAMBA_ROOT / model_name)
-    model, save, backbone_layers, head_layers = parse_model(deepcopy(model_cfg), ch=3, verbose=False)
+    input_channels = 4 if any(layer[2] == "ChannelSplit" for layer in model_cfg["backbone"]) else 3
+    model, save, backbone_layers, head_layers = parse_model(deepcopy(model_cfg), ch=input_channels, verbose=False)
 
     assert len(model) > 0
     assert isinstance(save, list)
@@ -57,7 +59,7 @@ def test_mamba_model_construction_uses_build_only_cpu_fallback(model_name, task)
 
     expected_stride = (
         torch.tensor([4.0, 8.0, 16.0, 32.0])
-        if model_name in {"mamba-hrnet-seg.yaml", "mamba-hrnet-seg-edgevss.yaml"}
+        if model_name in {"mamba-hrnet-seg.yaml", "mamba-hrnet-seg-dvss.yaml", "mamba-hrnet-seg-edgevss.yaml"}
         else torch.tensor([8.0, 16.0, 32.0])
     )
     assert torch.equal(model.model.stride.cpu(), expected_stride)
