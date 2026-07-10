@@ -1,0 +1,52 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+nc: 80
+stride: 32
+
+pointrend:
+  enabled: true
+  feature_levels: [0]
+  project_channels: 256
+  hidden_channels: 256
+  num_fcs: 3
+  coarse_resolution: 28
+  subdivision_steps: 3
+  subdivision_num_points: 784
+  scale_factor: 2
+
+backbone:
+  - [-1, 1, ResNetBackbone, [resnet50, null, 1, true]]
+  - [0, 1, Index, [0]]
+  - [0, 1, Index, [1]]
+  - [0, 1, Index, [2]]
+  - [0, 1, Index, [3]]
+
+head:
+  - [[1, 2, 3, 4], 1, FPN, [256, {num_outs: 5}]]
+  - [[5], 1, CascadeMaskRCNNHead, [nc, {
+      rpn: {
+        anchor_scales: [1, 2, 4],
+        anchor_ratios: [0.5, 1.0, 2.0],
+        strides: [4, 8, 16, 32, 64],
+        pre_nms_topk_train: 2000,
+        post_nms_topk_train: 2000,
+        pre_nms_topk_test: 1000,
+        post_nms_topk_test: 1000,
+        nms_thresh: 0.7,
+        min_box_size: 0.0,
+        pos_iou: 0.7,
+        neg_iou: 0.3,
+        samples_per_img: 256,
+        pos_fraction: 0.5,
+        beta: 0.1111111111111111
+      },
+      roi: {pool_size: 7, mask_pool_size: 14, sampling_ratio: 0, featmap_strides: [4, 8, 16, 32]},
+      train: {pos_iou: 0.5, neg_iou: 0.5, samples_per_img: 512, pos_fraction: 0.25},
+      test: {score_thresh: 0.05, nms_iou: 0.5, max_dets: 100},
+      bbox_head: {hidden_dim: 1024, loss: smooth_l1, beta: 1.0},
+      mask_head: {dim: 256, num_convs: 4, resolution: 28},
+      cascade: {
+        iou_thresholds: [0.5, 0.6, 0.7],
+        bbox_stds: [[0.1, 0.1, 0.2, 0.2], [0.05, 0.05, 0.1, 0.1], [0.033, 0.033, 0.067, 0.067]]
+      }
+    }]]

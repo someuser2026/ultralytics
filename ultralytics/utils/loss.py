@@ -1128,9 +1128,9 @@ class v8SegmentationLoss(v8DetectionLoss):
         loss[6] *= float(_get_cfg_value(self.hyp, "active_shoreline_aux_weight", self.shoreline_aux_weight))
 
         if self.point_rend_enabled:
-            point_loss = point_loss * self.point_rend.config.loss_weight
+            point_loss = point_loss * self.point_rend.train_config.loss_weight
             loss_items = torch.cat((loss.detach(), point_loss.detach().reshape(1)))
-            if self.point_rend.config.mode == "frozen":
+            if self.point_rend.train_config.mode == "frozen":
                 return point_loss * batch_size, loss_items
             total_terms = torch.cat((loss, point_loss.reshape(1)))
             return total_terms * batch_size, loss_items
@@ -1157,7 +1157,7 @@ class v8SegmentationLoss(v8DetectionLoss):
             raise RuntimeError("PointRend is enabled but the segmentation head did not return pointrend_features.")
         coefficients, boxes, image_indices, gt_instances = [], [], [], []
         source_indices = []
-        max_instances = self.point_rend.config.train_max_instances
+        max_instances = self.point_rend.train_config.train_max_instances
         image_h, image_w = int(imgsz[0].item()), int(imgsz[1].item())
 
         for image_index in range(fg_mask.shape[0]):
@@ -3351,7 +3351,7 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
                     batch=batch,
                     imgsz=imgsz,
                     fine_features=pointrend_features,
-                ) * self.point_rend.config.loss_weight
+                ) * self.point_rend.train_config.loss_weight
 
             # Compute auxiliary mask losses if enabled
             if self.aux_loss and dec_mask_coeffs.shape[0] > 0:
@@ -3404,7 +3404,7 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
             gt_indices = gt_indices.to(mask_coeffs.device)
             if query_indices.numel() == 0:
                 continue
-            query_indices = query_indices[: self.point_rend.config.train_max_instances]
+            query_indices = query_indices[: self.point_rend.train_config.train_max_instances]
             gt_indices = gt_indices[: query_indices.numel()]
             coefficients.append(mask_coeffs[image_index, query_indices])
             query_boxes = xywh2xyxy(pred_bboxes[image_index, query_indices].detach()) * scale
@@ -4397,9 +4397,9 @@ class Mask2FormerInstanceLoss(nn.Module):
         total = lcls + lmask + ldice
         if self.point_rend_enabled:
             point = self._pointrend_loss(outputs, targets, self.criterion.last_indices, batch)
-            point = point * self.point_rend.config.loss_weight
+            point = point * self.point_rend.train_config.loss_weight
             items = torch.stack((lcls.detach(), lmask.detach(), ldice.detach(), point.detach()))
-            if self.point_rend.config.mode == "frozen":
+            if self.point_rend.train_config.mode == "frozen":
                 return point, items
             return total + point, items
         return total, torch.stack((lcls.detach(), lmask.detach(), ldice.detach()))
@@ -4425,7 +4425,7 @@ class Mask2FormerInstanceLoss(nn.Module):
             target_indices = target_indices.to(outputs["pred_masks"].device)
             if query_indices.numel() == 0:
                 continue
-            query_indices = query_indices[: self.point_rend.config.train_max_instances]
+            query_indices = query_indices[: self.point_rend.train_config.train_max_instances]
             target_indices = target_indices[: query_indices.numel()]
             full_logits.append(outputs["pred_masks"][image_index, query_indices, None])
             query_boxes = outputs["boxes"][image_index, :, query_indices].transpose(0, 1).detach()

@@ -908,7 +908,7 @@ class _AxisRCNNBase(nn.Module):
             image_shape=self._image_shape_from_feats(feats),
             gt_masks=full_targets,
         )
-        return mask_loss, self.point_rend.point_loss(instances) * self.point_rend.config.loss_weight
+        return mask_loss, self.point_rend.point_loss(instances) * self.point_rend.train_config.loss_weight
 
     def loss(self, feats: list[Tensor], batch: dict) -> tuple[Tensor, Tensor]:
         gt_boxes, gt_labels, gt_masks = _split_targets(batch, "segment")
@@ -927,7 +927,7 @@ class _AxisRCNNBase(nn.Module):
                 mask_result = self._mask_loss(feats, pos_rois, gt_inds, gt_masks)
                 losses.extend(mask_result if isinstance(mask_result, tuple) else (mask_result,))
         loss_items = torch.stack([x if isinstance(x, Tensor) else feats[0].new_tensor(float(x)) for x in losses])
-        if self.point_rend_enabled and hasattr(self, "point_rend") and self.point_rend.config.mode == "frozen":
+        if self.point_rend_enabled and hasattr(self, "point_rend") and self.point_rend.train_config.mode == "frozen":
             return loss_items[-1], loss_items.detach()
         return loss_items.sum(), loss_items.detach()
 

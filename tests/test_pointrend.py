@@ -8,20 +8,11 @@ import torch
 
 def _point_args(**overrides):
     values = {
-        "pointrend": True,
         "pointrend_mode": "joint",
-        "pointrend_feature_levels": [0],
-        "pointrend_project_channels": 8,
-        "pointrend_hidden_channels": 8,
-        "pointrend_num_fcs": 2,
-        "pointrend_coarse_resolution": 8,
         "pointrend_train_num_points": 16,
         "pointrend_oversample_ratio": 3.0,
         "pointrend_importance_sample_ratio": 0.75,
         "pointrend_train_max_instances": 8,
-        "pointrend_subdivision_steps": 2,
-        "pointrend_subdivision_num_points": 16,
-        "pointrend_scale_factor": 2,
         "pointrend_loss_weight": 1.0,
         "box": 7.5,
         "cls": 0.5,
@@ -42,8 +33,24 @@ def _point_args(**overrides):
     return SimpleNamespace(**values)
 
 
-def _tiny_segment_cfg():
-    return {
+def _pointrend_block(**overrides):
+    values = {
+        "enabled": True,
+        "feature_levels": [0],
+        "project_channels": 8,
+        "hidden_channels": 8,
+        "num_fcs": 2,
+        "coarse_resolution": 8,
+        "subdivision_steps": 2,
+        "subdivision_num_points": 16,
+        "scale_factor": 2,
+    }
+    values.update(overrides)
+    return values
+
+
+def _tiny_segment_cfg(pointrend=False):
+    cfg = {
         "nc": 1,
         "backbone": [
             [-1, 1, "Conv", [16, 3, 2]],
@@ -52,6 +59,9 @@ def _tiny_segment_cfg():
         ],
         "head": [[[0, 1, 2], 1, "Segment", [1, 8, 16]]],
     }
+    if pointrend:
+        cfg["pointrend"] = _pointrend_block()
+    return cfg
 
 
 def _segment_batch(imgsz=64):
@@ -78,10 +88,15 @@ def test_uncertain_point_selection_prefers_logits_near_zero():
 
 
 def test_pointrend_refinement_shapes_and_gradients():
-    from ultralytics.nn.modules.pointrend import PointRendConfig, PointRendInstances, PointRendRefiner
+    from ultralytics.nn.modules.pointrend import (
+        PointRendConfig,
+        PointRendInstances,
+        PointRendRefiner,
+        PointRendTrainConfig,
+    )
 
-    cfg = PointRendConfig.from_args(_point_args())
-    refiner = PointRendRefiner([4], cfg)
+    cfg = PointRendConfig.from_yaml({"pointrend": _pointrend_block()})
+    refiner = PointRendRefiner([4], cfg, PointRendTrainConfig.from_args(_point_args()))
     source = torch.randn(2, 4, 16, 16, requires_grad=True)
     fine = refiner.project_features([source])
     coarse = torch.randn(2, 1, 8, 8, requires_grad=True)
@@ -109,14 +124,14 @@ def test_pointrend_refinement_shapes_and_gradients():
 
 @pytest.mark.parametrize("mode", ["joint", "frozen"])
 def test_yolo_segment_pointrend_loss_and_trainability(mode):
-    from ultralytics.nn.modules.pointrend import configure_pointrend
+    from ultralytics.nn.modules.pointrend import configure_pointrend_training
     from ultralytics.nn.tasks import SegmentationModel
 
     torch.manual_seed(0)
-    model = SegmentationModel(_tiny_segment_cfg(), ch=3, nc=1, verbose=False)
+    model = SegmentationModel(_tiny_segment_cfg(pointrend=True), ch=3, nc=1, verbose=False)
     args = _point_args(pointrend_mode=mode)
     model.args = args
-    configure_pointrend(model, args)
+    configure_pointrend_training(model, args)
     if mode == "frozen":
         for name, parameter in model.named_parameters():
             parameter.requires_grad = ".point_rend." in name
@@ -139,10 +154,15 @@ def test_pointrend_adapter_empty_instances():
     from ultralytics.nn.modules.pointrend import (
         PointRendConfig,
         PointRendRefiner,
+        PointRendTrainConfig,
         YOLOPrototypePointRendAdapter,
     )
 
-    refiner = PointRendRefiner([4], PointRendConfig.from_args(_point_args()))
+    refiner = PointRendRefiner(
+        [4],
+        PointRendConfig.from_yaml({"pointrend": _pointrend_block()}),
+        PointRendTrainConfig.from_args(_point_args()),
+    )
     fine = refiner.project_features([torch.randn(1, 4, 8, 8)])
     adapter = YOLOPrototypePointRendAdapter(refiner)
     instances = adapter.from_coefficients(
@@ -159,7 +179,7 @@ def test_pointrend_adapter_empty_instances():
 
 def test_mask2former_pointrend_joint_loss():
     from ultralytics.nn.modules import Mask2FormerHead
-    from ultralytics.nn.modules.pointrend import configure_pointrend
+    from ultralytics.nn.modules.pointrend import configure_pointrend_from_yaml, configure_pointrend_training
     from ultralytics.utils.loss import Mask2FormerInstanceLoss
 
     cfg = {
@@ -183,11 +203,12 @@ def test_mask2former_pointrend_joint_loss():
         def __init__(self, module):
             super().__init__()
             self.model = torch.nn.ModuleList([module])
-            self.yaml = {"nc": 1}
+            self.yaml = {"nc": 1, "pointrend": _pointrend_block()}
             self.args = _point_args(overlap_mask=False)
 
     model = Wrapper(head)
-    configure_pointrend(model, model.args)
+    configure_pointrend_from_yaml(model)
+    configure_pointrend_training(model, model.args)
     criterion = Mask2FormerInstanceLoss(model)
     features = [
         torch.randn(1, 8, 32, 32),
@@ -207,7 +228,7 @@ def test_mask2former_pointrend_joint_loss():
 
 def test_mask_rcnn_pointrend_joint_loss():
     from ultralytics.nn.modules import MaskRCNNHead
-    from ultralytics.nn.modules.pointrend import configure_pointrend
+    from ultralytics.nn.modules.pointrend import configure_pointrend_from_yaml, configure_pointrend_training
 
     head = MaskRCNNHead(
         [8],
@@ -234,9 +255,11 @@ def test_mask_rcnn_pointrend_joint_loss():
         def __init__(self, module):
             super().__init__()
             self.model = torch.nn.ModuleList([module])
+            self.yaml = {"nc": 1, "pointrend": _pointrend_block()}
 
     wrapper = Wrapper(head)
-    configure_pointrend(wrapper, _point_args())
+    configure_pointrend_from_yaml(wrapper)
+    configure_pointrend_training(wrapper, _point_args())
     features = [torch.randn(1, 8, 16, 16, requires_grad=True)]
     batch = _segment_batch()
 
@@ -249,11 +272,15 @@ def test_mask_rcnn_pointrend_joint_loss():
 
 
 def test_rtdetr_pointrend_final_match_loss():
-    from ultralytics.nn.modules.pointrend import PointRendConfig, PointRendRefiner
+    from ultralytics.nn.modules.pointrend import PointRendConfig, PointRendRefiner, PointRendTrainConfig
     from ultralytics.utils.loss import RTDETRSegmentLoss
 
     torch.manual_seed(0)
-    refiner = PointRendRefiner([8], PointRendConfig.from_args(_point_args()))
+    refiner = PointRendRefiner(
+        [8],
+        PointRendConfig.from_yaml({"pointrend": _pointrend_block()}),
+        PointRendTrainConfig.from_args(_point_args()),
+    )
     criterion = RTDETRSegmentLoss(
         nc=1,
         aux_loss=False,

@@ -695,15 +695,6 @@ class BaseTrainer:
 
     def _finalize_model_build(self, model, weights=None):
         """Apply model-level adapter configuration before loading checkpoint weights."""
-        if getattr(self.args, "task", None) == "segment" and getattr(self.args, "pointrend", False):
-            from ultralytics.nn.modules.pointrend import PointRendConfig, configure_pointrend
-
-            point_cfg = PointRendConfig.from_args(self.args)
-            pretrained_source = weights is not None or str(getattr(self.args, "model", "")).endswith(".pt")
-            if point_cfg.mode == "frozen" and not pretrained_source:
-                raise ValueError("pointrend_mode=frozen requires pretrained segmentation weights.")
-            configure_pointrend(model, self.args)
-
         if not self.args.lora and self._has_layer_spec(self.args.lora_layers):
             raise ValueError("'lora_layers' requires 'lora=True'.")
 
@@ -719,6 +710,23 @@ class BaseTrainer:
 
         if weights is not None:
             model.load(weights)
+
+        if getattr(self.args, "task", None) == "segment":
+            from ultralytics.nn.modules.pointrend import configure_pointrend_training, has_pointrend
+
+            if has_pointrend(model):
+                point_cfg = configure_pointrend_training(model, self.args)
+                pretrained_arg = getattr(self.args, "pretrained", False)
+                pretrained_source = (
+                    weights is not None
+                    or str(getattr(self.args, "model", "")).endswith(".pt")
+                    or isinstance(pretrained_arg, (str, Path))
+                )
+                if point_cfg.mode == "frozen" and not pretrained_source:
+                    raise ValueError(
+                        "pointrend_mode=frozen requires a .pt model, an explicit pretrained checkpoint, "
+                        "or incoming weights."
+                    )
         return model
 
     def _setup_train(self):
@@ -774,8 +782,15 @@ class BaseTrainer:
                 )
                 v.requires_grad = True
 
+        self.unfreeze_layer_names = self._apply_timm_unfreeze(timm_layers)
+        self._sync_timm_lora_train_mode_overrides(timm_layers)
+
+        from ultralytics.nn.modules.pointrend import has_pointrend
+
+        point_model = unwrap_model(self.model)
+        point_head = point_model.model[-1] if has_pointrend(point_model) else None
         self._pointrend_frozen_base = bool(
-            getattr(self.args, "pointrend", False) and getattr(self.args, "pointrend_mode", "joint") == "frozen"
+            point_head is not None and point_head.point_rend.train_config.mode == "frozen"
         )
         if self._pointrend_frozen_base:
             for name, parameter in self.model.named_parameters():
@@ -783,9 +798,6 @@ class BaseTrainer:
             trainable = sum(parameter.numel() for parameter in self.model.parameters() if parameter.requires_grad)
             frozen = sum(parameter.numel() for parameter in self.model.parameters() if not parameter.requires_grad)
             LOGGER.info(f"PointRend frozen-base mode: {trainable:,} trainable and {frozen:,} frozen parameters")
-
-        self.unfreeze_layer_names = self._apply_timm_unfreeze(timm_layers)
-        self._sync_timm_lora_train_mode_overrides(timm_layers)
 
         # Check AMP
         self.amp = torch.tensor(self.args.amp).to(self.device)  # True or False

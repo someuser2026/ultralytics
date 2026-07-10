@@ -217,15 +217,8 @@ CFG_INT_KEYS = frozenset(
         "lora_rank",
         "shoreline_prior_max_dist",
         "dual_input_rgb_channels",
-        "pointrend_project_channels",
-        "pointrend_hidden_channels",
-        "pointrend_num_fcs",
-        "pointrend_coarse_resolution",
         "pointrend_train_num_points",
         "pointrend_train_max_instances",
-        "pointrend_subdivision_steps",
-        "pointrend_subdivision_num_points",
-        "pointrend_scale_factor",
     }
 )
 CFG_BOOL_KEYS = frozenset(
@@ -268,7 +261,6 @@ CFG_BOOL_KEYS = frozenset(
         "use_shoreline_prior_loss",
         "use_land_water_prior_loss",
         "dual_input_backbone",
-        "pointrend",
     }
 )
 

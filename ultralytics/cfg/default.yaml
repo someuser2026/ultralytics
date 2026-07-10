@@ -58,20 +58,11 @@ reset_args_keys:
 # Segmentation
 overlap_mask: true # (bool) merge instance masks into one mask during training (segment only)
 mask_ratio: 8 # (int) mask downsample ratio (segment only)
-pointrend: false # (bool) enable the model-agnostic PointRend segmentation refiner
 pointrend_mode: joint # (str) PointRend training mode: joint or frozen
-pointrend_feature_levels: [0] # (list[int]) segmentation-head feature levels used for fine point features
-pointrend_project_channels: 256 # (int) projected channels per selected fine feature level
-pointrend_hidden_channels: 256 # (int) hidden channels in the PointRend point MLP
-pointrend_num_fcs: 3 # (int) number of hidden point-MLP layers
-pointrend_coarse_resolution: 28 # (int) square ROI resolution used as the coarse PointRend mask
 pointrend_train_num_points: 196 # (int) uncertainty-biased points supervised per training instance
 pointrend_oversample_ratio: 3.0 # (float) random candidate oversampling ratio for training points
 pointrend_importance_sample_ratio: 0.75 # (float) fraction of training points chosen by uncertainty
 pointrend_train_max_instances: 100 # (int) maximum PointRend training instances per image
-pointrend_subdivision_steps: 3 # (int) iterative 2x refinement steps at inference
-pointrend_subdivision_num_points: 784 # (int) uncertain pixels replaced per inference subdivision
-pointrend_scale_factor: 2 # (int) mask upsampling factor per subdivision
 pointrend_loss_weight: 1.0 # (float) PointRend point-loss gain
 use_shoreline_aux_loss: false # (bool) force shoreline Gaussian auxiliary targets for compatible shore-aux heads (useful when training from checkpoints)
 use_shoreline_prior_loss: false # (bool) penalize confident OBB or segment predictions far from shoreline

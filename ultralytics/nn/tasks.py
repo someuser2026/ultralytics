@@ -113,6 +113,8 @@ from ultralytics.nn.modules import (
     RTDETRSegmentDecoder,
     LWEGNet,
     Mask2FormerHead,
+    configure_pointrend_from_yaml,
+    prepare_pointrend_weight_transfer,
     # CascadeRCNNHead,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
@@ -383,6 +385,7 @@ class BaseModel(torch.nn.Module):
             verbose (bool, optional): Whether to log the transfer progress.
         """
         model = weights["model"] if isinstance(weights, dict) else weights  # torchvision models are not dicts
+        prepare_pointrend_weight_transfer(self, model)
         csd = model.float().state_dict()  # checkpoint state_dict as FP32
         updated_csd = intersect_dicts(csd, self.state_dict())  # intersect
         self.load_state_dict(updated_csd, strict=False)  # load
@@ -553,6 +556,7 @@ class DetectionModel(BaseModel):
 
         # Init weights, biases
         initialize_weights(self)
+        configure_pointrend_from_yaml(self)
         if verbose:
             self.info()
             LOGGER.info("")
@@ -762,8 +766,10 @@ class _RCNNModel(BaseModel):
         self.end2end = True
         stride = self.yaml.get("stride", 32)
         self.stride = torch.as_tensor(stride if isinstance(stride, (list, tuple)) else [stride], dtype=torch.float32)
-        self.loss_names = tuple(getattr(self.model[-1], "loss_names", ("loss",)))
         initialize_weights(self)
+        if task == "segment":
+            configure_pointrend_from_yaml(self)
+        self.loss_names = tuple(getattr(self.model[-1], "loss_names", ("loss",)))
         if verbose:
             self.info()
             LOGGER.info("")
@@ -1485,7 +1491,7 @@ class RTDETRSegmentModel(RTDETRDetectionModel):
             loss_keys.append("loss_point")
         total_loss = sum(loss.values())
         point_rend = getattr(segment_head, "point_rend", None)
-        if point_rend is not None and point_rend.config.mode == "frozen":
+        if point_rend is not None and point_rend.train_config.mode == "frozen":
             total_loss = loss.get("loss_point", sum((p.sum() * 0.0 for p in point_rend.parameters())))
         return total_loss, torch.as_tensor(
             [loss.get(k, torch.tensor(0.0, device=img.device)).detach() for k in loss_keys], device=img.device
@@ -2396,9 +2402,13 @@ def load_checkpoint(weight, device=None, inplace=True, fuse=False):
     ckpt, weight = torch_safe_load(weight)  # load ckpt
     args = {**DEFAULT_CFG_DICT, **(ckpt.get("train_args", {}))}  # combine model and default args, preferring model args
     model = (ckpt.get("ema") or ckpt["model"]).float()  # FP32 model
+    prepare_pointrend_weight_transfer(model, model)
 
     # Model compatibility updates
     model.args = args  # attach args to model
+    from ultralytics.nn.modules.pointrend import configure_pointrend_training
+
+    configure_pointrend_training(model, args)
     model.pt_path = weight  # attach *.pt file path to model
     model.task = getattr(model, "task", guess_model_task(model))
     if not hasattr(model, "stride"):

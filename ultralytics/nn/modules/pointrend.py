@@ -15,74 +15,133 @@ from torch import Tensor
 
 @dataclass(frozen=True)
 class PointRendConfig:
-    """Normalized runtime configuration for a PointRend add-on."""
+    """Model architecture and inference configuration for a PointRend add-on."""
 
     enabled: bool = False
-    mode: str = "joint"
     feature_levels: tuple[int, ...] = (0,)
     project_channels: int = 256
     hidden_channels: int = 256
     num_fcs: int = 3
     coarse_resolution: int = 28
+    subdivision_steps: int = 3
+    subdivision_num_points: int = 784
+    scale_factor: int = 2
+
+    @classmethod
+    def from_yaml(cls, model_yaml: dict[str, Any]) -> "PointRendConfig":
+        """Create and validate architecture configuration from a model YAML dictionary."""
+
+        value = model_yaml.get("pointrend")
+        if value is None or value is False:
+            return cls(enabled=False)
+        if value is True:
+            value = {}
+        if not isinstance(value, dict):
+            raise TypeError("model YAML 'pointrend' must be a mapping, true, false, or null.")
+        enabled = value.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise TypeError(f"pointrend.enabled must be true or false, got {enabled!r}.")
+        levels = value.get("feature_levels", [0])
+        if isinstance(levels, int):
+            levels = [levels]
+        cfg = cls(
+            enabled=enabled,
+            feature_levels=tuple(int(x) for x in levels),
+            project_channels=int(value.get("project_channels", 256)),
+            hidden_channels=int(value.get("hidden_channels", 256)),
+            num_fcs=int(value.get("num_fcs", 3)),
+            coarse_resolution=int(value.get("coarse_resolution", 28)),
+            subdivision_steps=int(value.get("subdivision_steps", 3)),
+            subdivision_num_points=int(value.get("subdivision_num_points", 784)),
+            scale_factor=int(value.get("scale_factor", 2)),
+        )
+        cfg.validate()
+        return cfg
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the normalized architecture into a model-YAML-compatible mapping."""
+
+        return {
+            "enabled": self.enabled,
+            "feature_levels": list(self.feature_levels),
+            "project_channels": self.project_channels,
+            "hidden_channels": self.hidden_channels,
+            "num_fcs": self.num_fcs,
+            "coarse_resolution": self.coarse_resolution,
+            "subdivision_steps": self.subdivision_steps,
+            "subdivision_num_points": self.subdivision_num_points,
+            "scale_factor": self.scale_factor,
+        }
+
+    def shape_signature(self) -> tuple[Any, ...]:
+        """Return architecture fields that determine PointRend parameter shapes."""
+
+        return (
+            self.feature_levels,
+            self.project_channels,
+            self.hidden_channels,
+            self.num_fcs,
+            self.coarse_resolution,
+        )
+
+    def validate(self) -> None:
+        """Raise an actionable error for invalid PointRend configuration."""
+
+        if not self.enabled:
+            return
+        if not self.feature_levels or min(self.feature_levels) < 0:
+            raise ValueError("pointrend.feature_levels must contain non-negative feature indices.")
+        positive = {
+            "pointrend.project_channels": self.project_channels,
+            "pointrend.hidden_channels": self.hidden_channels,
+            "pointrend.num_fcs": self.num_fcs,
+            "pointrend.coarse_resolution": self.coarse_resolution,
+            "pointrend.subdivision_num_points": self.subdivision_num_points,
+            "pointrend.scale_factor": self.scale_factor,
+        }
+        for name, value in positive.items():
+            if value <= 0:
+                raise ValueError(f"{name} must be > 0, got {value}.")
+        if self.subdivision_steps < 0:
+            raise ValueError(f"pointrend.subdivision_steps must be >= 0, got {self.subdivision_steps}.")
+
+
+@dataclass(frozen=True)
+class PointRendTrainConfig:
+    """Training-only PointRend configuration sourced from overall train arguments."""
+
+    mode: str = "joint"
     train_num_points: int = 196
     oversample_ratio: float = 3.0
     importance_sample_ratio: float = 0.75
     train_max_instances: int = 100
-    subdivision_steps: int = 3
-    subdivision_num_points: int = 784
-    scale_factor: int = 2
     loss_weight: float = 1.0
 
     @classmethod
-    def from_args(cls, args: Any) -> "PointRendConfig":
-        """Create and validate a configuration from a dict or namespace."""
+    def from_args(cls, args: Any) -> "PointRendTrainConfig":
+        """Create and validate training configuration from a dict or namespace."""
 
         get = args.get if isinstance(args, dict) else lambda key, default=None: getattr(args, key, default)
-        levels = get("pointrend_feature_levels", [0])
-        if isinstance(levels, int):
-            levels = [levels]
         cfg = cls(
-            enabled=bool(get("pointrend", False)),
             mode=str(get("pointrend_mode", "joint")).lower(),
-            feature_levels=tuple(int(x) for x in levels),
-            project_channels=int(get("pointrend_project_channels", 256)),
-            hidden_channels=int(get("pointrend_hidden_channels", 256)),
-            num_fcs=int(get("pointrend_num_fcs", 3)),
-            coarse_resolution=int(get("pointrend_coarse_resolution", 28)),
             train_num_points=int(get("pointrend_train_num_points", 196)),
             oversample_ratio=float(get("pointrend_oversample_ratio", 3.0)),
             importance_sample_ratio=float(get("pointrend_importance_sample_ratio", 0.75)),
             train_max_instances=int(get("pointrend_train_max_instances", 100)),
-            subdivision_steps=int(get("pointrend_subdivision_steps", 3)),
-            subdivision_num_points=int(get("pointrend_subdivision_num_points", 784)),
-            scale_factor=int(get("pointrend_scale_factor", 2)),
             loss_weight=float(get("pointrend_loss_weight", 1.0)),
         )
         cfg.validate()
         return cfg
 
     def validate(self) -> None:
-        """Raise an actionable error for invalid PointRend configuration."""
+        """Validate PointRend training policy and sampling values."""
 
         if self.mode not in {"joint", "frozen"}:
             raise ValueError(f"pointrend_mode must be 'joint' or 'frozen', got {self.mode!r}.")
-        if not self.feature_levels or min(self.feature_levels) < 0:
-            raise ValueError("pointrend_feature_levels must contain non-negative feature indices.")
-        positive = {
-            "pointrend_project_channels": self.project_channels,
-            "pointrend_hidden_channels": self.hidden_channels,
-            "pointrend_num_fcs": self.num_fcs,
-            "pointrend_coarse_resolution": self.coarse_resolution,
-            "pointrend_train_num_points": self.train_num_points,
-            "pointrend_train_max_instances": self.train_max_instances,
-            "pointrend_subdivision_num_points": self.subdivision_num_points,
-            "pointrend_scale_factor": self.scale_factor,
-        }
-        for name, value in positive.items():
-            if value <= 0:
-                raise ValueError(f"{name} must be > 0, got {value}.")
-        if self.subdivision_steps < 0:
-            raise ValueError(f"pointrend_subdivision_steps must be >= 0, got {self.subdivision_steps}.")
+        if self.train_num_points <= 0:
+            raise ValueError(f"pointrend_train_num_points must be > 0, got {self.train_num_points}.")
+        if self.train_max_instances <= 0:
+            raise ValueError(f"pointrend_train_max_instances must be > 0, got {self.train_max_instances}.")
         if self.oversample_ratio < 1.0:
             raise ValueError(f"pointrend_oversample_ratio must be >= 1, got {self.oversample_ratio}.")
         if not 0.0 <= self.importance_sample_ratio <= 1.0:
@@ -270,17 +329,23 @@ class PointRendPointHead(nn.Module):
 class PointRendRefiner(nn.Module):
     """Feature projection, point supervision, and iterative PointRend refinement."""
 
-    def __init__(self, source_channels: list[int] | tuple[int, ...], config: PointRendConfig):
+    def __init__(
+        self,
+        source_channels: list[int] | tuple[int, ...],
+        model_config: PointRendConfig,
+        train_config: PointRendTrainConfig | None = None,
+    ):
         super().__init__()
-        self.config = config
+        self.model_config = model_config
+        self.train_config = train_config or PointRendTrainConfig()
         self.source_channels = tuple(int(x) for x in source_channels)
         self.projections = nn.ModuleList(
-            [nn.Conv2d(ch, config.project_channels, 1) for ch in self.source_channels]
+            [nn.Conv2d(ch, model_config.project_channels, 1) for ch in self.source_channels]
         )
         self.point_head = PointRendPointHead(
-            fine_channels=len(self.source_channels) * config.project_channels,
-            hidden_channels=config.hidden_channels,
-            num_fcs=config.num_fcs,
+            fine_channels=len(self.source_channels) * model_config.project_channels,
+            hidden_channels=model_config.hidden_channels,
+            num_fcs=model_config.num_fcs,
         )
 
     def project_features(self, features: list[Tensor] | tuple[Tensor, ...]) -> list[Tensor]:
@@ -312,9 +377,9 @@ class PointRendRefiner(nn.Module):
             return sum((parameter.sum() * 0.0 for parameter in self.parameters()), instances.coarse_logits.sum() * 0.0)
         point_coords = sample_uncertain_points_train(
             instances.coarse_logits,
-            self.config.train_num_points,
-            self.config.oversample_ratio,
-            self.config.importance_sample_ratio,
+            self.train_config.train_num_points,
+            self.train_config.oversample_ratio,
+            self.train_config.importance_sample_ratio,
         )
         point_logits = self.predict_points(instances, point_coords)[:, 0]
         image_points = roi_points_to_image_points(point_coords, instances.boxes, instances.image_shape)
@@ -326,13 +391,15 @@ class PointRendRefiner(nn.Module):
 
         refined = instances.coarse_logits
         if refined.shape[0] == 0:
-            scale = self.config.scale_factor**self.config.subdivision_steps
+            scale = self.model_config.scale_factor**self.model_config.subdivision_steps
             return refined.new_zeros((0, 1, refined.shape[-2] * scale, refined.shape[-1] * scale))
-        for _ in range(self.config.subdivision_steps):
+        for _ in range(self.model_config.subdivision_steps):
             refined = F.interpolate(
-                refined, scale_factor=self.config.scale_factor, mode="bilinear", align_corners=False
+                refined, scale_factor=self.model_config.scale_factor, mode="bilinear", align_corners=False
             )
-            indices, point_coords = select_uncertain_points_test(refined, self.config.subdivision_num_points)
+            indices, point_coords = select_uncertain_points_test(
+                refined, self.model_config.subdivision_num_points
+            )
             point_logits = self.predict_points(instances, point_coords)
             flat = refined.flatten(2)
             flat = flat.scatter(2, indices[:, None].expand(-1, flat.shape[1], -1), point_logits)
@@ -359,7 +426,7 @@ class PointRendAdapter:
         """Build common instances from per-instance full-image logits."""
 
         coarse = crop_logits_to_rois(
-            full_logits, boxes, image_shape, self.refiner.config.coarse_resolution
+            full_logits, boxes, image_shape, self.refiner.model_config.coarse_resolution
         )
         instances = PointRendInstances(
             coarse_logits=coarse,
@@ -370,7 +437,7 @@ class PointRendAdapter:
             gt_masks=gt_masks,
             source_indices=source_indices,
         )
-        return instances.detached_base() if self.refiner.config.mode == "frozen" else instances
+        return instances.detached_base() if self.refiner.train_config.mode == "frozen" else instances
 
     def refined_image_logits(self, instances: PointRendInstances) -> Tensor:
         """Refine ROI masks and paste logits into input-image coordinates."""
@@ -431,10 +498,11 @@ class RCNNPointRendAdapter(PointRendAdapter):
     ) -> PointRendInstances:
         if roi_logits.ndim == 3:
             roi_logits = roi_logits[:, None]
-        if roi_logits.shape[-2:] != (self.refiner.config.coarse_resolution,) * 2:
+        coarse_resolution = self.refiner.model_config.coarse_resolution
+        if roi_logits.shape[-2:] != (coarse_resolution,) * 2:
             roi_logits = F.interpolate(
                 roi_logits,
-                size=(self.refiner.config.coarse_resolution,) * 2,
+                size=(coarse_resolution,) * 2,
                 mode="bilinear",
                 align_corners=False,
             )
@@ -447,7 +515,7 @@ class RCNNPointRendAdapter(PointRendAdapter):
             gt_masks=gt_masks,
             source_indices=source_indices,
         )
-        return instances.detached_base() if self.refiner.config.mode == "frozen" else instances
+        return instances.detached_base() if self.refiner.train_config.mode == "frozen" else instances
 
 
 _POINTREND_ADAPTERS: dict[str, type[PointRendAdapter]] = {
@@ -482,38 +550,142 @@ def _head_from_model(model: nn.Module) -> nn.Module:
     return sequence[-1]
 
 
-def configure_pointrend(model: nn.Module, args: Any) -> PointRendRefiner | None:
-    """Attach or enable PointRend on a supported native segmentation head."""
+def configure_pointrend_from_yaml(model: nn.Module) -> PointRendRefiner | None:
+    """Attach PointRend from the model YAML without consulting training arguments."""
 
-    config = PointRendConfig.from_args(args)
-    head = _head_from_model(model)
-    existing = getattr(head, "point_rend", None)
-    head.point_rend_enabled = config.enabled
+    model = getattr(model, "module", model)
+    model_yaml = getattr(model, "yaml", None)
+    if not isinstance(model_yaml, dict):
+        raise TypeError("PointRend configuration requires model.yaml to be a dictionary.")
+    config = PointRendConfig.from_yaml(model_yaml)
     if not config.enabled:
-        return existing
+        return None
+    head = _head_from_model(model)
+    head_name = type(head).__name__
+    if head_name not in _POINTREND_ADAPTERS:
+        supported = ", ".join(sorted(_POINTREND_ADAPTERS))
+        raise TypeError(
+            f"PointRend is enabled in the model YAML, but head {head_name} is unsupported. "
+            f"Register an adapter with register_pointrend_adapter(); supported heads: {supported}."
+        )
     channels = tuple(getattr(head, "point_rend_source_channels", ()))
     if not channels:
         raise TypeError(
-            f"{type(head).__name__} does not expose point_rend_source_channels and cannot use PointRend."
+            f"{head_name} does not expose point_rend_source_channels and cannot use PointRend."
         )
     if max(config.feature_levels) >= len(channels):
         raise ValueError(
-            f"pointrend_feature_levels={list(config.feature_levels)} exceeds the {len(channels)} features "
-            f"exposed by {type(head).__name__}."
+            f"pointrend.feature_levels={list(config.feature_levels)} exceeds the {len(channels)} features "
+            f"exposed by {head_name}."
         )
     selected_channels = [channels[i] for i in config.feature_levels]
+    existing = getattr(head, "point_rend", None)
     if existing is None:
         head.point_rend = PointRendRefiner(selected_channels, config)
+        reference = next(head.parameters(), None)
+        if reference is not None:
+            head.point_rend.to(device=reference.device, dtype=reference.dtype)
     else:
         if tuple(existing.source_channels) != tuple(selected_channels):
             raise ValueError(
-                "Loaded PointRend feature channels do not match the requested pointrend_feature_levels."
+                "Loaded PointRend feature channels do not match the requested pointrend.feature_levels."
             )
-        existing.config = config
+        existing_config = _model_config_from_refiner(existing)
+        if existing_config.shape_signature() != config.shape_signature():
+            raise ValueError(
+                "An attached PointRend module is incompatible with model.yaml['pointrend']; "
+                f"module={existing_config.to_dict()}, YAML={config.to_dict()}."
+            )
+        existing.model_config = config
+        if not hasattr(existing, "train_config"):
+            existing.train_config = PointRendTrainConfig()
+    head.point_rend_enabled = True
     head.point_rend_feature_levels = config.feature_levels
-    if type(head).__name__ in {"MaskRCNNHead", "CascadeMaskRCNNHead"} and "point" not in head.loss_names:
+    model_yaml["pointrend"] = config.to_dict()
+    if head_name in {"MaskRCNNHead", "CascadeMaskRCNNHead"} and "point" not in head.loss_names:
         head.loss_names.append("point")
     return head.point_rend
+
+
+def configure_pointrend_training(model: nn.Module, args: Any) -> PointRendTrainConfig | None:
+    """Update only PointRend training policy; never create or resize model modules."""
+
+    if not has_pointrend(model):
+        return None
+    train_config = PointRendTrainConfig.from_args(args)
+    head = _head_from_model(model)
+    head.point_rend.train_config = train_config
+    return train_config
+
+
+def _model_config_from_refiner(refiner: PointRendRefiner) -> PointRendConfig:
+    """Read architecture config from current or legacy runtime-config PointRend refiners."""
+
+    config = getattr(refiner, "model_config", None)
+    if isinstance(config, PointRendConfig):
+        return config
+    legacy = getattr(refiner, "config", None)
+    if legacy is None:
+        raise TypeError("The incoming PointRend refiner has no recoverable architecture configuration.")
+    config = PointRendConfig(
+        enabled=True,
+        feature_levels=tuple(int(x) for x in getattr(legacy, "feature_levels", (0,))),
+        project_channels=int(getattr(legacy, "project_channels", 256)),
+        hidden_channels=int(getattr(legacy, "hidden_channels", 256)),
+        num_fcs=int(getattr(legacy, "num_fcs", 3)),
+        coarse_resolution=int(getattr(legacy, "coarse_resolution", 28)),
+        subdivision_steps=int(getattr(legacy, "subdivision_steps", 3)),
+        subdivision_num_points=int(getattr(legacy, "subdivision_num_points", 784)),
+        scale_factor=int(getattr(legacy, "scale_factor", 2)),
+    )
+    config.validate()
+    return config
+
+
+def _pointrend_refiner(model: nn.Module) -> PointRendRefiner | None:
+    """Return an attached refiner without requiring its enabled flag."""
+
+    try:
+        return getattr(_head_from_model(model), "point_rend", None)
+    except TypeError:
+        return None
+
+
+def prepare_pointrend_weight_transfer(target_model: nn.Module, incoming_model: nn.Module) -> None:
+    """Make PointRend topology compatible before intersecting incoming checkpoint tensors."""
+
+    target_refiner = _pointrend_refiner(target_model)
+    incoming_refiner = _pointrend_refiner(incoming_model)
+    if target_refiner is not None:
+        target_config = _model_config_from_refiner(target_refiner)
+        target_refiner.model_config = target_config
+        if not hasattr(target_refiner, "train_config"):
+            target_refiner.train_config = PointRendTrainConfig()
+        target = getattr(target_model, "module", target_model)
+        if isinstance(getattr(target, "yaml", None), dict):
+            target.yaml["pointrend"] = target_config.to_dict()
+    if incoming_refiner is None:
+        return
+
+    incoming_config = _model_config_from_refiner(incoming_refiner)
+    if target_refiner is None:
+        target = getattr(target_model, "module", target_model)
+        target.yaml["pointrend"] = incoming_config.to_dict()
+        target_refiner = configure_pointrend_from_yaml(target)
+        if target_refiner is None:  # pragma: no cover - guarded by enabled=True above
+            raise RuntimeError("Failed to reconstruct PointRend from the incoming checkpoint.")
+
+    target_config = _model_config_from_refiner(target_refiner)
+    if target_config.shape_signature() != incoming_config.shape_signature():
+        raise ValueError(
+            "PointRend checkpoint architecture is incompatible with the target model. "
+            f"target={target_config.to_dict()}, checkpoint={incoming_config.to_dict()}."
+        )
+    if tuple(target_refiner.source_channels) != tuple(incoming_refiner.source_channels):
+        raise ValueError(
+            "PointRend checkpoint feature-channel shapes are incompatible with the target model: "
+            f"target={target_refiner.source_channels}, checkpoint={incoming_refiner.source_channels}."
+        )
 
 
 def has_pointrend(model_or_head: nn.Module) -> bool:

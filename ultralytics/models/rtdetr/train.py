@@ -7,6 +7,7 @@ from copy import copy
 from ultralytics.models.yolo.detect import DetectionTrainer
 from ultralytics.nn.tasks import RTDETRDetectionModel
 from ultralytics.utils import RANK, colorstr
+from ultralytics.utils.torch_utils import unwrap_model
 
 from .val import RTDETRDataset, RTDETRValidator
 
@@ -139,7 +140,9 @@ class RTDETRSegmentTrainer(RTDETRTrainer):
         from .val import RTDETRSegmentValidator
 
         self.loss_names = "giou_loss", "cls_loss", "l1_loss", "mask_loss"
-        if getattr(self.args, "pointrend", False):
+        from ultralytics.nn.modules.pointrend import has_pointrend
+
+        if has_pointrend(unwrap_model(self.model)):
             self.loss_names = (*self.loss_names, "point_loss")
         return RTDETRSegmentValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args))
 

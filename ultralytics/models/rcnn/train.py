@@ -9,6 +9,7 @@ from typing import Any
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import RCNNOBBModel, RCNNSegmentationModel
 from ultralytics.utils import DEFAULT_CFG, RANK
+from ultralytics.utils.torch_utils import unwrap_model
 
 from .val import RCNNOBBValidator, RCNNSegmentationValidator
 
@@ -26,7 +27,8 @@ class RCNNSegmentationTrainer(yolo.segment.SegmentationTrainer):
         return self._finalize_model_build(model, weights)
 
     def get_validator(self):
-        head = getattr(getattr(self, "model", None), "model", [None])[-1]
+        model = unwrap_model(self.model)
+        head = getattr(model, "model", [None])[-1]
         self.loss_names = tuple(getattr(head, "loss_names", ("loss",)))
         return RCNNSegmentationValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks)
 
