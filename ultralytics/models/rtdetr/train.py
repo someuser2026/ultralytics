@@ -139,6 +139,8 @@ class RTDETRSegmentTrainer(RTDETRTrainer):
         from .val import RTDETRSegmentValidator
 
         self.loss_names = "giou_loss", "cls_loss", "l1_loss", "mask_loss"
+        if getattr(self.args, "pointrend", False):
+            self.loss_names = (*self.loss_names, "point_loss")
         return RTDETRSegmentValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args))
 
 

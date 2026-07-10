@@ -140,6 +140,20 @@ from .legnet import LWEGNet
 from .rcnn import CascadeMaskRCNNHead, MaskRCNNHead, OrientedRCNNHead, RotatedFasterRCNNHead
 from .rcnn_backbone import ResNetBackbone, UnravelNetBackbone
 from .mask2former import Mask2FormerHead
+from .pointrend import (
+    Mask2FormerPointRendAdapter,
+    PointRendConfig,
+    PointRendInstances,
+    PointRendPointHead,
+    PointRendRefiner,
+    RCNNPointRendAdapter,
+    RTDETRPrototypePointRendAdapter,
+    YOLOPrototypePointRendAdapter,
+    configure_pointrend,
+    get_pointrend_adapter,
+    has_pointrend,
+    register_pointrend_adapter,
+)
 
 from .rpn import AnchorGenerator, RPNHead
 
@@ -281,6 +295,18 @@ __all__ = (
     "RTDETROBBDecoder",
     "RTDETRSegmentDecoder",
     "Mask2FormerHead",
+    "PointRendConfig",
+    "PointRendInstances",
+    "PointRendPointHead",
+    "PointRendRefiner",
+    "YOLOPrototypePointRendAdapter",
+    "RTDETRPrototypePointRendAdapter",
+    "Mask2FormerPointRendAdapter",
+    "RCNNPointRendAdapter",
+    "configure_pointrend",
+    "get_pointrend_adapter",
+    "has_pointrend",
+    "register_pointrend_adapter",
     "EdgeStem",
     "EdgeVSSBlock",
     "DVSSBlock",

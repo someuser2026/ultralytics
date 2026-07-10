@@ -924,6 +924,11 @@ class v8SegmentationLoss(v8DetectionLoss):
         """Initialize the v8SegmentationLoss class with model parameters and mask overlap setting."""
         super().__init__(model, tal_topk=tal_topk)
         self.overlap = model.args.overlap_mask
+        self.segment_head = model.model[-1]
+        self.point_rend = getattr(self.segment_head, "point_rend", None)
+        self.point_rend_enabled = bool(
+            getattr(self.segment_head, "point_rend_enabled", False) and self.point_rend is not None
+        )
 
         self.use_mixed_loss = getattr(model.args, "seg_use_mixed_loss", False)
         
@@ -972,6 +977,8 @@ class v8SegmentationLoss(v8DetectionLoss):
             proto, pred_semantic = proto
         batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
         masks = None
+        masks_full = None
+        point_loss = proto.new_tensor(0.0)
         pred_distri, pred_scores = preds["boxes"], preds["scores"]
 
         # B, grids, ..
@@ -1034,6 +1041,7 @@ class v8SegmentationLoss(v8DetectionLoss):
             )
             # Masks loss
             masks = batch["masks"].to(self.device).float()
+            masks_full = masks
             if tuple(masks.shape[-2:]) != (mask_h, mask_w):  # downsample
                 masks = F.interpolate(masks[None], (mask_h, mask_w), mode="nearest")[0]
 
@@ -1049,10 +1057,25 @@ class v8SegmentationLoss(v8DetectionLoss):
                 self.overlap,
                 fg_probs=assigned_probs,
             )
+            if self.point_rend_enabled:
+                point_loss = self.calculate_pointrend_loss(
+                    fg_mask=fg_mask,
+                    target_gt_idx=target_gt_idx,
+                    target_scores=target_scores,
+                    pred_bboxes=pred_bboxes * stride_tensor,
+                    pred_masks=pred_masks,
+                    proto=proto,
+                    masks=masks_full,
+                    batch_idx=batch_idx,
+                    imgsz=imgsz,
+                    fine_features=preds.get("pointrend_features"),
+                )
 
         # WARNING: lines below prevent Multi-GPU DDP 'unused gradient' PyTorch errors, do not remove
         else:
             loss[1] += (proto * 0).sum() + (pred_masks * 0).sum()  # inf sums may lead to nan loss
+            if self.point_rend_enabled:
+                point_loss = sum((p.sum() * 0.0 for p in self.point_rend.parameters()), proto.sum() * 0.0)
 
         if self.use_shoreline_prior_loss or self.use_land_water_prior_loss:
             confidence = pred_scores.sigmoid().amax(-1)
@@ -1104,7 +1127,91 @@ class v8SegmentationLoss(v8DetectionLoss):
             )
         loss[6] *= float(_get_cfg_value(self.hyp, "active_shoreline_aux_weight", self.shoreline_aux_weight))
 
+        if self.point_rend_enabled:
+            point_loss = point_loss * self.point_rend.config.loss_weight
+            loss_items = torch.cat((loss.detach(), point_loss.detach().reshape(1)))
+            if self.point_rend.config.mode == "frozen":
+                return point_loss * batch_size, loss_items
+            total_terms = torch.cat((loss, point_loss.reshape(1)))
+            return total_terms * batch_size, loss_items
         return loss * batch_size, loss.detach()  # loss(box, seg, cls, dfl, shoreline_prior, land_water_prior, shore_aux)
+
+    def calculate_pointrend_loss(
+        self,
+        fg_mask: torch.Tensor,
+        target_gt_idx: torch.Tensor,
+        target_scores: torch.Tensor,
+        pred_bboxes: torch.Tensor,
+        pred_masks: torch.Tensor,
+        proto: torch.Tensor,
+        masks: torch.Tensor,
+        batch_idx: torch.Tensor,
+        imgsz: torch.Tensor,
+        fine_features: list[torch.Tensor] | None,
+    ) -> torch.Tensor:
+        """Build one representative positive per GT and compute PointRend point supervision."""
+
+        from ultralytics.nn.modules.pointrend import get_pointrend_adapter
+
+        if not fine_features:
+            raise RuntimeError("PointRend is enabled but the segmentation head did not return pointrend_features.")
+        coefficients, boxes, image_indices, gt_instances = [], [], [], []
+        source_indices = []
+        max_instances = self.point_rend.config.train_max_instances
+        image_h, image_w = int(imgsz[0].item()), int(imgsz[1].item())
+
+        for image_index in range(fg_mask.shape[0]):
+            positive = torch.where(fg_mask[image_index])[0]
+            if positive.numel() == 0:
+                continue
+            local_gt = target_gt_idx[image_index, positive]
+            score = target_scores[image_index, positive].sum(-1)
+            chosen = []
+            for gt_index in local_gt.unique(sorted=True):
+                candidates = torch.where(local_gt == gt_index)[0]
+                best = candidates[score[candidates].argmax()]
+                chosen.append(best)
+            if not chosen:
+                continue
+            chosen = torch.stack(chosen)[:max_instances]
+            anchor_indices = positive[chosen]
+            local_indices = local_gt[chosen].long()
+            coefficients.append(pred_masks[image_index, anchor_indices])
+            image_boxes = pred_bboxes[image_index, anchor_indices].detach().clone()
+            image_boxes[:, [0, 2]].clamp_(0, image_w)
+            image_boxes[:, [1, 3]].clamp_(0, image_h)
+            boxes.append(image_boxes)
+            image_indices.append(anchor_indices.new_full((anchor_indices.numel(),), image_index))
+            source_indices.append(anchor_indices)
+            if self.overlap:
+                image_mask = masks[image_index]
+                if image_mask.ndim == 3 and image_mask.shape[0] == 1:
+                    image_mask = image_mask[0]
+                gt_instances.append((image_mask[None] == (local_indices[:, None, None] + 1)).float())
+            else:
+                per_image_masks = masks[batch_idx.view(-1) == image_index]
+                gt_instances.append(per_image_masks.index_select(0, local_indices).float())
+
+        if not coefficients:
+            return sum((p.sum() * 0.0 for p in self.point_rend.parameters()), proto.sum() * 0.0)
+
+        coefficients = torch.cat(coefficients)
+        boxes = torch.cat(boxes)
+        image_indices = torch.cat(image_indices)
+        gt_instances = torch.cat(gt_instances).unsqueeze(1)
+        source_indices = torch.cat(source_indices)
+        adapter = get_pointrend_adapter(self.segment_head)
+        instances = adapter.from_coefficients(
+            coefficients=coefficients,
+            prototypes=proto,
+            boxes=boxes,
+            batch_indices=image_indices,
+            fine_features=fine_features,
+            image_shape=(image_h, image_w),
+            gt_masks=gt_instances,
+            source_indices=source_indices,
+        )
+        return self.point_rend.point_loss(instances)
 
     # @staticmethod
     def single_mask_loss(
@@ -2935,6 +3042,7 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
         seg_w_bce: float = 0.2,
         seg_ignore_index: int = -100,
         seg_area_normalize: bool = True,
+        point_rend: nn.Module | None = None,
     ):
         """
         Initialize RT-DETR segmentation loss.
@@ -2974,6 +3082,8 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
         )
 
         self.overlap_mask = overlap_mask
+        self.point_rend = point_rend
+        self.point_rend_enabled = point_rend is not None
         self.use_mixed_loss = use_mixed_loss
         self.use_soft_ignore_band = use_soft_ignore_band
         self.ignore_band_width = ignore_band_width
@@ -3183,6 +3293,7 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
         dn_scores: torch.Tensor | None = None,
         dn_mask_coeffs: torch.Tensor | None = None,
         dn_meta: dict[str, Any] | None = None,
+        pointrend_features: list[torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass to compute detection and mask losses.
@@ -3230,6 +3341,17 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
                 imgsz,
             )
             total_loss.update(main_mask_loss)
+            if self.point_rend_enabled:
+                total_loss["loss_point"] = self._get_pointrend_loss(
+                    mask_coeffs=dec_mask_coeffs_all[-1],
+                    protos=protos,
+                    pred_bboxes=pred_bboxes[-1],
+                    gt_masks=gt_masks,
+                    match_indices=main_match_indices,
+                    batch=batch,
+                    imgsz=imgsz,
+                    fine_features=pointrend_features,
+                ) * self.point_rend.config.loss_weight
 
             # Compute auxiliary mask losses if enabled
             if self.aux_loss and dec_mask_coeffs.shape[0] > 0:
@@ -3251,6 +3373,69 @@ class RTDETRSegmentLoss(RTDETRDetectionLoss):
                 total_loss.update(aux_mask_loss)
 
         return total_loss
+
+    def _get_pointrend_loss(
+        self,
+        mask_coeffs: torch.Tensor,
+        protos: torch.Tensor,
+        pred_bboxes: torch.Tensor,
+        gt_masks: torch.Tensor,
+        match_indices: list[tuple],
+        batch: dict[str, Any],
+        imgsz: torch.Tensor,
+        fine_features: list[torch.Tensor] | None,
+    ) -> torch.Tensor:
+        """Compute PointRend loss for final-layer Hungarian-matched RT-DETR queries."""
+
+        from ultralytics.nn.modules.pointrend import RTDETRPrototypePointRendAdapter
+
+        if not fine_features:
+            raise RuntimeError("RT-DETR PointRend is enabled but pointrend_features are missing.")
+        coefficients, boxes, image_indices, targets, sources = [], [], [], [], []
+        gt_groups = batch["gt_groups"]
+        gt_offsets = torch.as_tensor(
+            [0, *gt_groups[:-1]], device=mask_coeffs.device, dtype=torch.long
+        ).cumsum_(0)
+        image_h, image_w = int(imgsz[0].item()), int(imgsz[1].item())
+        scale = pred_bboxes.new_tensor((image_w, image_h, image_w, image_h))
+
+        for image_index, (query_indices, gt_indices) in enumerate(match_indices):
+            query_indices = query_indices.to(mask_coeffs.device)
+            gt_indices = gt_indices.to(mask_coeffs.device)
+            if query_indices.numel() == 0:
+                continue
+            query_indices = query_indices[: self.point_rend.config.train_max_instances]
+            gt_indices = gt_indices[: query_indices.numel()]
+            coefficients.append(mask_coeffs[image_index, query_indices])
+            query_boxes = xywh2xyxy(pred_bboxes[image_index, query_indices].detach()) * scale
+            query_boxes[:, [0, 2]].clamp_(0, image_w)
+            query_boxes[:, [1, 3]].clamp_(0, image_h)
+            boxes.append(query_boxes)
+            image_indices.append(query_indices.new_full((query_indices.numel(),), image_index))
+            sources.append(query_indices)
+            if self.overlap_mask:
+                image_mask = gt_masks[image_index]
+                if image_mask.ndim == 3 and image_mask.shape[0] == 1:
+                    image_mask = image_mask[0]
+                local_gt = gt_indices - gt_offsets[image_index]
+                targets.append((image_mask[None] == (local_gt[:, None, None] + 1)).float())
+            else:
+                targets.append(gt_masks.index_select(0, gt_indices).float())
+
+        if not coefficients:
+            return sum((p.sum() * 0.0 for p in self.point_rend.parameters()), protos.sum() * 0.0)
+        adapter = RTDETRPrototypePointRendAdapter(self.point_rend)
+        instances = adapter.from_coefficients(
+            coefficients=torch.cat(coefficients),
+            prototypes=protos,
+            boxes=torch.cat(boxes),
+            batch_indices=torch.cat(image_indices),
+            fine_features=fine_features,
+            image_shape=(image_h, image_w),
+            gt_masks=torch.cat(targets).unsqueeze(1),
+            source_indices=torch.cat(sources),
+        )
+        return self.point_rend.point_loss(instances)
 
     def _get_match_indices_for_layer(
         self, pred_bboxes: torch.Tensor, pred_scores: torch.Tensor, batch: dict[str, Any]
@@ -4099,6 +4284,7 @@ class Mask2FormerSetCriterion(nn.Module):
         """Compute final and auxiliary Mask2Former losses."""
         outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
         indices = self.matcher(outputs_without_aux, targets)
+        self.last_indices = indices
         num_masks = sum(len(t["labels"]) for t in targets)
         num_masks_t = torch.as_tensor([num_masks], dtype=torch.float, device=outputs["pred_masks"].device)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -4126,6 +4312,9 @@ class Mask2FormerInstanceLoss(nn.Module):
     def __init__(self, model):
         super().__init__()
         head = model.model[-1]
+        self.head = head
+        self.point_rend = getattr(head, "point_rend", None)
+        self.point_rend_enabled = bool(getattr(head, "point_rend_enabled", False) and self.point_rend is not None)
         self.device = next(head.parameters()).device
         cfg = getattr(head, "loss_cfg", {})
         args = getattr(model, "args", None)
@@ -4206,4 +4395,60 @@ class Mask2FormerInstanceLoss(nn.Module):
         losses = self.criterion(outputs, targets)
         lcls, lmask, ldice = self._weighted_components(losses, self.class_weight, self.mask_weight, self.dice_weight)
         total = lcls + lmask + ldice
+        if self.point_rend_enabled:
+            point = self._pointrend_loss(outputs, targets, self.criterion.last_indices, batch)
+            point = point * self.point_rend.config.loss_weight
+            items = torch.stack((lcls.detach(), lmask.detach(), ldice.detach(), point.detach()))
+            if self.point_rend.config.mode == "frozen":
+                return point, items
+            return total + point, items
         return total, torch.stack((lcls.detach(), lmask.detach(), ldice.detach()))
+
+    def _pointrend_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: list[dict[str, torch.Tensor]],
+        indices: list[tuple[torch.Tensor, torch.Tensor]],
+        batch: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Compute PointRend loss for final Mask2Former Hungarian matches."""
+
+        from ultralytics.nn.modules.pointrend import Mask2FormerPointRendAdapter
+
+        fine_features = outputs.get("pointrend_features")
+        if not fine_features:
+            raise RuntimeError("Mask2Former PointRend is enabled but pointrend_features are missing.")
+        full_logits, boxes, image_indices, gt_masks, source_indices = [], [], [], [], []
+        image_h, image_w = tuple(batch["img"].shape[-2:])
+        for image_index, (query_indices, target_indices) in enumerate(indices):
+            query_indices = query_indices.to(outputs["pred_masks"].device)
+            target_indices = target_indices.to(outputs["pred_masks"].device)
+            if query_indices.numel() == 0:
+                continue
+            query_indices = query_indices[: self.point_rend.config.train_max_instances]
+            target_indices = target_indices[: query_indices.numel()]
+            full_logits.append(outputs["pred_masks"][image_index, query_indices, None])
+            query_boxes = outputs["boxes"][image_index, :, query_indices].transpose(0, 1).detach()
+            query_boxes = xywh2xyxy(query_boxes)
+            query_boxes[:, [0, 2]].clamp_(0, image_w)
+            query_boxes[:, [1, 3]].clamp_(0, image_h)
+            boxes.append(query_boxes)
+            image_indices.append(query_indices.new_full((query_indices.numel(),), image_index))
+            source_indices.append(query_indices)
+            gt_masks.append(targets[image_index]["masks"].index_select(0, target_indices).float())
+        if not full_logits:
+            return sum(
+                (parameter.sum() * 0.0 for parameter in self.point_rend.parameters()),
+                outputs["pred_masks"].sum() * 0.0,
+            )
+        adapter = Mask2FormerPointRendAdapter(self.point_rend)
+        instances = adapter.from_full_logits(
+            full_logits=torch.cat(full_logits),
+            boxes=torch.cat(boxes),
+            batch_indices=torch.cat(image_indices),
+            fine_features=fine_features,
+            image_shape=(image_h, image_w),
+            gt_masks=torch.cat(gt_masks).unsqueeze(1),
+            source_indices=torch.cat(source_indices),
+        )
+        return self.point_rend.point_loss(instances)

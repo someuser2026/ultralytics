@@ -302,10 +302,13 @@ class RTDETRSegmentValidator(SegmentationValidator, RTDETRValidator):
         # Extract protos if available
         if isinstance(preds[1], (list, tuple)) and len(preds[1]) > 6:
             protos = preds[1][6]
+            point_features = preds[1][8] if len(preds[1]) > 8 else None
         elif preds[1] is not None:
             protos = preds[1] if isinstance(preds[1], torch.Tensor) else None
+            point_features = None
         else:
             protos = None
+            point_features = None
 
         bs, _, nd = preds[0].shape
         nm = 32
@@ -327,15 +330,37 @@ class RTDETRSegmentValidator(SegmentationValidator, RTDETRValidator):
             pred = pred[score > self.args.conf]
             pred = pred[pred[:, 4].argsort(descending=True)]
             proto_i = None if protos is None else (protos if protos.ndim == 3 else protos[i])
-            masks = (
-                self.process(proto_i, pred[:, 6:], pred[:, :4], shape=imgsz)
-                if protos is not None and pred.shape[0]
-                else torch.zeros(
-                    (0, *(imgsz if self.process is ops.process_mask_native or proto_i is None else proto_i.shape[1:])),
-                    dtype=torch.uint8,
-                    device=pred.device,
-                )
+            use_pointrend = bool(
+                point_features is not None
+                and head is not None
+                and getattr(head, "point_rend_enabled", False)
+                and hasattr(head, "point_rend")
+                and pred.shape[0]
             )
+            if use_pointrend:
+                from ultralytics.nn.modules.pointrend import get_pointrend_adapter
+
+                adapter = get_pointrend_adapter(head)
+                fine = [feature[i : i + 1] for feature in point_features]
+                instances = adapter.from_coefficients(
+                    pred[:, 6:],
+                    proto_i.unsqueeze(0),
+                    pred[:, :4],
+                    torch.zeros(pred.shape[0], device=pred.device, dtype=torch.long),
+                    fine,
+                    imgsz,
+                )
+                masks = adapter.refined_image_logits(instances) > 0
+            else:
+                masks = (
+                    self.process(proto_i, pred[:, 6:], pred[:, :4], shape=imgsz)
+                    if protos is not None and pred.shape[0]
+                    else torch.zeros(
+                        (0, *(imgsz if self.process is ops.process_mask_native or proto_i is None else proto_i.shape[1:])),
+                        dtype=torch.uint8,
+                        device=pred.device,
+                    )
+                )
             results.append({"bboxes": pred[:, :4], "conf": pred[:, 4], "cls": pred[:, 5], "masks": masks})
 
         return results

@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from ultralytics.models.yolo.detect import DetectionValidator
+from ultralytics.models.yolo.segment.predict import _segment_head
 from ultralytics.utils import LOGGER, NUM_THREADS, ops
 from ultralytics.utils.checks import check_requirements
 from ultralytics.utils.metrics import SegmentMetrics, mask_iou
@@ -86,6 +87,7 @@ class SegmentationValidator(DetectionValidator):
             model (torch.nn.Module): Model to validate.
         """
         super().init_metrics(model)
+        self.segment_head = _segment_head(model)
         if self.args.save_json:
             check_requirements("faster-coco-eval>=1.6.7")
         # More accurate vs faster
@@ -131,8 +133,10 @@ class SegmentationValidator(DetectionValidator):
         Returns:
             list[dict[str, torch.Tensor]]: Processed detection predictions with masks.
         """
+        raw = None
         if isinstance(preds, (tuple, list)) and isinstance(preds[0], (tuple, list)):
             pred, proto = preds[0]
+            raw = preds[1] if len(preds) > 1 and isinstance(preds[1], dict) else None
         elif isinstance(preds, (tuple, list)):
             pred, proto = preds
         else:
@@ -140,6 +144,14 @@ class SegmentationValidator(DetectionValidator):
         preds = super().postprocess(pred)
         # imgsz = [4 * x for x in proto.shape[2:]]  # get image size from proto
         imgsz = self._last_imgsz
+        point_features = raw.get("pointrend_features") if raw is not None else None
+        head = getattr(self, "segment_head", None)
+        use_pointrend = bool(
+            point_features is not None
+            and head is not None
+            and getattr(head, "point_rend_enabled", False)
+            and hasattr(head, "point_rend")
+        )
         for i, pred in enumerate(preds):
             # print("-"*50)
             # print("Inside postprocess function in segment/val.py 126")
@@ -147,15 +159,41 @@ class SegmentationValidator(DetectionValidator):
             # print("pred:", pred)
             # print("-"*50)
             coefficient = pred.pop("extra")
-            pred["masks"] = (
-                self.process(proto[i], coefficient, pred["bboxes"], shape=imgsz)
-                if coefficient.shape[0]
-                else torch.zeros(
-                    (0, *(imgsz if self.process is ops.process_mask_native else proto.shape[2:])),
-                    dtype=torch.uint8,
-                    device=pred["bboxes"].device,
+            if use_pointrend and coefficient.shape[0]:
+                from ultralytics.nn.modules.pointrend import get_pointrend_adapter
+
+                adapter = get_pointrend_adapter(head)
+                fine = [feature[i : i + 1] for feature in point_features]
+                batch_indices = torch.zeros(coefficient.shape[0], device=coefficient.device, dtype=torch.long)
+                if type(head).__name__ == "Mask2FormerHead":
+                    query_indices = coefficient.argmax(1)
+                    instances = adapter.from_full_logits(
+                        proto[i].index_select(0, query_indices)[:, None],
+                        pred["bboxes"],
+                        batch_indices,
+                        fine,
+                        imgsz,
+                    )
+                else:
+                    instances = adapter.from_coefficients(
+                        coefficient,
+                        proto[i : i + 1],
+                        pred["bboxes"],
+                        batch_indices,
+                        fine,
+                        imgsz,
+                    )
+                pred["masks"] = adapter.refined_image_logits(instances) > 0
+            else:
+                pred["masks"] = (
+                    self.process(proto[i], coefficient, pred["bboxes"], shape=imgsz)
+                    if coefficient.shape[0]
+                    else torch.zeros(
+                        (0, *(imgsz if self.process is ops.process_mask_native else proto.shape[2:])),
+                        dtype=torch.uint8,
+                        device=pred["bboxes"].device,
+                    )
                 )
-            )
         return preds
 
     def _prepare_batch(self, si: int, batch: dict[str, Any]) -> dict[str, Any]:

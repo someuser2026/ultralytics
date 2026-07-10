@@ -682,6 +682,8 @@ class Mask2FormerHead(nn.Module):
         self.end2end = False
         self.export = False
         self.format = None
+        self.point_rend_source_channels = (int(cfg.get("mask_dim", 256)),)
+        self.point_rend_enabled = False
         self.stride = torch.tensor([float(s) for s in cfg["feature_strides"]])
         self.loss_cfg = {
             "class_weight": float(cfg.get("class_weight", 2.0)),
@@ -752,6 +754,8 @@ class Mask2FormerHead(nn.Module):
         mask_features, _, multi_scale_features = self.pixel_decoder.forward_features(x)
         outputs = self.predictor(multi_scale_features, mask_features, None)
         outputs = self._add_standard_outputs(outputs, multi_scale_features)
+        if self.point_rend_enabled and hasattr(self, "point_rend"):
+            outputs["pointrend_features"] = self.point_rend.project_features([mask_features])
         self._last_outputs = outputs
         if self.training:
             return outputs

@@ -168,6 +168,8 @@ CFG_FLOAT_KEYS = frozenset(
         "segment_prior_topk",
         "land_water_prior_land_threshold",
         "land_water_prior_exp_beta",
+        "pointrend_oversample_ratio",
+        "pointrend_loss_weight",
     }
 )
 CFG_FRACTION_KEYS = frozenset(
@@ -196,6 +198,7 @@ CFG_FRACTION_KEYS = frozenset(
         "iou",
         "fraction",
         "lora_dropout",
+        "pointrend_importance_sample_ratio",
     }
 )
 CFG_INT_KEYS = frozenset(
@@ -214,6 +217,15 @@ CFG_INT_KEYS = frozenset(
         "lora_rank",
         "shoreline_prior_max_dist",
         "dual_input_rgb_channels",
+        "pointrend_project_channels",
+        "pointrend_hidden_channels",
+        "pointrend_num_fcs",
+        "pointrend_coarse_resolution",
+        "pointrend_train_num_points",
+        "pointrend_train_max_instances",
+        "pointrend_subdivision_steps",
+        "pointrend_subdivision_num_points",
+        "pointrend_scale_factor",
     }
 )
 CFG_BOOL_KEYS = frozenset(
@@ -256,6 +268,7 @@ CFG_BOOL_KEYS = frozenset(
         "use_shoreline_prior_loss",
         "use_land_water_prior_loss",
         "dual_input_backbone",
+        "pointrend",
     }
 )
 

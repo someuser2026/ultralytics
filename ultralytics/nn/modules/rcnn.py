@@ -698,6 +698,8 @@ class _AxisRCNNBase(nn.Module):
     def __init__(self, in_channels: list[int], nc: int, cfg: dict | None = None, with_mask: bool = False, cascade: bool = False):
         super().__init__()
         self.nc = nc
+        self.point_rend_source_channels = tuple(in_channels)
+        self.point_rend_enabled = False
         self.with_mask = with_mask
         self.cascade = cascade
         self.cfg = _merge_dict(self.default_cfg, cfg)
@@ -865,9 +867,13 @@ class _AxisRCNNBase(nn.Module):
                 stage_gt_inds = torch.cat(pos_gt_inds, dim=0)
         return stage_losses, current_props, stage_pos_rois, stage_gt_inds
 
-    def _mask_loss(self, feats: list[Tensor], pos_rois: Tensor, gt_inds: Tensor, gt_masks: list[Tensor | None]) -> Tensor:
+    def _mask_loss(self, feats: list[Tensor], pos_rois: Tensor, gt_inds: Tensor, gt_masks: list[Tensor | None]) -> Tensor | tuple[Tensor, Tensor]:
         if pos_rois is None or pos_rois.numel() == 0:
-            return feats[0].sum() * 0.0
+            base_zero = feats[0].sum() * 0.0
+            if self.point_rend_enabled and hasattr(self, "point_rend"):
+                point_zero = sum((p.sum() * 0.0 for p in self.point_rend.parameters()), base_zero)
+                return base_zero, point_zero
+            return base_zero
         pooled = _roi_align_multilevel(feats[:4], pos_rois, self.cfg["roi"]["mask_pool_size"], self.cfg["roi"]["sampling_ratio"], self.cfg["roi"]["featmap_strides"])
         logits = self.mask_head(pooled).squeeze(1)
         targets = []
@@ -876,7 +882,33 @@ class _AxisRCNNBase(nn.Module):
             idx = pos_rois[:, 0].long() == bi
             targets.append(_crop_mask_targets(gt_masks[bi], pos_rois[idx, 1:5], gt_inds[idx], self.cfg["mask_head"]["resolution"]))
         target = torch.cat(targets, dim=0) if targets else logits.new_zeros((0, self.cfg["mask_head"]["resolution"], self.cfg["mask_head"]["resolution"]))
-        return F.binary_cross_entropy_with_logits(logits, target)
+        mask_loss = F.binary_cross_entropy_with_logits(logits, target)
+        if not self.point_rend_enabled or not hasattr(self, "point_rend"):
+            return mask_loss
+
+        from ultralytics.nn.modules.pointrend import RCNNPointRendAdapter
+
+        levels = getattr(self, "point_rend_feature_levels", (0,))
+        fine_features = self.point_rend.project_features([feats[i] for i in levels])
+        instance_targets = []
+        for roi, gt_index in zip(pos_rois, gt_inds):
+            image_index = int(roi[0].item())
+            masks_i = gt_masks[image_index]
+            if masks_i is None or masks_i.numel() == 0:
+                instance_targets.append(logits.new_zeros(self._image_shape_from_feats(feats)))
+            else:
+                instance_targets.append(masks_i[int(gt_index.item())].to(logits).float())
+        full_targets = torch.stack(instance_targets).unsqueeze(1)
+        adapter = RCNNPointRendAdapter(self.point_rend)
+        instances = adapter.from_roi_logits(
+            roi_logits=logits,
+            boxes=pos_rois[:, 1:5].detach(),
+            batch_indices=pos_rois[:, 0].long(),
+            fine_features=fine_features,
+            image_shape=self._image_shape_from_feats(feats),
+            gt_masks=full_targets,
+        )
+        return mask_loss, self.point_rend.point_loss(instances) * self.point_rend.config.loss_weight
 
     def loss(self, feats: list[Tensor], batch: dict) -> tuple[Tensor, Tensor]:
         gt_boxes, gt_labels, gt_masks = _split_targets(batch, "segment")
@@ -886,13 +918,17 @@ class _AxisRCNNBase(nn.Module):
             stage_losses, final_props, pos_rois, gt_inds = self._cascade_stage_loss(feats, proposals, gt_boxes, gt_labels, image_shape)
             losses = [rpn_cls, rpn_box, *stage_losses]
             if self.with_mask:
-                losses.append(self._mask_loss(feats, pos_rois, gt_inds, gt_masks))
+                mask_result = self._mask_loss(feats, pos_rois, gt_inds, gt_masks)
+                losses.extend(mask_result if isinstance(mask_result, tuple) else (mask_result,))
         else:
             cls_loss, box_loss, pos_rois, gt_inds = self._single_stage_loss(feats, proposals, gt_boxes, gt_labels)
             losses = [rpn_cls, rpn_box, cls_loss, box_loss]
             if self.with_mask:
-                losses.append(self._mask_loss(feats, pos_rois, gt_inds, gt_masks))
+                mask_result = self._mask_loss(feats, pos_rois, gt_inds, gt_masks)
+                losses.extend(mask_result if isinstance(mask_result, tuple) else (mask_result,))
         loss_items = torch.stack([x if isinstance(x, Tensor) else feats[0].new_tensor(float(x)) for x in losses])
+        if self.point_rend_enabled and hasattr(self, "point_rend") and self.point_rend.config.mode == "frozen":
+            return loss_items[-1], loss_items.detach()
         return loss_items.sum(), loss_items.detach()
 
     @torch.no_grad()
@@ -951,7 +987,23 @@ class _AxisRCNNBase(nn.Module):
                 if pred_boxes.numel():
                     rois = torch.cat((pred_boxes.new_full((pred_boxes.shape[0], 1), bi), pred_boxes), dim=1)
                     pooled = _roi_align_multilevel(feats[:4], rois, self.cfg["roi"]["mask_pool_size"], self.cfg["roi"]["sampling_ratio"], self.cfg["roi"]["featmap_strides"])
-                    pred_masks = _paste_masks(self.mask_head(pooled).squeeze(1), pred_boxes, image_shape, _mask_threshold_from_cfg(self.cfg))
+                    mask_logits = self.mask_head(pooled).squeeze(1)
+                    if self.point_rend_enabled and hasattr(self, "point_rend"):
+                        from ultralytics.nn.modules.pointrend import RCNNPointRendAdapter
+
+                        levels = getattr(self, "point_rend_feature_levels", (0,))
+                        fine_features = self.point_rend.project_features([feats[i] for i in levels])
+                        adapter = RCNNPointRendAdapter(self.point_rend)
+                        instances = adapter.from_roi_logits(
+                            roi_logits=mask_logits,
+                            boxes=pred_boxes,
+                            batch_indices=pred_boxes.new_full((pred_boxes.shape[0],), bi, dtype=torch.long),
+                            fine_features=fine_features,
+                            image_shape=image_shape,
+                        )
+                        pred_masks = adapter.refined_image_logits(instances) > 0
+                    else:
+                        pred_masks = _paste_masks(mask_logits, pred_boxes, image_shape, _mask_threshold_from_cfg(self.cfg))
                     pred_boxes, pred_scores, pred_labels, pred_masks = _filter_empty_mask_predictions(pred_boxes, pred_scores, pred_labels, pred_masks)
                 else:
                     pred_masks = pred_boxes.new_zeros((0, image_shape[0], image_shape[1]), dtype=torch.bool)

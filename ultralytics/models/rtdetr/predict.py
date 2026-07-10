@@ -147,10 +147,13 @@ class RTDETRSegmentPredictor(RTDETRPredictor):
         # Extract protos from extra output
         if isinstance(preds[1], (list, tuple)) and len(preds[1]) > 6:
             protos = preds[1][6]  # Protos is at index 6 in the tuple
+            point_features = preds[1][8] if len(preds[1]) > 8 else None
         elif preds[1] is not None:
             protos = preds[1] if isinstance(preds[1], torch.Tensor) else None
+            point_features = None
         else:
             protos = None
+            point_features = None
 
         nd = preds[0].shape[-1]
         # Split: bboxes (4), scores (nc), masks (nm)
@@ -180,11 +183,38 @@ class RTDETRSegmentPredictor(RTDETRPredictor):
             # Process masks
             masks = None
             if protos is not None and pred.shape[0] > 0:
-                proto_i = protos if protos.ndim == 3 else protos[len(results)]
+                image_index = len(results)
+                proto_i = protos if protos.ndim == 3 else protos[image_index]
                 input_boxes = pred[:, :4].clone()
                 input_boxes[:, [0, 2]] *= img.shape[3]
                 input_boxes[:, [1, 3]] *= img.shape[2]
-                if self.args.retina_masks:
+                use_pointrend = bool(
+                    point_features is not None
+                    and head is not None
+                    and getattr(head, "point_rend_enabled", False)
+                    and hasattr(head, "point_rend")
+                )
+                if use_pointrend:
+                    from ultralytics.nn.modules.pointrend import get_pointrend_adapter
+
+                    adapter = get_pointrend_adapter(head)
+                    fine = [feature[image_index : image_index + 1] for feature in point_features]
+                    batch_indices = torch.zeros(pred.shape[0], device=pred.device, dtype=torch.long)
+                    instances = adapter.from_coefficients(
+                        pred[:, 6:],
+                        proto_i.unsqueeze(0),
+                        input_boxes,
+                        batch_indices,
+                        fine,
+                        tuple(img.shape[2:]),
+                    )
+                    masks = adapter.refined_image_logits(instances)
+                    if self.args.retina_masks:
+                        masks = ops.scale_masks(masks[None], orig_img.shape[:2])[0]
+                    masks = masks > 0
+                    pred[:, [0, 2]] *= ow
+                    pred[:, [1, 3]] *= oh
+                elif self.args.retina_masks:
                     pred[:, [0, 2]] *= ow
                     pred[:, [1, 3]] *= oh
                     masks = ops.process_mask_native(proto_i, pred[:, 6:], pred[:, :4], orig_img.shape[:2])

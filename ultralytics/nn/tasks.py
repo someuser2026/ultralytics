@@ -1395,6 +1395,9 @@ class RTDETRSegmentModel(RTDETRDetectionModel):
         return RTDETRSegmentLoss(
             nc=self.yaml["nc"],
             use_vfl=True,
+            point_rend=getattr(self.model[-1], "point_rend", None)
+            if getattr(self.model[-1], "point_rend_enabled", False)
+            else None,
             overlap_mask=bool(get_arg("overlap_mask", True)) if model_args else True,
             use_mixed_loss=bool(get_arg("seg_use_mixed_loss", False)) if model_args else False,
             use_soft_ignore_band=bool(get_arg("use_soft_ignore_band", False)) if model_args else False,
@@ -1438,9 +1441,9 @@ class RTDETRSegmentModel(RTDETRDetectionModel):
 
         if preds is None:
             preds = self.predict(img, batch=targets, metadata_vec=batch.get("metadata_vec"))
-        dec_bboxes, dec_scores, enc_bboxes, enc_scores, dec_mask_coeffs, enc_mask_coeffs, protos, dn_meta = (
-            preds if self.training else preds[1]
-        )
+        raw_preds = preds if self.training else preds[1]
+        pointrend_features = raw_preds[8] if len(raw_preds) > 8 else None
+        dec_bboxes, dec_scores, enc_bboxes, enc_scores, dec_mask_coeffs, enc_mask_coeffs, protos, dn_meta = raw_preds[:8]
 
         if dn_meta is None:
             dn_bboxes, dn_scores, dn_mask_coeffs = None, None, None
@@ -1472,11 +1475,19 @@ class RTDETRSegmentModel(RTDETRDetectionModel):
             dn_scores=dn_scores,
             dn_mask_coeffs=dn_mask_coeffs,
             dn_meta=dn_meta,
+            pointrend_features=pointrend_features,
         )
 
         # Return main losses - include mask loss if available
         loss_keys = ["loss_giou", "loss_class", "loss_bbox", "loss_mask"]
-        return sum(loss.values()), torch.as_tensor(
+        segment_head = self.model[-1] if hasattr(self, "model") and len(self.model) else None
+        if getattr(segment_head, "point_rend_enabled", False):
+            loss_keys.append("loss_point")
+        total_loss = sum(loss.values())
+        point_rend = getattr(segment_head, "point_rend", None)
+        if point_rend is not None and point_rend.config.mode == "frozen":
+            total_loss = loss.get("loss_point", sum((p.sum() * 0.0 for p in point_rend.parameters())))
+        return total_loss, torch.as_tensor(
             [loss.get(k, torch.tensor(0.0, device=img.device)).detach() for k in loss_keys], device=img.device
         )
 

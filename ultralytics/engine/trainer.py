@@ -695,6 +695,15 @@ class BaseTrainer:
 
     def _finalize_model_build(self, model, weights=None):
         """Apply model-level adapter configuration before loading checkpoint weights."""
+        if getattr(self.args, "task", None) == "segment" and getattr(self.args, "pointrend", False):
+            from ultralytics.nn.modules.pointrend import PointRendConfig, configure_pointrend
+
+            point_cfg = PointRendConfig.from_args(self.args)
+            pretrained_source = weights is not None or str(getattr(self.args, "model", "")).endswith(".pt")
+            if point_cfg.mode == "frozen" and not pretrained_source:
+                raise ValueError("pointrend_mode=frozen requires pretrained segmentation weights.")
+            configure_pointrend(model, self.args)
+
         if not self.args.lora and self._has_layer_spec(self.args.lora_layers):
             raise ValueError("'lora_layers' requires 'lora=True'.")
 
@@ -764,6 +773,16 @@ class BaseTrainer:
                     "See ultralytics.engine.trainer for customization of frozen layers."
                 )
                 v.requires_grad = True
+
+        self._pointrend_frozen_base = bool(
+            getattr(self.args, "pointrend", False) and getattr(self.args, "pointrend_mode", "joint") == "frozen"
+        )
+        if self._pointrend_frozen_base:
+            for name, parameter in self.model.named_parameters():
+                parameter.requires_grad = ".point_rend." in name
+            trainable = sum(parameter.numel() for parameter in self.model.parameters() if parameter.requires_grad)
+            frozen = sum(parameter.numel() for parameter in self.model.parameters() if not parameter.requires_grad)
+            LOGGER.info(f"PointRend frozen-base mode: {trainable:,} trainable and {frozen:,} frozen parameters")
 
         self.unfreeze_layer_names = self._apply_timm_unfreeze(timm_layers)
         self._sync_timm_lora_train_mode_overrides(timm_layers)
@@ -1052,6 +1071,10 @@ class BaseTrainer:
         """Set model in training mode."""
         self.model.train()
         self._restore_timm_train_modes()
+        if getattr(self, "_pointrend_frozen_base", False):
+            for name, module in self.model.named_modules():
+                if ".point_rend" not in name and isinstance(module, (nn.modules.batchnorm._BatchNorm, nn.Dropout)):
+                    module.eval()
         # Freeze BN stat
         for n, m in self.model.named_modules():
             if (

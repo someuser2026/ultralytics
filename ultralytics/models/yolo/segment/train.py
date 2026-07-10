@@ -82,6 +82,8 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
             self.loss_names = "cls_loss", "mask_loss", "dice_loss"
         else:
             self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss", "shoreline_prior_loss", "land_water_prior_loss", "shore_aux_loss"
+        if getattr(self.args, "pointrend", False):
+            self.loss_names = (*self.loss_names, "point_loss")
         return yolo.segment.SegmentationValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )

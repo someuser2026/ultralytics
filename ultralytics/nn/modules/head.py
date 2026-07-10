@@ -350,6 +350,8 @@ class Segment(Detect):
         super().__init__(nc, ch, reg_max, end2end)
         self.nm = nm  # number of masks
         self.npr = npr  # number of protos
+        self.point_rend_source_channels = tuple(ch)
+        self.point_rend_enabled = False
         self.proto = Proto(ch[0], self.npr, self.nm)  # protos
 
         c4 = max(ch[0] // 4, self.nm)
@@ -407,13 +409,19 @@ class Segment(Detect):
     def forward(self, x: list[torch.Tensor]) -> dict[str, torch.Tensor | list[torch.Tensor]] | tuple:
         """Return model outputs and mask coefficients if training, otherwise return outputs and mask coefficients."""
         p = self.proto(x[0])  # mask protos
+        point_features = self._point_rend_features(x)
         preds = Detect.forward(self, x)
         if self.training:
             if self.end2end:
                 preds["one2many"]["proto"] = p
                 preds["one2one"]["proto"] = p.detach()
+                if point_features is not None:
+                    preds["one2many"]["pointrend_features"] = point_features
+                    preds["one2one"]["pointrend_features"] = [feature.detach() for feature in point_features]
             else:
                 preds["proto"] = p
+                if point_features is not None:
+                    preds["pointrend_features"] = point_features
             return preds
         if self.export:
             return preds, p
@@ -421,9 +429,22 @@ class Segment(Detect):
         if self.end2end:
             raw["one2many"]["proto"] = p
             raw["one2one"]["proto"] = p.detach()
+            if point_features is not None:
+                raw["one2many"]["pointrend_features"] = point_features
+                raw["one2one"]["pointrend_features"] = [feature.detach() for feature in point_features]
         else:
             raw["proto"] = p
+            if point_features is not None:
+                raw["pointrend_features"] = point_features
         return (y, p), raw
+
+    def _point_rend_features(self, x: list[torch.Tensor]) -> list[torch.Tensor] | None:
+        """Project configured fine features when PointRend is attached and enabled."""
+
+        if not self.point_rend_enabled or not hasattr(self, "point_rend"):
+            return None
+        levels = getattr(self, "point_rend_feature_levels", (0,))
+        return self.point_rend.project_features([x[i] for i in levels])
 
 
 class Segment26(Segment):
@@ -443,13 +464,19 @@ class Segment26(Segment):
     def forward(self, x: list[torch.Tensor]) -> dict[str, torch.Tensor | list[torch.Tensor]] | tuple:
         """Return YOLO26 segmentation predictions and multi-scale prototypes."""
         p = self.proto(x)
+        point_features = self._point_rend_features(x)
         preds = Detect.forward(self, x)
         if self.training:
             if self.end2end:
                 preds["one2many"]["proto"] = p
                 preds["one2one"]["proto"] = self._detach_proto(p)
+                if point_features is not None:
+                    preds["one2many"]["pointrend_features"] = point_features
+                    preds["one2one"]["pointrend_features"] = [feature.detach() for feature in point_features]
             else:
                 preds["proto"] = p
+                if point_features is not None:
+                    preds["pointrend_features"] = point_features
             return preds
         if self.export:
             return preds, p
@@ -457,8 +484,13 @@ class Segment26(Segment):
         if self.end2end:
             raw["one2many"]["proto"] = p
             raw["one2one"]["proto"] = self._detach_proto(p)
+            if point_features is not None:
+                raw["one2many"]["pointrend_features"] = point_features
+                raw["one2one"]["pointrend_features"] = [feature.detach() for feature in point_features]
         else:
             raw["proto"] = p
+            if point_features is not None:
+                raw["pointrend_features"] = point_features
         return (y, p), raw
 
     def fuse(self) -> None:
@@ -1274,6 +1306,8 @@ class YOLOESegment(YOLOEDetect):
         super().__init__(nc, embed, with_bn, ch)
         self.nm = nm
         self.npr = npr
+        self.point_rend_source_channels = tuple(ch)
+        self.point_rend_enabled = False
         self.proto = Proto(ch[0], self.npr, self.nm)
 
         c5 = max(ch[0] // 4, self.nm)
@@ -1282,6 +1316,10 @@ class YOLOESegment(YOLOEDetect):
     def forward(self, x: list[torch.Tensor], text: torch.Tensor) -> dict[str, torch.Tensor | list[torch.Tensor]] | tuple | torch.Tensor:
         """Return model outputs and mask coefficients if training, otherwise return outputs and mask coefficients."""
         p = self.proto(x[0])  # mask protos
+        point_features = None
+        if self.point_rend_enabled and hasattr(self, "point_rend"):
+            levels = getattr(self, "point_rend_feature_levels", (0,))
+            point_features = self.point_rend.project_features([x[i] for i in levels])
         bs = p.shape[0]  # batch size
 
         mc = torch.cat([self.cv5[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)  # mask coefficients
@@ -1295,6 +1333,8 @@ class YOLOESegment(YOLOEDetect):
         if self.training:
             det_out["mask_coefficient"] = mc
             det_out["proto"] = p
+            if point_features is not None:
+                det_out["pointrend_features"] = point_features
             return det_out
 
         if has_lrpc:
@@ -1305,6 +1345,8 @@ class YOLOESegment(YOLOEDetect):
         y, raw = det_out
         raw["mask_coefficient"] = mc
         raw["proto"] = p
+        if point_features is not None:
+            raw["pointrend_features"] = point_features
         return (torch.cat([y, mc], 1), p), raw
 
 
@@ -1711,6 +1753,8 @@ class RTDETRSegmentDecoder(RTDETRDecoder):
         )
         self.nm = nm
         self.npr = npr
+        self.point_rend_source_channels = tuple(ch)
+        self.point_rend_enabled = False
         # Proto module for mask generation
         self.proto = Proto(ch[0], self.npr, self.nm)
 
@@ -1732,6 +1776,11 @@ class RTDETRSegmentDecoder(RTDETRDecoder):
                 where y is (bs, 300, 4+nc+nm) concatenated tensor
         """
         from ultralytics.models.utils.ops import get_cdn_group
+
+        point_features = None
+        if self.point_rend_enabled and hasattr(self, "point_rend"):
+            levels = getattr(self, "point_rend_feature_levels", (0,))
+            point_features = self.point_rend.project_features([x[i] for i in levels])
 
         # Generate prototypes from first feature map
         protos = self.proto(x[0])  # (bs, nm, H, W)
@@ -1816,6 +1865,8 @@ class RTDETRSegmentDecoder(RTDETRDecoder):
             dec_mask_coeffs = torch.stack(dec_mask_coeffs)  # (ndl, bs, nq, nm)
 
         x = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dec_mask_coeffs, enc_mask_coeffs, protos, dn_meta
+        if point_features is not None:
+            x = (*x, point_features)
         if self.training:
             return x
         # Concatenate bboxes, scores, and mask coefficients for inference
