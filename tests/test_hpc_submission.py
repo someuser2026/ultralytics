@@ -120,6 +120,66 @@ def test_hpc_wrappers_submit_local_configs(tmp_path: Path) -> None:
     assert saw_unfreeze
 
 
+def test_pointrend_joint_segment_submitter(tmp_path: Path) -> None:
+    """The PointRend launcher should submit each requested single-class config in joint mode."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{\n"
+        "  echo CALL\n"
+        "  for arg in \"$@\"; do\n"
+        "    printf '%s\\n' \"$arg\"\n"
+        "  done\n"
+        "  echo END\n"
+        "} >> \"$QSUB_LOG\"\n",
+    )
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["QSUB_LOG"] = str(qsub_log)
+    subprocess.run(
+        [
+            "bash",
+            "jobs/train/hpc/bash_scripts_seg/submit_pointrend_joint_segment_models.sh",
+            "4",
+            "5",
+            "0",
+            "0",
+            "1",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == 5
+    expected_configs = {
+        "ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg-pointrend.yaml",
+        "ultralytics/cfg/models/12/yolo12x-seg-pointrend.yaml",
+        "ultralytics/cfg/models/timm/segment/final/panet_adaptive/hrnet/hrnet_w32/four_scale/1cls/"
+        "hrnet_w32-panet_adaptive-segment-pointrend.yaml",
+        "ultralytics/cfg/models/11/yolo11x-seg-pointrend.yaml",
+        "ultralytics/cfg/models/26/yolo26-seg-pointrend.yaml",
+    }
+    assert {_parse_varlist(call)["CONFIG_YAML"] for call in calls} == expected_configs
+    for call in calls:
+        assert call[-1] == "jobs/train/hpc/planet_full.pbs"
+        vars_map = _parse_varlist(call)
+        assert vars_map["TASK"] == "segment"
+        assert vars_map["POINTREND_MODE"] == "joint"
+        assert vars_map["EPOCHS"] == "5"
+        assert vars_map["BATCH"] == "4"
+        assert vars_map["WORKERS"] == "1"
+        assert vars_map["MULTISPECTRAL"] == "21"
+        assert vars_map["FREEZE"] == "0"
+
+
 def test_joint_mamba_launcher_includes_edgevss_variants(tmp_path: Path) -> None:
     """Smoke-test the joint Mamba launcher after adding EdgeVSS variants."""
     bin_dir = tmp_path / "bin"
