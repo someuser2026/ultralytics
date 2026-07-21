@@ -199,9 +199,16 @@ class ClassificationTrainer(BaseTrainer):
 
     def final_eval(self):
         """Evaluate trained model and save validation results."""
+        preserve_last = self._should_preserve_last_checkpoint()
         for f in self.last, self.best:
             if f.exists():
-                strip_optimizer(f)  # strip optimizers
+                if f is not self.last or not preserve_last:
+                    strip_optimizer(f)  # strip optimizers
+                else:
+                    LOGGER.info(
+                        f"\nTime limit reached after epoch {self.epoch + 1} of {self.epochs}. "
+                        f"Preserving resumable checkpoint at {f}"
+                    )
                 if f is self.best:
                     LOGGER.info(f"\nValidating {f}...")
                     self.validator.args.data = self.args.data

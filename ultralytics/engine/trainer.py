@@ -150,6 +150,7 @@ class BaseTrainer:
         self.batch_size = self.args.batch
         self.epochs = self.args.epochs or 100  # in case users accidentally pass epochs=None with timed training
         self.start_epoch = 0
+        self.time_limit_reached = False
         if RANK == -1:
             print_args(vars(self.args))
 
@@ -226,6 +227,15 @@ class BaseTrainer:
     def _time_exceeded(self):
         """Return True when the configured training time budget has been exhausted."""
         return bool(self.args.time) and (time.time() - self.train_time_start) > (self.args.time * 3600)
+
+    def _should_preserve_last_checkpoint(self):
+        """Return True when an explicit epoch target remains after a timed stop."""
+        return bool(
+            self.args.time
+            and self._explicit_epoch_limit
+            and self.time_limit_reached
+            and self.epoch + 1 < self.epochs
+        )
 
     def _training_duration_description(self):
         """Describe the active stop criteria for training logs."""
@@ -881,6 +891,7 @@ class BaseTrainer:
         self.epoch_time = None
         self.epoch_time_start = time.time()
         self.train_time_start = time.time()
+        self.time_limit_reached = False
         self.run_callbacks("on_train_start")
         LOGGER.info(
             f"Image sizes {self.args.imgsz} train, {self.args.imgsz} val\n"
@@ -987,6 +998,7 @@ class BaseTrainer:
             self.run_callbacks("on_train_epoch_end")
             if RANK in {-1, 0}:
                 time_limit_reached |= self._time_exceeded()
+                self.time_limit_reached |= time_limit_reached
                 final_epoch = epoch + 1 >= self.epochs
                 self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
 
@@ -1318,10 +1330,18 @@ class BaseTrainer:
     def final_eval(self):
         """Perform final evaluation and validation for object detection YOLO model."""
         ckpt = {}
+        preserve_last = self._should_preserve_last_checkpoint()
         for f in self.last, self.best:
             if f.exists():
                 if f is self.last:
-                    ckpt = strip_optimizer(f)
+                    if preserve_last:
+                        ckpt = {"train_results": self.read_results_csv()}
+                        LOGGER.info(
+                            f"\nTime limit reached after epoch {self.epoch + 1} of {self.epochs}. "
+                            f"Preserving resumable checkpoint at {f}"
+                        )
+                    else:
+                        ckpt = strip_optimizer(f)
                 elif f is self.best:
                     k = "train_results"  # update best.pt train_metrics from last.pt
                     strip_optimizer(f, updates={k: ckpt[k]} if k in ckpt else None)

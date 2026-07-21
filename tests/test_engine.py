@@ -14,6 +14,7 @@ from ultralytics.engine import trainer as trainer_module
 from ultralytics.engine.exporter import Exporter
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models.yolo import classify, detect, segment
+from ultralytics.models.yolo.classify import train as classify_train_module
 from ultralytics.utils import ASSETS, DEFAULT_CFG, WEIGHTS_DIR
 
 
@@ -183,30 +184,141 @@ class _TimeSequence:
         return next(self.values, self.last)
 
 
+class _DummyTQDM:
+    def __init__(self, iterable, total=None):
+        self.iterable = iterable
+
+    def __iter__(self):
+        return iter(self.iterable)
+
+    def set_description(self, description):
+        pass
+
+
 def test_time_and_epochs_stop_at_first_limit(monkeypatch, tmp_path):
     """Explicit time and epoch limits should finish the current epoch, then stop at the first limit hit."""
     trainer = _TimeLimitTrainer(tmp_path, epochs=3, time_hours=1, explicit_epoch_limit=True, batch_count=2)
     monkeypatch.setattr(trainer_module.time, "time", _TimeSequence(0, 0, 100, 200, 300, 300, 4001, 4002, 4003, 4004, 4005))
-    monkeypatch.setattr(trainer_module, "TQDM", lambda iterable, total=None: iterable)
+    monkeypatch.setattr(trainer_module, "TQDM", _DummyTQDM)
     trainer._do_train()
 
     assert trainer.epoch == 1
     assert trainer.epochs == 3
     assert trainer.batches_seen == 4
     assert trainer.validate_calls == 1
+    assert trainer.time_limit_reached
+    assert trainer._should_preserve_last_checkpoint()
 
 
 def test_time_only_training_keeps_current_epoch_estimation(monkeypatch, tmp_path):
     """Time-only training should still stretch beyond the initial epoch cap, but stop after the current epoch."""
     trainer = _TimeLimitTrainer(tmp_path, epochs=2, time_hours=1, explicit_epoch_limit=False, batch_count=2)
     monkeypatch.setattr(trainer_module.time, "time", _TimeSequence(0, 0, 100, 200, 300, 300, 4001, 4002, 4003, 4004, 4005))
-    monkeypatch.setattr(trainer_module, "TQDM", lambda iterable, total=None: iterable)
+    monkeypatch.setattr(trainer_module, "TQDM", _DummyTQDM)
     trainer._do_train()
 
     assert trainer.epoch == 1
     assert trainer.scheduler_epochs[1] > trainer.scheduler_epochs[0]
     assert trainer.batches_seen == 4
     assert trainer.validate_calls == 1
+    assert trainer.time_limit_reached
+    assert not trainer._should_preserve_last_checkpoint()
+
+
+def test_preserve_last_checkpoint_requires_unfinished_explicit_epoch_target():
+    """Only a timed stop before an explicit epoch target should preserve last.pt."""
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.args = SimpleNamespace(time=1)
+    trainer._explicit_epoch_limit = True
+    trainer.time_limit_reached = True
+    trainer.epochs = 3
+
+    trainer.epoch = 1
+    assert trainer._should_preserve_last_checkpoint()
+
+    trainer.epoch = 2
+    assert not trainer._should_preserve_last_checkpoint()
+
+    trainer.epoch = 1
+    trainer.time_limit_reached = False
+    assert not trainer._should_preserve_last_checkpoint()
+
+    trainer.time_limit_reached = True
+    trainer._explicit_epoch_limit = False
+    assert not trainer._should_preserve_last_checkpoint()
+
+
+class _DummyFinalValidator:
+    def __init__(self):
+        self.args = SimpleNamespace(plots=False, compile=True, data=None)
+        self.calls = []
+
+    def __call__(self, model):
+        self.calls.append(model)
+        return {"fitness": 1.0}
+
+
+def _make_final_eval_trainer(trainer_cls, tmp_path, preserve):
+    trainer = trainer_cls.__new__(trainer_cls)
+    trainer.last = tmp_path / "last.pt"
+    trainer.best = tmp_path / "best.pt"
+    trainer.last.write_bytes(b"last")
+    trainer.best.write_bytes(b"best")
+    trainer.args = SimpleNamespace(time=1, plots=False, data="data.yaml")
+    trainer._explicit_epoch_limit = True
+    trainer.time_limit_reached = preserve
+    trainer.epoch = 0 if preserve else 1
+    trainer.epochs = 2
+    trainer.validator = _DummyFinalValidator()
+    trainer.callbacks = defaultdict(list)
+    trainer.metrics = {}
+    trainer.read_results_csv = lambda: {"epoch": [1], "metric": [0.5]}
+    return trainer
+
+
+def test_final_eval_preserves_resumable_last_but_finalizes_best(monkeypatch, tmp_path):
+    """An incomplete timed run should preserve last.pt and still finalize best.pt with current results."""
+    trainer = _make_final_eval_trainer(BaseTrainer, tmp_path, preserve=True)
+    strip_calls = []
+
+    def fake_strip(path, updates=None):
+        strip_calls.append((path, updates))
+        return {"train_results": {"old": []}}
+
+    monkeypatch.setattr(trainer_module, "strip_optimizer", fake_strip)
+    trainer.final_eval()
+
+    assert [call[0] for call in strip_calls] == [trainer.best]
+    assert strip_calls[0][1] == {"train_results": {"epoch": [1], "metric": [0.5]}}
+    assert trainer.validator.calls == [trainer.best]
+
+
+def test_final_eval_strips_last_after_epoch_target(monkeypatch, tmp_path):
+    """A completed epoch target should retain the existing finalization behavior."""
+    trainer = _make_final_eval_trainer(BaseTrainer, tmp_path, preserve=False)
+    strip_calls = []
+
+    def fake_strip(path, updates=None):
+        strip_calls.append((path, updates))
+        return {"train_results": {"epoch": [1, 2]}}
+
+    monkeypatch.setattr(trainer_module, "strip_optimizer", fake_strip)
+    trainer.final_eval()
+
+    assert [call[0] for call in strip_calls] == [trainer.last, trainer.best]
+    assert strip_calls[1][1] == {"train_results": {"epoch": [1, 2]}}
+
+
+def test_classification_final_eval_preserves_last(monkeypatch, tmp_path):
+    """Classification should follow the same timed-checkpoint preservation rule."""
+    trainer = _make_final_eval_trainer(classify.ClassificationTrainer, tmp_path, preserve=True)
+    strip_calls = []
+    monkeypatch.setattr(classify_train_module, "strip_optimizer", lambda path: strip_calls.append(path))
+
+    trainer.final_eval()
+
+    assert strip_calls == [trainer.best]
+    assert trainer.validator.calls == [trainer.best]
 
 
 def test_export():

@@ -1108,6 +1108,159 @@ def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
     assert null_run["project"] == str(scratch / "runs/cuda/segment/imgsz_224/yolo")
 
 
+def _resume_pbs_env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
+    """Build a minimal environment for exercising the PBS true-resume path."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    yolo_log = tmp_path / "yolo.log"
+    checkpoint = tmp_path / "runs" / "demo_run" / "weights" / "last.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"resumable")
+
+    _write_stub(
+        bin_dir / "micromamba",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "if [[ \"$1\" == \"shell\" && \"$2\" == \"hook\" ]]; then\n"
+        "cat <<'EOF'\n"
+        "micromamba() { return 0; }\n"
+        "EOF\n"
+        "fi\n",
+    )
+    _write_stub(
+        bin_dir / "yolo",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{\n"
+        "  echo CALL\n"
+        "  for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done\n"
+        "  echo END\n"
+        "} >> \"$YOLO_LOG\"\n",
+    )
+    _write_stub(bin_dir / "nvidia-smi", "#!/usr/bin/env bash\nexit 0\n")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["MAMBA_EXE"] = str(bin_dir / "micromamba")
+    env["MAMBA_ROOT_PREFIX"] = str(tmp_path / "mamba-root")
+    env["YOLO_LOG"] = str(yolo_log)
+    env["PBS_O_WORKDIR"] = str(REPO_ROOT)
+    env["RESUME"] = "true"
+    env["CHECKPOINT"] = str(checkpoint)
+    env["DEVICE"] = "1"
+    env["BATCH"] = "2"
+    env["WANDB"] = "false"
+    for key in ("TASK", "IMGSZ", "CONFIG_YAML", "TIME_FLOAT", "EPOCHS", "OVERLAP", "KEEP_FRAC", "SCRATCH"):
+        env.pop(key, None)
+    return env, checkpoint, yolo_log
+
+
+def test_both_planet_pbs_wrappers_build_true_resume_command(tmp_path: Path) -> None:
+    """Both PBS profiles should resume solely from last.pt plus supported runtime overrides."""
+    env, checkpoint, yolo_log = _resume_pbs_env(tmp_path)
+
+    for wrapper in ("jobs/train/hpc/planet_full.pbs", "jobs/train/hpc/planet_full_2hr_walltime.pbs"):
+        subprocess.run(["bash", wrapper], cwd=REPO_ROOT, env=env, check=True)
+
+    calls = _parse_call_log(yolo_log)
+    assert len(calls) == 4
+    for settings_call, train_call in zip(calls[0::2], calls[1::2]):
+        assert settings_call == ["settings", "wandb=False"]
+        assert train_call == ["mode=train", f"model={checkpoint}", "resume=True", "device=1", "batch=2"]
+        assert not any(arg.startswith(("data=", "epochs=", "time=", "project=", "name=", "task=")) for arg in train_call)
+
+
+def test_planet_pbs_resume_requires_checkpoint(tmp_path: Path) -> None:
+    """Resume mode should reject a missing checkpoint before invoking yolo."""
+    env, _, yolo_log = _resume_pbs_env(tmp_path)
+    env.pop("CHECKPOINT")
+
+    result = subprocess.run(
+        ["bash", "jobs/train/hpc/planet_full.pbs"], cwd=REPO_ROOT, env=env, check=False, capture_output=True, text=True
+    )
+
+    assert result.returncode != 0
+    assert "CHECKPOINT" in result.stdout
+    assert not yolo_log.exists()
+
+
+def test_submit_resume_training_selects_profiles_and_multiple_checkpoints(tmp_path: Path) -> None:
+    """The manual submitter should support both profiles, batching, overrides, and dry runs."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{ echo CALL; for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done; echo END; } >> \"$QSUB_LOG\"\n",
+    )
+    checkpoints = []
+    for run_name in ("run_a", "run-b"):
+        checkpoint = tmp_path / run_name / "weights" / "last.pt"
+        checkpoint.parent.mkdir(parents=True)
+        checkpoint.write_bytes(b"resumable")
+        checkpoints.append(checkpoint)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["QSUB_LOG"] = str(qsub_log)
+    env["DEVICE"] = "0"
+    env["BATCH"] = "4"
+    env["WANDB"] = "false"
+    script = "jobs/train/hpc/submit_resume_training.sh"
+    subprocess.run(["bash", script, "full", *map(str, checkpoints)], cwd=REPO_ROOT, env=env, check=True)
+    subprocess.run(["bash", script, "2hr", str(checkpoints[0])], cwd=REPO_ROOT, env=env, check=True)
+
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == 3
+    assert [call[-1] for call in calls] == [
+        "jobs/train/hpc/planet_full.pbs",
+        "jobs/train/hpc/planet_full.pbs",
+        "jobs/train/hpc/planet_full_2hr_walltime.pbs",
+    ]
+    for call, checkpoint in zip(calls, [*checkpoints, checkpoints[0]]):
+        vars_map = _parse_varlist(call)
+        assert vars_map == {
+            "RESUME": "true",
+            "CHECKPOINT": str(checkpoint),
+            "WANDB": "false",
+            "DEVICE": "0",
+            "BATCH": "4",
+        }
+
+    dry_env = env.copy()
+    dry_env["DRY_RUN"] = "1"
+    dry_run = subprocess.run(
+        ["bash", script, "full", str(checkpoints[0])],
+        cwd=REPO_ROOT,
+        env=dry_env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "DRY_RUN qsub" in dry_run.stdout
+    assert len(_parse_call_log(qsub_log)) == 3
+
+
+def test_submit_resume_training_rejects_invalid_inputs(tmp_path: Path) -> None:
+    """The manual submitter should fail cleanly for invalid profiles and non-resumable checkpoint paths."""
+    script = "jobs/train/hpc/submit_resume_training.sh"
+    best = tmp_path / "weights" / "best.pt"
+    best.parent.mkdir()
+    best.write_bytes(b"stripped")
+
+    cases = [
+        ["invalid", str(best)],
+        ["full", str(best)],
+        ["full", str(tmp_path / "missing" / "last.pt")],
+        ["full", str(tmp_path / "bad,path" / "last.pt")],
+    ]
+    for args in cases:
+        result = subprocess.run(["bash", script, *args], cwd=REPO_ROOT, check=False, capture_output=True, text=True)
+        assert result.returncode != 0
+
+
 def test_site_prediction_submitter_passes_site_and_img_dir(tmp_path: Path) -> None:
     """Smoke-test the site prediction submitter with live and dry-run flows."""
     bin_dir = tmp_path / "bin"

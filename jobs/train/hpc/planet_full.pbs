@@ -180,6 +180,7 @@ workers="${WORKERS:-}"
 data_yaml_override="${DATA_YAML:-}"
 
 weights="${CHECKPOINT:-}"
+resume="${RESUME:-false}"
 freeze="${FREEZE:-}"
 unfreeze="${UNFREEZE:-}"
 lora="${LORA:-}"
@@ -218,6 +219,70 @@ mosaic="${MOSAIC:-}"
 mixup="${MIXUP:-}"
 copy_paste="${COPY_PASTE:-}"
 close_mosaic="${CLOSE_MOSAIC:-}"
+
+if [[ "$(bool_string "${resume}")" == "True" ]]; then
+    if is_nullish "${weights}"; then
+        echo "Error: CHECKPOINT must point to a resumable last.pt when RESUME=true"
+        exit 1
+    fi
+    if [ ! -f "${weights}" ]; then
+        echo "Error: Resume checkpoint not found: ${weights}"
+        exit 1
+    fi
+    if [[ "$(basename "${weights}")" != "last.pt" ]]; then
+        echo "Error: RESUME=true requires last.pt; best.pt and other finalized weights are inference-only"
+        exit 1
+    fi
+
+    echo "========================================="
+    echo "Training mode: resume"
+    echo "Resume checkpoint: ${weights}"
+    echo "Device override: ${device:-checkpoint default}"
+    echo "Batch override: ${batch:-checkpoint default}"
+    echo "WandB: ${wandb}"
+    echo "========================================="
+    echo "GPU information:"
+    nvidia-smi || echo "Warning: nvidia-smi not available"
+    echo "========================================="
+    echo "Setting up Python environment..."
+    echo "Activating ultralytics_contrib environment..."
+    if micromamba activate ultralytics_contrib; then
+        echo "✓ Environment activated successfully"
+    else
+        echo "⚠ Failed to activate environment"
+    fi
+    echo "Final Python: $(which python3)"
+    echo "Final Python version: $(python3 --version 2>&1)"
+    echo "Current environment: ${CONDA_DEFAULT_ENV:-system}"
+    echo "========================================="
+
+    if ! command -v yolo >/dev/null 2>&1; then
+        echo "Error: 'yolo' command is not available after environment activation"
+        exit 1
+    fi
+
+    wandb_setting="$(bool_string "${wandb}")"
+    yolo settings "wandb=${wandb_setting}" || true
+    yolo_args=("mode=train" "model=${weights}" "resume=True")
+    append_arg "device" "${device}"
+    append_arg "batch" "${batch}"
+
+    printf 'Training command: yolo'
+    for arg in "${yolo_args[@]}"; do
+        printf ' %q' "${arg}"
+    done
+    printf '\n'
+    echo "========================================="
+
+    if yolo "${yolo_args[@]}"; then
+        echo "✅ Resumed training completed successfully at: $(date)"
+        exit 0
+    else
+        exit_code=$?
+        echo "⚠ Resumed training failed with exit code: ${exit_code} at: $(date)"
+        exit "${exit_code}"
+    fi
+fi
 
 if is_nullish "${time}"; then
     effective_walltime="$(resolve_pbs_walltime "${pbs_walltime}")"
@@ -414,6 +479,9 @@ save_dir="${project_dir}/${run_name}"
 selected_model="${model_yaml}"
 if ! is_nullish "${weights}"; then
     selected_model="${weights}"
+    training_mode="fine-tune"
+else
+    training_mode="fresh"
 fi
 
 wandb_setting="$(bool_string "${wandb}")"
@@ -471,6 +539,7 @@ append_arg "copy_paste" "${copy_paste}"
 append_arg "close_mosaic" "${close_mosaic}"
 
 echo "Resolved run name: ${run_name}"
+echo "Training mode: ${training_mode}"
 echo "Project directory: ${project_dir}"
 echo "Final save dir: ${save_dir}"
 echo "WandB setting: ${wandb_setting}"
