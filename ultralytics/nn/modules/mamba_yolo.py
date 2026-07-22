@@ -417,7 +417,7 @@ class DSS2D(nn.Module):
         self.force_fp32, self.no_einsum = forward_options[forward_type]
 
         d_proj = d_expand if self.disable_z else d_expand * 2
-        self.in_proj = nn.Conv2d(d_model, d_proj, kernel_size=1, stride=1, groups=1, bias=bias, **factory_kwargs)
+        self.in_proj = Linear2d(d_model, d_proj, bias=bias, **factory_kwargs)
         self.act = act_layer()
         if self.d_conv > 1:
             self.conv2d = DCNv4Spatial(
@@ -467,7 +467,7 @@ class DSS2D(nn.Module):
             raise ValueError(f"DSS2D unsupported initialization '{initialize}'.")
 
         self.out_act = nn.GELU() if self.oact else nn.Identity()
-        self.out_proj = nn.Conv2d(d_expand, d_model, kernel_size=1, stride=1, bias=bias, **factory_kwargs)
+        self.out_proj = Linear2d(d_expand, d_model, bias=bias, **factory_kwargs)
         self.dropout = nn.Dropout(dropout) if dropout > 0. else nn.Identity()
 
     def forward_core(self, x):
@@ -512,14 +512,14 @@ class DSS2D(nn.Module):
 
 
 class DVSSBlock(nn.Module):
-    """HRVMamba Dynamic Visual State Space block for Ultralytics YAML models."""
+    """HRVMamba Dynamic Visual State Space block with an identity residual path."""
 
     def __init__(
             self,
             in_channels: int = 0,
             hidden_dim: int = 0,
             drop_path: float = 0,
-            norm_layer: Callable[..., torch.nn.Module] = partial(LayerNorm2d, eps=1e-6),
+            norm_layer: Callable[..., torch.nn.Module] = partial(LayerNorm2d, eps=1e-5),
             ssm_d_state: int = 1,
             ssm_ratio=2.0,
             ssm_rank_ratio=2.0,
@@ -543,11 +543,14 @@ class DVSSBlock(nn.Module):
         self.mlp_branch = mlp_ratio > 0
         self.use_checkpoint = use_checkpoint
         self.post_norm = post_norm
-        self.proj_conv = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_dim, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm2d(hidden_dim),
-            nn.SiLU(),
-        )
+        self.in_channels = in_channels
+        self.hidden_dim = hidden_dim
+        if in_channels != hidden_dim:
+            raise ValueError(
+                f"DVSSBlock requires in_channels == hidden_dim for its identity residual, got "
+                f"{in_channels} and {hidden_dim}. Use a transition layer before the block."
+            )
+        self.proj_conv = nn.Identity()
 
         self.num_groups = 4
         self.split_channels = _split_channels(hidden_dim, self.num_groups)
@@ -587,8 +590,19 @@ class DVSSBlock(nn.Module):
                 channels_first=True,
             )
 
+        # Match HRVMamba's explicit initialization for Linear2d layers without
+        # touching the state-space parameters' specialized initialization.
+        reference_linears = []
+        if self.ssm_branch:
+            reference_linears.extend((self.op.in_proj, self.op.out_proj))
+        if self.mlp_branch:
+            reference_linears.extend((self.mlp.fc1, self.mlp.fc2))
+        for module in reference_linears:
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+
     def _forward(self, input):
-        input = self.proj_conv(input)
         if self.post_norm:
             x_split = torch.split(input, self.split_channels, dim=1)
             x = [conv(t) for conv, t in zip(self.esinb_convs, x_split)]

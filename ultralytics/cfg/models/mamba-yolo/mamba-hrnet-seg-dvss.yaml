@@ -1,124 +1,155 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-# Segmentation model with a faithful HRNet-style staged DVSS-Mamba backbone.
-# Stage layout: 1 branch -> 2 branches -> 3 branches -> 4 branches.
-# Each branch uses DVSSBlock stacks in place of HRNet bottlenecks/basic blocks.
+# HRVMamba-base segmentation model expressed as an explicit Ultralytics YAML graph.
+# Reference backbone: channels 80/160/320/640, stage modules 1/4/2, two DVSS blocks per branch.
+# Model scales are intentionally absent: all widths, depths, and drop-path values are fixed to the reference config.
 
-nc: 1  # number of classes
-scales:  # [depth, width, max_channels]
-  T: [0.33, 0.25, 1024]
-  B: [0.33, 0.50, 1024]
-  L: [0.67, 0.75, 768]
+nc: 1
+depth_multiple: 1.0
+width_multiple: 1.0
 
 backbone:
-  # Stem + Stage 1 (single high-resolution branch)
-  - [-1, 1, SimpleStem, [128, 3]]  # 0-P2/4
-  - [-1, 2, DVSSBlock, [128]]  # 1 Stage1-B1
+  # Stem: two 3x3 stride-2 Conv-BN-ReLU layers.
+  - [-1, 1, HRConv, [64, 3, 2]]  # 0-P1/2
+  - [-1, 1, HRConv, [64, 3, 2]]  # 1-P2/4
 
-  # Transition 1: 1 -> 2 branches
-  - [1, 1, DVSSBlock, [128]]  # 2 Stage2-B1 transition
-  - [1, 1, Conv, [256, 3, 2]]  # 3 Stage2-B2 downsample
-  - [-1, 1, DVSSBlock, [256]]  # 4 Stage2-B2 transition
+  # Stage 1: two ResNet bottlenecks, 64 -> 256.
+  - [-1, 1, HRBottleneck, [256]]  # 2
+  - [-1, 1, HRBottleneck, [256]]  # 3
 
-  # Stage 2 branches
-  - [2, 2, DVSSBlock, [128]]  # 5 Stage2-B1
-  - [4, 2, DVSSBlock, [256]]  # 6 Stage2-B2
+  # Transition 1: one P2 branch becomes P2/P3 branches with widths 80/160.
+  - [3, 1, HRConv, [80, 3, 1]]  # 4 Stage2-B1
+  - [3, 1, HRConv, [160, 3, 2]]  # 5 Stage2-B2
 
-  # Stage 2 exchange fusion
-  - [6, 1, nn.Upsample, [None, 2, "nearest"]]  # 7 B2 -> B1
-  - [[5, 7], 1, Concat, [1]]  # 8
-  - [-1, 2, DVSSBlock, [128]]  # 9 Stage2 fused B1
-  - [5, 1, Conv, [256, 3, 2]]  # 10 B1 -> B2
-  - [[10, 6], 1, Concat, [1]]  # 11
-  - [-1, 2, DVSSBlock, [256]]  # 12 Stage2 fused B2
+  # Stage 2, module 1/1. Drop path pair: 0.0 -> 0.01153846.
+  - [4, 1, DVSSBlock, [80, 0.0]]  # 6 B1 block 1
+  - [-1, 1, DVSSBlock, [80, 0.0115384615]]  # 7 B1 block 2
+  - [5, 1, DVSSBlock, [160, 0.0]]  # 8 B2 block 1
+  - [-1, 1, DVSSBlock, [160, 0.0115384615]]  # 9 B2 block 2
+  - [[7, 9], 1, HRFusion, [0]]  # 10 fused B1 (add + ReLU)
+  - [[7, 9], 1, HRFusion, [1]]  # 11 fused B2 (add + ReLU)
 
-  # Transition 2: 2 -> 3 branches
-  - [12, 1, Conv, [512, 3, 2]]  # 13 Stage3-B3 downsample
-  - [-1, 1, DVSSBlock, [512]]  # 14 Stage3-B3 transition
+  # Transition 2: retain B1/B2 and create B3 from the previous coarsest branch.
+  - [11, 1, HRConv, [320, 3, 2]]  # 12 Stage3-B3
 
-  # Stage 3 branches
-  - [9, 2, DVSSBlock, [128]]  # 15 Stage3-B1
-  - [12, 2, DVSSBlock, [256]]  # 16 Stage3-B2
-  - [14, 2, DVSSBlock, [512]]  # 17 Stage3-B3
+  # Stage 3, module 1/4. Drop path pair: 0.02307692 -> 0.03461538.
+  - [10, 1, DVSSBlock, [80, 0.0230769231]]  # 13
+  - [-1, 1, DVSSBlock, [80, 0.0346153846]]  # 14
+  - [11, 1, DVSSBlock, [160, 0.0230769231]]  # 15
+  - [-1, 1, DVSSBlock, [160, 0.0346153846]]  # 16
+  - [12, 1, DVSSBlock, [320, 0.0230769231]]  # 17
+  - [-1, 1, DVSSBlock, [320, 0.0346153846]]  # 18
+  - [[14, 16, 18], 1, HRFusion, [0]]  # 19 fused B1
+  - [[14, 16, 18], 1, HRFusion, [1]]  # 20 fused B2
+  - [[14, 16, 18], 1, HRFusion, [2]]  # 21 fused B3
 
-  # Stage 3 exchange fusion
-  - [16, 1, nn.Upsample, [None, 2, "nearest"]]  # 18 B2 -> B1
-  - [17, 1, nn.Upsample, [None, 4, "nearest"]]  # 19 B3 -> B1
-  - [[15, 18, 19], 1, Concat, [1]]  # 20
-  - [-1, 2, DVSSBlock, [128]]  # 21 Stage3 fused B1
-  - [15, 1, Conv, [256, 3, 2]]  # 22 B1 -> B2
-  - [17, 1, nn.Upsample, [None, 2, "nearest"]]  # 23 B3 -> B2
-  - [[22, 16, 23], 1, Concat, [1]]  # 24
-  - [-1, 2, DVSSBlock, [256]]  # 25 Stage3 fused B2
-  - [15, 1, Conv, [256, 3, 2]]  # 26 B1 -> temp P3
-  - [26, 1, Conv, [512, 3, 2]]  # 27 B1 -> B3
-  - [16, 1, Conv, [512, 3, 2]]  # 28 B2 -> B3
-  - [[27, 28, 17], 1, Concat, [1]]  # 29
-  - [-1, 2, DVSSBlock, [512]]  # 30 Stage3 fused B3
+  # Stage 3, module 2/4. Drop path pair: 0.04615385 -> 0.05769231.
+  - [19, 1, DVSSBlock, [80, 0.0461538462]]  # 22
+  - [-1, 1, DVSSBlock, [80, 0.0576923077]]  # 23
+  - [20, 1, DVSSBlock, [160, 0.0461538462]]  # 24
+  - [-1, 1, DVSSBlock, [160, 0.0576923077]]  # 25
+  - [21, 1, DVSSBlock, [320, 0.0461538462]]  # 26
+  - [-1, 1, DVSSBlock, [320, 0.0576923077]]  # 27
+  - [[23, 25, 27], 1, HRFusion, [0]]  # 28 fused B1
+  - [[23, 25, 27], 1, HRFusion, [1]]  # 29 fused B2
+  - [[23, 25, 27], 1, HRFusion, [2]]  # 30 fused B3
 
-  # Transition 3: 3 -> 4 branches
-  - [30, 1, Conv, [1024, 3, 2]]  # 31 Stage4-B4 downsample
-  - [-1, 1, DVSSBlock, [1024]]  # 32 Stage4-B4 transition
+  # Stage 3, module 3/4. Drop path pair: 0.06923077 -> 0.08076923.
+  - [28, 1, DVSSBlock, [80, 0.0692307692]]  # 31
+  - [-1, 1, DVSSBlock, [80, 0.0807692308]]  # 32
+  - [29, 1, DVSSBlock, [160, 0.0692307692]]  # 33
+  - [-1, 1, DVSSBlock, [160, 0.0807692308]]  # 34
+  - [30, 1, DVSSBlock, [320, 0.0692307692]]  # 35
+  - [-1, 1, DVSSBlock, [320, 0.0807692308]]  # 36
+  - [[32, 34, 36], 1, HRFusion, [0]]  # 37 fused B1
+  - [[32, 34, 36], 1, HRFusion, [1]]  # 38 fused B2
+  - [[32, 34, 36], 1, HRFusion, [2]]  # 39 fused B3
 
-  # Stage 4 branches
-  - [21, 2, DVSSBlock, [128]]  # 33 Stage4-B1
-  - [25, 2, DVSSBlock, [256]]  # 34 Stage4-B2
-  - [30, 2, DVSSBlock, [512]]  # 35 Stage4-B3
-  - [32, 2, DVSSBlock, [1024]]  # 36 Stage4-B4
+  # Stage 3, module 4/4. Drop path pair: 0.09230769 -> 0.10384615.
+  - [37, 1, DVSSBlock, [80, 0.0923076923]]  # 40
+  - [-1, 1, DVSSBlock, [80, 0.1038461538]]  # 41
+  - [38, 1, DVSSBlock, [160, 0.0923076923]]  # 42
+  - [-1, 1, DVSSBlock, [160, 0.1038461538]]  # 43
+  - [39, 1, DVSSBlock, [320, 0.0923076923]]  # 44
+  - [-1, 1, DVSSBlock, [320, 0.1038461538]]  # 45
+  - [[41, 43, 45], 1, HRFusion, [0]]  # 46 fused B1
+  - [[41, 43, 45], 1, HRFusion, [1]]  # 47 fused B2
+  - [[41, 43, 45], 1, HRFusion, [2]]  # 48 fused B3
 
-  # Final exchange fusion (4 branches)
-  - [34, 1, nn.Upsample, [None, 2, "nearest"]]  # 37 B2 -> B1
-  - [35, 1, nn.Upsample, [None, 4, "nearest"]]  # 38 B3 -> B1
-  - [36, 1, nn.Upsample, [None, 8, "nearest"]]  # 39 B4 -> B1
-  - [[33, 37, 38, 39], 1, Concat, [1]]  # 40
-  - [-1, 2, DVSSBlock, [128]]  # 41 final P2
+  # Transition 3: retain B1/B2/B3 and create B4 from the previous coarsest branch.
+  - [48, 1, HRConv, [640, 3, 2]]  # 49 Stage4-B4
 
-  - [33, 1, Conv, [256, 3, 2]]  # 42 B1 -> B2
-  - [35, 1, nn.Upsample, [None, 2, "nearest"]]  # 43 B3 -> B2
-  - [36, 1, nn.Upsample, [None, 4, "nearest"]]  # 44 B4 -> B2
-  - [[42, 34, 43, 44], 1, Concat, [1]]  # 45
-  - [-1, 2, DVSSBlock, [256]]  # 46 final P3
+  # Stage 4, module 1/2. Drop path pair: 0.11538462 -> 0.12692308.
+  - [46, 1, DVSSBlock, [80, 0.1153846154]]  # 50
+  - [-1, 1, DVSSBlock, [80, 0.1269230769]]  # 51
+  - [47, 1, DVSSBlock, [160, 0.1153846154]]  # 52
+  - [-1, 1, DVSSBlock, [160, 0.1269230769]]  # 53
+  - [48, 1, DVSSBlock, [320, 0.1153846154]]  # 54
+  - [-1, 1, DVSSBlock, [320, 0.1269230769]]  # 55
+  - [49, 1, DVSSBlock, [640, 0.1153846154]]  # 56
+  - [-1, 1, DVSSBlock, [640, 0.1269230769]]  # 57
+  - [[51, 53, 55, 57], 1, HRFusion, [0]]  # 58 fused B1
+  - [[51, 53, 55, 57], 1, HRFusion, [1]]  # 59 fused B2
+  - [[51, 53, 55, 57], 1, HRFusion, [2]]  # 60 fused B3
+  - [[51, 53, 55, 57], 1, HRFusion, [3]]  # 61 fused B4
 
-  - [33, 1, Conv, [256, 3, 2]]  # 47 B1 -> temp P3
-  - [47, 1, Conv, [512, 3, 2]]  # 48 B1 -> B3
-  - [34, 1, Conv, [512, 3, 2]]  # 49 B2 -> B3
-  - [36, 1, nn.Upsample, [None, 2, "nearest"]]  # 50 B4 -> B3
-  - [[48, 49, 35, 50], 1, Concat, [1]]  # 51
-  - [-1, 2, DVSSBlock, [512]]  # 52 final P4
+  # Stage 4, module 2/2. Drop path pair: 0.13846154 -> 0.15.
+  - [58, 1, DVSSBlock, [80, 0.1384615385]]  # 62
+  - [-1, 1, DVSSBlock, [80, 0.15]]  # 63
+  - [59, 1, DVSSBlock, [160, 0.1384615385]]  # 64
+  - [-1, 1, DVSSBlock, [160, 0.15]]  # 65
+  - [60, 1, DVSSBlock, [320, 0.1384615385]]  # 66
+  - [-1, 1, DVSSBlock, [320, 0.15]]  # 67
+  - [61, 1, DVSSBlock, [640, 0.1384615385]]  # 68
+  - [-1, 1, DVSSBlock, [640, 0.15]]  # 69
+  - [[63, 65, 67, 69], 1, HRFusion, [0]]  # 70 final HR B1
+  - [[63, 65, 67, 69], 1, HRFusion, [1]]  # 71 final HR B2
+  - [[63, 65, 67, 69], 1, HRFusion, [2]]  # 72 final HR B3
+  - [[63, 65, 67, 69], 1, HRFusion, [3]]  # 73 final HR B4
 
-  - [33, 1, Conv, [256, 3, 2]]  # 53 B1 -> temp P3
-  - [53, 1, Conv, [512, 3, 2]]  # 54 B1 -> temp P4
-  - [54, 1, Conv, [1024, 3, 2]]  # 55 B1 -> B4
-  - [34, 1, Conv, [512, 3, 2]]  # 56 B2 -> temp P4
-  - [56, 1, Conv, [1024, 3, 2]]  # 57 B2 -> B4
-  - [35, 1, Conv, [1024, 3, 2]]  # 58 B3 -> B4
-  - [[55, 57, 58, 36], 1, Concat, [1]]  # 59
-  - [-1, 2, DVSSBlock, [1024]]  # 60 final P5
-  - [-1, 1, SPPF, [1024, 5]]  # 61 final P5 + context
+  # Reference HRFuseScales: increase each branch, progressively downsample, and add.
+  - [70, 1, HRBottleneck, [128]]  # 74 increased P2
+  - [71, 1, HRBottleneck, [256]]  # 75 increased P3
+  - [72, 1, HRBottleneck, [512]]  # 76 increased P4
+  - [73, 1, HRBottleneck, [1024]]  # 77 increased P5
+  - [74, 1, HRConv, [256, 3, 2]]  # 78 P2 -> P3
+  - [[78, 75], 1, HRAdd, [false]]  # 79 P3
+  - [79, 1, HRConv, [512, 3, 2]]  # 80 P3 -> P4
+  - [[80, 76], 1, HRAdd, [false]]  # 81 P4
+  - [81, 1, HRConv, [1024, 3, 2]]  # 82 P4 -> P5
+  - [[82, 77], 1, HRAdd, [false]]  # 83 fused P5
+  - [83, 1, HRConv, [2048, 1, 1]]  # 84 final P5 projection
+
+  # Reference output normalization on P2/P3/P4/P5.
+  - [74, 1, LayerNorm2d, [128, 0.00001]]  # 85 P2/4, 128 channels
+  - [79, 1, LayerNorm2d, [256, 0.00001]]  # 86 P3/8, 256 channels
+  - [81, 1, LayerNorm2d, [512, 0.00001]]  # 87 P4/16, 512 channels
+  - [84, 1, LayerNorm2d, [2048, 0.00001]]  # 88 P5/32, 2048 channels
+  - [88, 1, SPPF, [1024, 5]]  # 89 P5 context for the YOLO segmentation head
 
 head:
-  - [61, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 52], 1, Concat, [1]]  # cat backbone P4
-  - [-1, 2, C3k2, [512, False]]  # 64
+  - [89, 1, nn.Upsample, [null, 2, "nearest"]]  # 90
+  - [[-1, 87], 1, Concat, [1]]  # 91 cat backbone P4
+  - [-1, 2, C3k2, [512, false]]  # 92
 
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 46], 1, Concat, [1]]  # cat backbone P3
-  - [-1, 2, C3k2, [256, False]]  # 67
+  - [-1, 1, nn.Upsample, [null, 2, "nearest"]]  # 93
+  - [[-1, 86], 1, Concat, [1]]  # 94 cat backbone P3
+  - [-1, 2, C3k2, [256, false]]  # 95
 
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 41], 1, Concat, [1]]  # cat backbone P2
-  - [-1, 2, C3k2, [128, False]]  # 70 (P2/4-xsmall)
+  - [-1, 1, nn.Upsample, [null, 2, "nearest"]]  # 96
+  - [[-1, 85], 1, Concat, [1]]  # 97 cat backbone P2
+  - [-1, 2, C3k2, [128, false]]  # 98 P2/4
 
-  - [70, 1, Conv, [256, 3, 2]]
-  - [[-1, 67], 1, Concat, [1]]  # cat head P3
-  - [-1, 2, C3k2, [256, False]]  # 73 (P3/8-small)
+  - [98, 1, Conv, [256, 3, 2]]  # 99
+  - [[-1, 95], 1, Concat, [1]]  # 100 cat head P3
+  - [-1, 2, C3k2, [256, false]]  # 101 P3/8
 
-  - [73, 1, Conv, [512, 3, 2]]
-  - [[-1, 64], 1, Concat, [1]]  # cat head P4
-  - [-1, 2, C3k2, [512, False]]  # 76 (P4/16-medium)
+  - [101, 1, Conv, [512, 3, 2]]  # 102
+  - [[-1, 92], 1, Concat, [1]]  # 103 cat head P4
+  - [-1, 2, C3k2, [512, false]]  # 104 P4/16
 
-  - [76, 1, Conv, [512, 3, 2]]
-  - [[-1, 61], 1, Concat, [1]]  # cat head P5
-  - [-1, 2, C3k2, [1024, True]]  # 79 (P5/32-large)
+  - [104, 1, Conv, [512, 3, 2]]  # 105
+  - [[-1, 89], 1, Concat, [1]]  # 106 cat head P5
+  - [-1, 2, C3k2, [1024, true]]  # 107 P5/32
 
-  - [[70, 73, 76, 79], 1, Segment, [nc, 32, 256]]  # Segment(P2, P3, P4, P5)
+  - [[98, 101, 104, 107], 1, Segment, [nc, 32, 256]]  # 108 Segment(P2, P3, P4, P5)

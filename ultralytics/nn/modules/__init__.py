@@ -137,6 +137,7 @@ from .neck import (
     ScaleEqualizingFPN,
 )
 from .legnet import LWEGNet
+from .hrvmamba import HRAdd, HRBottleneck, HRConv, HRFusion
 from .rcnn import CascadeMaskRCNNHead, MaskRCNNHead, OrientedRCNNHead, RotatedFasterRCNNHead
 from .rcnn_backbone import ResNetBackbone, UnravelNetBackbone
 from .mask2former import Mask2FormerHead
@@ -294,6 +295,10 @@ __all__ = (
     "RepFPN",
     "ScaleEqualizingFPN",
     "LWEGNet",
+    "HRAdd",
+    "HRBottleneck",
+    "HRConv",
+    "HRFusion",
     "RHINOOBBDecoder",
     "RTDETROBBDecoder",
     "RTDETRSegmentDecoder",

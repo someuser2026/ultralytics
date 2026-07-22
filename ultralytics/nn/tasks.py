@@ -60,8 +60,13 @@ from ultralytics.nn.modules import (
     GhostConv,
     HGBlock,
     HGStem,
+    HRAdd,
+    HRBottleneck,
+    HRConv,
+    HRFusion,
     ImagePoolingAttn,
     Index,
+    LayerNorm2d,
     LRPCHead,
     Pose,
     RepC3,
@@ -2501,6 +2506,8 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             A2C2f,
             MaxViTBlock,
+            HRBottleneck,
+            HRConv,
             EdgeStem,
             EdgeVSSBlock,
             DVSSBlock,
@@ -2586,6 +2593,17 @@ def parse_model(d, ch, verbose=True):
             c2 = args[1] if args[3] else args[1] * 4
         elif m is torch.nn.BatchNorm2d:
             args = [ch[f]]
+        elif m is HRFusion:
+            c1 = [ch[x] for x in f]
+            target_index = args[0]
+            c2 = c1[target_index]
+            args = [c1, target_index]
+        elif m is HRAdd:
+            c1 = [ch[x] for x in f]
+            if not c1 or len(set(c1)) != 1:
+                raise ValueError(f"HRAdd inputs must have equal channels, got {c1}.")
+            c2 = c1[0]
+            args = [c1, *args]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
