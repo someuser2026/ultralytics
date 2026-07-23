@@ -1,0 +1,82 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+# Detectron2-style PointRend R50-FPN with small-object anchor multipliers.
+
+nc: 80
+stride: 32
+
+backbone:
+  # Detectron2 FREEZE_AT=2 freezes the stem and res2 (torchvision layer1).
+  - [-1, 1, ResNetBackbone, [resnet50, DEFAULT, 1, true, true]] # 0 -> [C2, C3, C4, C5]
+  - [0, 1, Index, [0]]
+  - [0, 1, Index, [1]]
+  - [0, 1, Index, [2]]
+  - [0, 1, Index, [3]]
+
+head:
+  # Reference FPN produces P2-P5 with learned convolutions and max-pools P5 to produce P6.
+  - [[1, 2, 3, 4], 1, FPN, [256, {
+      implementation: reference,
+      num_outs: 5,
+      weight_init: detectron2
+    }]]
+  - [[5], 1, PointRendRCNNHead, [nc, {
+      rpn: {
+        anchor_scales: [1, 2, 4],
+        anchor_ratios: [0.5, 1.0, 2.0],
+        strides: [4, 8, 16, 32, 64],
+        pre_nms_topk_train: 2000,
+        post_nms_topk_train: 1000,
+        pre_nms_topk_test: 1000,
+        post_nms_topk_test: 1000,
+        nms_thresh: 0.7,
+        min_box_size: 0.0,
+        pos_iou: 0.7,
+        neg_iou: 0.3,
+        min_pos_iou: 0.3,
+        match_low_quality: true,
+        gt_max_assign_all: true,
+        samples_per_img: 256,
+        pos_fraction: 0.5,
+        beta: 0.0
+      },
+      roi: {
+        pool_size: 7,
+        sampling_ratio: 0,
+        featmap_strides: [4, 8, 16, 32]
+      },
+      train: {
+        pos_iou: 0.5,
+        neg_iou: 0.5,
+        samples_per_img: 512,
+        pos_fraction: 0.25
+      },
+      test: {
+        score_thresh: 0.05,
+        nms_iou: 0.5,
+        max_dets: 100,
+        mask_threshold: 0.5
+      },
+      bbox_head: {
+        hidden_dim: 1024,
+        loss: smooth_l1,
+        beta: 0.0,
+        train_on_pred_boxes: true,
+        class_agnostic: false
+      },
+      pointrend: {
+        coarse_pool_resolution: 14,
+        coarse_conv_dim: 256,
+        coarse_fc_dim: 1024,
+        coarse_num_fcs: 2,
+        coarse_output_resolution: 7,
+        point_hidden_dim: 256,
+        point_num_fcs: 3,
+        coarse_pred_each_layer: true,
+        train_num_points: 196,
+        oversample_ratio: 3.0,
+        importance_sample_ratio: 0.75,
+        subdivision_steps: 5,
+        subdivision_num_points: 784,
+        scale_factor: 2
+      }
+    }]]

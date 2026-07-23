@@ -1328,6 +1328,20 @@ class FPN(BaseNeck):
                         dcn=self._dcn("extra", i),
                     )
                 )
+            weight_init = cfg.get("weight_init")
+            if weight_init not in {None, "default", "detectron2"}:
+                raise ValueError(
+                    "Reference FPN weight_init must be omitted, 'default', or 'detectron2', "
+                    f"received {weight_init!r}."
+                )
+            if weight_init == "detectron2":
+                for module in (*self.laterals, *self.smooth, *self.extra_convs):
+                    for layer in module.modules():
+                        if isinstance(layer, nn.Conv2d):
+                            # Detectron2 uses Caffe2 XavierFill for FPN convolutions.
+                            nn.init.kaiming_uniform_(layer.weight, a=1)
+                            if layer.bias is not None:
+                                nn.init.zeros_(layer.bias)
             self._fusions = nn.ModuleList()
             return
 

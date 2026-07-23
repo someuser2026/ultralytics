@@ -396,6 +396,20 @@ def test_probability_paste_empty_and_single_sigmoid_threshold():
     assert not binary[0, 0, 0]
 
 
+def test_probability_paste_handles_subnormal_width_without_nonfinite_sampling_grid():
+    from ultralytics.nn.modules.pointrend import paste_roi_probabilities
+
+    probabilities = paste_roi_probabilities(
+        torch.zeros(1, 1, 2, 2),
+        torch.tensor([[0.0, 1.0, torch.finfo(torch.float32).tiny / 2, 3.0]]),
+        (4, 4),
+    )
+
+    assert probabilities.shape == (1, 4, 4)
+    assert torch.isfinite(probabilities).all()
+    assert torch.count_nonzero(probabilities) == 0
+
+
 def test_mask2former_pointrend_joint_loss():
     from ultralytics.nn.modules import Mask2FormerHead
     from ultralytics.nn.modules.pointrend import configure_pointrend_from_yaml, configure_pointrend_training

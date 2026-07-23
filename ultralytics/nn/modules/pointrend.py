@@ -353,6 +353,11 @@ def paste_roi_probabilities(
         x0, y0, x1, y1 = chunk_boxes.unbind(dim=1)
         grid_x = (image_x[None] - x0[:, None]) / (x1 - x0)[:, None] * 2.0 - 1.0
         grid_y = (image_y[None] - y0[:, None]) / (y1 - y0)[:, None] * 2.0 - 1.0
+        # Extremely small but positive predicted boxes can overflow normalized coordinates.
+        # Any magnitude beyond the sampling domain is equivalently zero-padded, so cap it before
+        # entering grid_sample (which can crash in some CPU kernels on non-finite coordinates).
+        grid_x = torch.nan_to_num(grid_x, nan=2.0, posinf=2.0, neginf=-2.0).clamp_(-2.0, 2.0)
+        grid_y = torch.nan_to_num(grid_y, nan=2.0, posinf=2.0, neginf=-2.0).clamp_(-2.0, 2.0)
         grid = torch.stack(
             (
                 grid_x[:, None].expand(-1, h, -1),
@@ -767,11 +772,57 @@ def _pointrend_refiner(model: nn.Module) -> PointRendRefiner | None:
         return None
 
 
+def _is_self_contained_pointrend(refiner: nn.Module | None) -> bool:
+    """Return whether a branch owns its PointRend coarse, point, loss, and inference paths."""
+
+    return bool(refiner is not None and getattr(refiner, "self_contained_pointrend", False))
+
+
+def _self_contained_signature(refiner: nn.Module) -> tuple:
+    """Read the complete architecture signature exposed by a self-contained branch."""
+
+    signature = getattr(refiner, "architecture_signature", None)
+    if not callable(signature):
+        raise TypeError(
+            f"Self-contained PointRend branch {type(refiner).__name__} does not expose architecture_signature()."
+        )
+    return tuple(signature())
+
+
 def prepare_pointrend_weight_transfer(target_model: nn.Module, incoming_model: nn.Module) -> None:
     """Make PointRend topology compatible before intersecting incoming checkpoint tensors."""
 
     target_refiner = _pointrend_refiner(target_model)
     incoming_refiner = _pointrend_refiner(incoming_model)
+    target_self_contained = _is_self_contained_pointrend(target_refiner)
+    incoming_self_contained = _is_self_contained_pointrend(incoming_refiner)
+
+    if target_self_contained or incoming_self_contained:
+        if target_refiner is not None and not hasattr(target_refiner, "train_config"):
+            target_refiner.train_config = PointRendTrainConfig()
+        if incoming_refiner is None:
+            # Loading generic/base weights into a dedicated target is safe because tensor intersection
+            # cannot synthesize or partially attach a generic mask branch.
+            return
+        if target_refiner is None:
+            raise ValueError(
+                "A self-contained PointRend RCNN checkpoint requires a PointRendRCNNHead target; "
+                "it cannot be attached to a generic segmentation or Mask R-CNN head."
+            )
+        if target_self_contained != incoming_self_contained:
+            raise ValueError(
+                "PointRend checkpoint architectures are incompatible: a self-contained Detectron2-style "
+                "PointRend RCNN branch cannot be transferred to or from a generic adapter-based branch."
+            )
+        target_signature = _self_contained_signature(target_refiner)
+        incoming_signature = _self_contained_signature(incoming_refiner)
+        if target_signature != incoming_signature:
+            raise ValueError(
+                "Self-contained PointRend RCNN checkpoint architecture is incompatible with the target model. "
+                f"target={target_signature}, checkpoint={incoming_signature}."
+            )
+        return
+
     if target_refiner is not None:
         target_config = _model_config_from_refiner(target_refiner)
         target_refiner.model_config = target_config

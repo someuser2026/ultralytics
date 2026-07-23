@@ -54,12 +54,14 @@ class ResNetBackbone(nn.Module):
         weights: str | None = "DEFAULT",
         frozen_stages: int = 1,
         norm_eval: bool = True,
+        freeze_norm_affine: bool = False,
     ):
         super().__init__()
         import torchvision
 
         self.channels = [256, 512, 1024, 2048]
         self.norm_eval = norm_eval
+        self.freeze_norm_affine = bool(freeze_norm_affine)
         self.frozen_stages = frozen_stages
 
         weight_enum = None
@@ -105,6 +107,12 @@ class ResNetBackbone(nn.Module):
                 module.eval()
                 for p in module.parameters():
                     p.requires_grad = False
+        if self.freeze_norm_affine:
+            for module in self.modules():
+                if isinstance(module, nn.BatchNorm2d):
+                    module.eval()
+                    for parameter in module.parameters():
+                        parameter.requires_grad = False
 
     def train(self, mode: bool = True):
         super().train(mode)

@@ -139,6 +139,7 @@ from .neck import (
 from .legnet import LWEGNet
 from .hrvmamba import HRAdd, HRBottleneck, HRConv, HRFusion
 from .rcnn import CascadeMaskRCNNHead, MaskRCNNHead, OrientedRCNNHead, RotatedFasterRCNNHead
+from .pointrend_rcnn import PointRendRCNNHead
 from .rcnn_backbone import ResNetBackbone, UnravelNetBackbone
 from .mask2former import Mask2FormerHead
 from .pointrend import (
@@ -255,6 +256,7 @@ __all__ = (
     "UnravelNetBackbone",
     "MaskRCNNHead",
     "CascadeMaskRCNNHead",
+    "PointRendRCNNHead",
     "RotatedFasterRCNNHead",
     "OrientedRCNNHead",
     "ImagePoolingAttn",

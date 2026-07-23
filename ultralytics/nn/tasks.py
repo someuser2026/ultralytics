@@ -96,6 +96,7 @@ from ultralytics.nn.modules import (
     OrientedRCNNHead,
     MaskRCNNHead,
     CascadeMaskRCNNHead,
+    PointRendRCNNHead,
     ConvNeXtBlock,
     ConvNeXtStem,
     ConvNeXtDownsample,
@@ -2624,7 +2625,9 @@ def parse_model(d, ch, verbose=True):
             c2 = int(cfg_arg.get("mask_dim", cfg_arg.get("conv_dim", 256)))
         elif m in frozenset({RTDETRDecoder, RTDETRSegmentDecoder, RTDETROBBDecoder, RHINOOBBDecoder}):  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
-        elif m in frozenset({MaskRCNNHead, CascadeMaskRCNNHead, RotatedFasterRCNNHead, OrientedRCNNHead}):
+        elif m in frozenset(
+            {MaskRCNNHead, CascadeMaskRCNNHead, PointRendRCNNHead, RotatedFasterRCNNHead, OrientedRCNNHead}
+        ):
             head_ch = ch[f[0]] if isinstance(f, list) and len(f) == 1 and isinstance(ch[f[0]], list) else [ch[x] for x in f]
             args = [head_ch, *args]
             c2 = head_ch[0] if isinstance(head_ch, list) else head_ch
@@ -2733,7 +2736,21 @@ def parse_model(d, ch, verbose=True):
             c2 = ch[f]
 
         # Fixed: Move this outside ConvNeXtBlock handling and fix the condition
-        if m not in frozenset({ChannelSplit, ConvNeXtBlock, LWEGNet, Timm, ResNetBackbone, UnravelNetBackbone, MaskRCNNHead, CascadeMaskRCNNHead, RotatedFasterRCNNHead, OrientedRCNNHead}):
+        if m not in frozenset(
+            {
+                ChannelSplit,
+                ConvNeXtBlock,
+                LWEGNet,
+                Timm,
+                ResNetBackbone,
+                UnravelNetBackbone,
+                MaskRCNNHead,
+                CascadeMaskRCNNHead,
+                PointRendRCNNHead,
+                RotatedFasterRCNNHead,
+                OrientedRCNNHead,
+            }
+        ):
             # if m in {Segment, YOLOESegment}:
             #     print("[DEBUG] Segment sources f =", f)
             #     print("[DEBUG] Segment in-channels =", [ch[u] for u in f], flush=True)
@@ -2823,7 +2840,7 @@ def guess_model_task(model):
         m = cfg["head"][-1][-2].lower()  # output module name
         if m in {"classify", "classifier", "cls", "fc"}:
             return "classify"
-        if "segment" in m or "maskrcnn" in m or "mask2former" in m:
+        if "segment" in m or "maskrcnn" in m or "pointrendrcnn" in m or "mask2former" in m:
             return "segment"
         if "obb" in m or "rotatedfcos" in m or "orientedrcnn" in m or "rotatedfasterrcnn" in m:
             return "obb"
@@ -2845,7 +2862,18 @@ def guess_model_task(model):
             with contextlib.suppress(Exception):
                 return cfg2task(eval(x))
         for m in model.modules():
-            if isinstance(m, (Segment, Segment26, YOLOESegment, MaskRCNNHead, CascadeMaskRCNNHead, Mask2FormerHead)):
+            if isinstance(
+                m,
+                (
+                    Segment,
+                    Segment26,
+                    YOLOESegment,
+                    MaskRCNNHead,
+                    CascadeMaskRCNNHead,
+                    PointRendRCNNHead,
+                    Mask2FormerHead,
+                ),
+            ):
                 return "segment"
             elif isinstance(m, RTDETRSegmentDecoder):
                 return "segment"

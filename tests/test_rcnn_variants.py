@@ -18,7 +18,17 @@ RCNN_VARIANTS = {
     "mask_rcnn_r50_fpn_smallobj.yaml": ("MaskRCNNHead", "segment"),
     "cascade_mask_rcnn_r50_fpn.yaml": ("CascadeMaskRCNNHead", "segment"),
     "cascade_mask_rcnn_r50_fpn_smallobj.yaml": ("CascadeMaskRCNNHead", "segment"),
+    "pointrend_rcnn_r50_fpn_smallobj.yaml": ("PointRendRCNNHead", "segment"),
 }
+
+
+def _disable_test_only_pretrained_download(model_cfg):
+    """Keep architecture tests independent of local Torch Hub caches or network access."""
+    model_cfg = deepcopy(model_cfg)
+    for layer in model_cfg.get("backbone", []):
+        if layer[-2] == "ResNetBackbone" and len(layer[-1]) > 1 and layer[-1][1] == "DEFAULT":
+            layer[-1][1] = None
+    return model_cfg
 
 
 @pytest.mark.parametrize(("model_name", "expected"), RCNN_VARIANTS.items())
@@ -26,7 +36,7 @@ def test_rcnn_variant_yaml_parses(model_name, expected):
     from ultralytics.nn.tasks import parse_model, yaml_model_load
 
     head_name, _ = expected
-    model_cfg = yaml_model_load(RCNN_ROOT / model_name)
+    model_cfg = _disable_test_only_pretrained_download(yaml_model_load(RCNN_ROOT / model_name))
     model, save, backbone_layers, head_layers = parse_model(deepcopy(model_cfg), ch=3, verbose=False)
 
     assert len(model) > 0
@@ -37,15 +47,22 @@ def test_rcnn_variant_yaml_parses(model_name, expected):
 
 
 @pytest.mark.parametrize(("model_name", "expected"), RCNN_VARIANTS.items())
-def test_rcnn_variant_task_inference(model_name, expected):
+def test_rcnn_variant_task_inference(model_name, expected, tmp_path):
     from ultralytics import RCNN, YOLO
     from ultralytics.nn.tasks import guess_model_task, yaml_model_load
+    from ultralytics.utils import YAML
 
     _, task = expected
     model_path = RCNN_ROOT / model_name
     cfg = yaml_model_load(model_path)
 
     assert guess_model_task(cfg) == task
+    if any(
+        layer[-2] == "ResNetBackbone" and len(layer[-1]) > 1 and layer[-1][1] == "DEFAULT"
+        for layer in cfg.get("backbone", [])
+    ):
+        model_path = tmp_path / model_name
+        YAML.save(model_path, _disable_test_only_pretrained_download(cfg))
 
     model = RCNN(str(model_path))
     assert model.task == task

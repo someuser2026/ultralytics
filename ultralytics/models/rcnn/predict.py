@@ -8,6 +8,7 @@ import torch
 from ultralytics.engine.results import Results
 from ultralytics.models.yolo.obb.predict import OBBPredictor
 from ultralytics.models.yolo.segment.predict import SegmentationPredictor
+from ultralytics.nn.modules.pointrend import paste_roi_probabilities
 from ultralytics.utils import DEFAULT_CFG, ops
 
 _RCNN_MASK_THRESHOLD = 0.5
@@ -35,8 +36,25 @@ class RCNNSegmentationPredictor(SegmentationPredictor):
         else:
             det = boxes.new_zeros((0, 6))
 
+        roi_logits = pred.get("mask_roi_logits")
         masks = pred.get("masks")
-        if masks is not None and masks.numel():
+        if roi_logits is not None:
+            if roi_logits.shape[0] != det.shape[0]:
+                raise ValueError(
+                    "Dedicated PointRend RCNN output has mismatched detection and ROI-mask counts: "
+                    f"{det.shape[0]} detections versus {roi_logits.shape[0]} masks."
+                )
+            if roi_logits.numel():
+                probabilities = paste_roi_probabilities(
+                    roi_logits,
+                    boxes,
+                    orig_img.shape[:2],
+                    max_chunk_size=8,
+                )
+                masks = probabilities >= _RCNN_MASK_THRESHOLD
+            else:
+                masks = boxes.new_zeros((0, orig_img.shape[0], orig_img.shape[1]), dtype=torch.bool)
+        elif masks is not None and masks.numel():
             masks = ops.scale_image(
                 masks.permute(1, 2, 0).contiguous().float().cpu().numpy(),
                 orig_img.shape,
