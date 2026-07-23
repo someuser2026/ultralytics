@@ -208,10 +208,10 @@ class RTDETRSegmentPredictor(RTDETRPredictor):
                         fine,
                         tuple(img.shape[2:]),
                     )
-                    masks = adapter.refined_image_logits(instances)
+                    masks = adapter.refined_image_probabilities(instances)
                     if self.args.retina_masks:
                         masks = ops.scale_masks(masks[None], orig_img.shape[:2])[0]
-                    masks = masks > 0
+                    masks = masks >= 0.5
                     pred[:, [0, 2]] *= ow
                     pred[:, [1, 3]] *= oh
                 elif self.args.retina_masks:

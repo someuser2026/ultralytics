@@ -158,6 +158,10 @@ class SegmentationPredictor(DetectionPredictor):
                     pointrend_features,
                     tuple(img.shape[2:]),
                 )
+                masks = adapter.refined_image_logits(instances)
+                if self.args.retina_masks:
+                    masks = ops.scale_masks(masks[None], orig_img.shape[:2])[0]
+                masks = masks > 0
             else:
                 instances = adapter.from_coefficients(
                     pred[:, 6:],
@@ -167,10 +171,10 @@ class SegmentationPredictor(DetectionPredictor):
                     pointrend_features,
                     tuple(img.shape[2:]),
                 )
-            masks = adapter.refined_image_logits(instances)
-            if self.args.retina_masks:
-                masks = ops.scale_masks(masks[None], orig_img.shape[:2])[0]
-            masks = masks > 0
+                mask_probabilities = adapter.refined_image_probabilities(instances)
+                if self.args.retina_masks:
+                    mask_probabilities = ops.scale_masks(mask_probabilities[None], orig_img.shape[:2])[0]
+                masks = mask_probabilities >= 0.5
             pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
         elif self.args.retina_masks:
             pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)

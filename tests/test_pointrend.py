@@ -87,6 +87,63 @@ def test_uncertain_point_selection_prefers_logits_near_zero():
     assert torch.allclose(coords[0, 0], torch.tensor([0.25, 0.75]))
 
 
+def test_point_head_uses_msra_hidden_initialization_and_small_predictor():
+    from ultralytics.nn.modules.pointrend import PointRendPointHead
+
+    torch.manual_seed(0)
+    head = PointRendPointHead(fine_channels=32, hidden_channels=128, num_fcs=3)
+    hidden_stds = torch.tensor([layer.weight.std().item() for layer in head.fcs])
+    predictor_std = head.fc_logits.weight.std().item()
+
+    assert torch.all(hidden_stds > 0.05)
+    assert 0.0007 < predictor_std < 0.0013
+    assert hidden_stds.min() > predictor_std * 50
+    assert all(torch.count_nonzero(layer.bias) == 0 for layer in [*head.fcs, head.fc_logits])
+
+
+def test_instance_refinement_starts_with_dense_point_grid(monkeypatch):
+    from ultralytics.nn.modules.pointrend import (
+        PointRendConfig,
+        PointRendInstances,
+        PointRendRefiner,
+        PointRendTrainConfig,
+    )
+
+    cfg = PointRendConfig.from_yaml(
+        {
+            "pointrend": _pointrend_block(
+                coarse_resolution=4,
+                subdivision_steps=2,
+                subdivision_num_points=3,
+            )
+        }
+    )
+    refiner = PointRendRefiner([4], cfg, PointRendTrainConfig.from_args(_point_args()))
+    instances = PointRendInstances(
+        coarse_logits=torch.randn(1, 1, 4, 4),
+        boxes=torch.tensor([[1.0, 1.0, 15.0, 15.0]]),
+        batch_indices=torch.zeros(1, dtype=torch.long),
+        fine_features=refiner.project_features([torch.randn(1, 4, 8, 8)]),
+        image_shape=(16, 16),
+    )
+    calls = []
+    original = refiner.predict_points
+
+    def record_points(current_instances, point_coords):
+        calls.append(point_coords.shape[1])
+        return original(current_instances, point_coords)
+
+    monkeypatch.setattr(refiner, "predict_points", record_points)
+    dense = refiner.refine(instances)
+    assert calls == [16, 3, 3]
+    assert dense.shape == (1, 1, 16, 16)
+
+    calls.clear()
+    coarse_first = refiner.refine_from_coarse(instances)
+    assert calls == [3, 3]
+    assert coarse_first.shape == (1, 1, 16, 16)
+
+
 def test_pointrend_refinement_shapes_and_gradients():
     from ultralytics.nn.modules.pointrend import (
         PointRendConfig,
@@ -120,6 +177,55 @@ def test_pointrend_refinement_shapes_and_gradients():
     assert source.grad is not None and source.grad.abs().sum() > 0
     assert coarse.grad is not None and coarse.grad.abs().sum() > 0
     assert refiner.point_head.fc_logits.weight.grad.abs().sum() > 0
+
+
+def test_frozen_mode_detaches_base_inputs_but_trains_every_pointrend_stage():
+    from ultralytics.nn.modules.pointrend import (
+        PointRendConfig,
+        PointRendInstances,
+        PointRendRefiner,
+        PointRendTrainConfig,
+    )
+
+    torch.manual_seed(0)
+    cfg = PointRendConfig.from_yaml({"pointrend": _pointrend_block()})
+    train_cfg = PointRendTrainConfig.from_args(_point_args(pointrend_mode="frozen"))
+    refiner = PointRendRefiner([4, 6], cfg, train_cfg)
+    raw_features = [
+        torch.randn(1, 4, 16, 16, requires_grad=True),
+        torch.randn(1, 6, 8, 8, requires_grad=True),
+    ]
+    projected = refiner.project_features(raw_features)
+    coarse = torch.randn(1, 1, 8, 8, requires_grad=True)
+    gt = torch.zeros(1, 1, 32, 32)
+    gt[:, :, 6:27, 9:25] = 1
+    instances = PointRendInstances(
+        coarse_logits=coarse,
+        boxes=torch.tensor([[3.0, 4.0, 29.0, 30.0]], requires_grad=True),
+        batch_indices=torch.zeros(1, dtype=torch.long),
+        fine_features=projected,
+        image_shape=(32, 32),
+        gt_masks=gt,
+    ).detached_base()
+
+    refiner.point_loss(instances).backward()
+
+    assert coarse.grad is None
+    assert all(feature.grad is None for feature in raw_features)
+    assert all(
+        projection.weight.grad is not None
+        and torch.isfinite(projection.weight.grad).all()
+        and projection.weight.grad.abs().sum() > 0
+        for projection in refiner.projections
+    )
+    assert all(
+        layer.weight.grad is not None
+        and torch.isfinite(layer.weight.grad).all()
+        and layer.weight.grad.abs().sum() > 0
+        for layer in refiner.point_head.fcs
+    )
+    predictor_grad = refiner.point_head.fc_logits.weight.grad
+    assert predictor_grad is not None and torch.isfinite(predictor_grad).all() and predictor_grad.abs().sum() > 0
 
 
 @pytest.mark.parametrize("mode", ["joint", "frozen"])
@@ -175,6 +281,119 @@ def test_pointrend_adapter_empty_instances():
     )
 
     assert refiner.refine(instances).shape == (0, 1, 32, 32)
+
+
+def test_standard_and_mask2former_adapters_use_separate_refinement_paths():
+    from ultralytics.nn.modules.pointrend import (
+        Mask2FormerPointRendAdapter,
+        PointRendAdapter,
+        PointRendInstances,
+    )
+
+    class RefinerStub:
+        def __init__(self):
+            self.calls = []
+
+        def refine(self, instances):
+            self.calls.append("dense")
+            return instances.coarse_logits.new_full((1, 1, 2, 2), 2.0)
+
+        def refine_from_coarse(self, instances):
+            self.calls.append("coarse")
+            return instances.coarse_logits.new_full((1, 1, 2, 2), -2.0)
+
+    refiner = RefinerStub()
+    instances = PointRendInstances(
+        coarse_logits=torch.zeros(1, 1, 2, 2),
+        boxes=torch.tensor([[0.0, 0.0, 2.0, 2.0]]),
+        batch_indices=torch.zeros(1, dtype=torch.long),
+        fine_features=[],
+        image_shape=(2, 2),
+    )
+
+    probabilities = PointRendAdapter(refiner).refined_image_probabilities(instances)
+    legacy_logits = Mask2FormerPointRendAdapter(refiner).refined_image_logits(instances)
+
+    assert refiner.calls == ["dense", "coarse"]
+    assert torch.allclose(probabilities, torch.full_like(probabilities, torch.sigmoid(torch.tensor(2.0))))
+    assert torch.equal(legacy_logits, torch.full_like(legacy_logits, -2.0))
+
+
+def _reference_paste_roi_probabilities(roi_logits, boxes, image_shape):
+    import torch.nn.functional as F
+
+    h, w = image_shape
+    outputs = []
+    image_y = torch.arange(h, dtype=roi_logits.dtype, device=roi_logits.device) + 0.5
+    image_x = torch.arange(w, dtype=roi_logits.dtype, device=roi_logits.device) + 0.5
+    for mask, box in zip(roi_logits.sigmoid(), boxes):
+        if not torch.isfinite(box).all() or box[2] <= box[0] or box[3] <= box[1]:
+            outputs.append(mask.new_zeros((h, w)))
+            continue
+        grid_x = (image_x - box[0]) / (box[2] - box[0]) * 2.0 - 1.0
+        grid_y = (image_y - box[1]) / (box[3] - box[1]) * 2.0 - 1.0
+        grid = torch.stack(
+            (grid_x[None].expand(h, -1), grid_y[:, None].expand(-1, w)),
+            dim=-1,
+        )
+        outputs.append(F.grid_sample(mask[None], grid[None], align_corners=False)[0, 0])
+    return torch.stack(outputs) if outputs else roi_logits.new_zeros((0, h, w))
+
+
+def test_continuous_probability_paste_matches_reference_and_chunking():
+    from ultralytics.nn.modules.pointrend import paste_roi_probabilities
+
+    torch.manual_seed(0)
+    logits = torch.randn(4, 1, 5, 5)
+    boxes = torch.tensor(
+        [
+            [1.25, 0.75, 7.6, 6.4],
+            [-2.0, 2.25, 4.5, 9.0],
+            [3.0, 3.0, 3.0, 6.0],
+            [float("nan"), 0.0, 4.0, 4.0],
+        ]
+    )
+    expected = _reference_paste_roi_probabilities(logits, boxes, (7, 9))
+    chunked = paste_roi_probabilities(logits, boxes, (7, 9), max_chunk_size=1)
+    batched = paste_roi_probabilities(logits, boxes, (7, 9), max_chunk_size=4)
+
+    assert torch.allclose(chunked, expected)
+    assert torch.allclose(batched, expected)
+    assert torch.count_nonzero(chunked[2:]) == 0
+    assert torch.isfinite(chunked).all()
+
+
+def test_continuous_probability_paste_preserves_fractional_box_motion():
+    from ultralytics.nn.modules.pointrend import _paste_roi_logits_legacy, paste_roi_probabilities
+
+    logits = torch.linspace(-4.0, 4.0, 16).reshape(1, 1, 4, 4)
+    box_a = torch.tensor([[1.1, 1.1, 6.1, 6.1]])
+    box_b = torch.tensor([[1.4, 1.4, 6.4, 6.4]])
+
+    legacy_a = _paste_roi_logits_legacy(logits, box_a, (8, 8))
+    legacy_b = _paste_roi_logits_legacy(logits, box_b, (8, 8))
+    aligned_a = paste_roi_probabilities(logits, box_a, (8, 8))
+    aligned_b = paste_roi_probabilities(logits, box_b, (8, 8))
+
+    assert torch.equal(legacy_a, legacy_b)
+    assert not torch.allclose(aligned_a, aligned_b)
+
+
+def test_probability_paste_empty_and_single_sigmoid_threshold():
+    from ultralytics.nn.modules.pointrend import paste_roi_probabilities
+
+    empty = paste_roi_probabilities(torch.zeros(0, 1, 2, 2), torch.zeros(0, 4), (4, 5))
+    probabilities = paste_roi_probabilities(
+        torch.zeros(1, 1, 2, 2),
+        torch.tensor([[1.0, 1.0, 3.0, 3.0]]),
+        (4, 4),
+    )
+    binary = probabilities >= 0.5
+
+    assert empty.shape == (0, 4, 5)
+    assert probabilities[0, 1:3, 1:3].eq(0.5).all()
+    assert binary[0, 1:3, 1:3].all()
+    assert not binary[0, 0, 0]
 
 
 def test_mask2former_pointrend_joint_loss():

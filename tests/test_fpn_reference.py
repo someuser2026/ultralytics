@@ -74,5 +74,4 @@ def test_all_rcnn_family_yamls_select_reference_fpn():
         assert fpn_layers, f"{path} has an RCNN head but no FPN layer"
         assert all(layer[3][1].get("implementation") == "reference" for layer in fpn_layers), path
         checked += 1
-    assert checked == 12
-
+    assert checked == 14

@@ -1,20 +1,24 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-# LEGNet-small Rotated FCOS model with P3/8 - P7/128 outputs
+# ResNet-50 + Rotated FCOS benchmark model with canonical P3-P7 features.
+# Rotated FCOS is anchor-free, so the RCNN-only [1, 2, 4] anchor reduction does not apply here.
 
 nc: 80
 angle_mode: le90
 
 backbone:
-  # [from, repeats, module, args]
-  - [-1, 1, LWEGNet, [64, [1, 4, 4, 2], 2.0, 0.1]] # 0 -> [P2, P3, P4, P5]
+  - [-1, 1, ResNetBackbone, [resnet50, null, 1, true]] # 0 -> [C2, C3, C4, C5]
+  - [0, 1, Index, [1]] # 1-C3/8
+  - [0, 1, Index, [2]] # 2-C4/16
+  - [0, 1, Index, [3]] # 3-C5/32
 
 head:
-  - [0, 1, Index, [1]] # 1-P3/8
-  - [0, 1, Index, [2]] # 2-P4/16
-  - [0, 1, Index, [3]] # 3-P5/32
-
-  - [[1, 2, 3], 1, FPN, [256, {implementation: reference, num_outs: 5, add_extra_convs: "on_output", relu_before_extra_convs: true}]] # 4
+  - [[1, 2, 3], 1, FPN, [256, {
+      implementation: reference,
+      num_outs: 5,
+      add_extra_convs: "on_output",
+      relu_before_extra_convs: true
+    }]] # 4 -> [P3, P4, P5, P6, P7]
 
   - [4, 1, Index, [0]] # 5-P3/8
   - [4, 1, Index, [1]] # 6-P4/16

@@ -166,13 +166,13 @@ class PointRendInstances:
     source_indices: Tensor | None = None
 
     def detached_base(self) -> "PointRendInstances":
-        """Detach all base-model tensors while retaining PointRend trainability."""
+        """Detach base predictions while preserving gradients through projected PointRend features."""
 
         return PointRendInstances(
             coarse_logits=self.coarse_logits.detach(),
             boxes=self.boxes.detach(),
             batch_indices=self.batch_indices,
-            fine_features=[x.detach() for x in self.fine_features],
+            fine_features=self.fine_features,
             image_shape=self.image_shape,
             gt_masks=self.gt_masks,
             source_indices=self.source_indices,
@@ -279,8 +279,8 @@ def crop_logits_to_rois(
     return point_sample(full_logits, image_grid).reshape(n, full_logits.shape[1], resolution, resolution)
 
 
-def paste_roi_logits(roi_logits: Tensor, boxes: Tensor, image_shape: tuple[int, int]) -> Tensor:
-    """Paste refined ROI logits into input-image canvases for inference."""
+def _paste_roi_logits_legacy(roi_logits: Tensor, boxes: Tensor, image_shape: tuple[int, int]) -> Tensor:
+    """Paste ROI logits with the original rounded-box implementation used by Mask2Former."""
 
     n = roi_logits.shape[0]
     h, w = image_shape
@@ -301,6 +301,76 @@ def paste_roi_logits(roi_logits: Tensor, boxes: Tensor, image_shape: tuple[int, 
     return torch.stack(canvases)
 
 
+def paste_roi_probabilities(
+    roi_logits: Tensor,
+    boxes: Tensor,
+    image_shape: tuple[int, int],
+    *,
+    max_chunk_size: int | None = None,
+) -> Tensor:
+    """Paste sigmoid ROI probabilities at continuous box coordinates using image pixel centers."""
+
+    if roi_logits.ndim != 4 or roi_logits.shape[1] != 1:
+        raise ValueError(f"Expected ROI logits shaped (N, 1, H, W), got {tuple(roi_logits.shape)}.")
+    if boxes.ndim != 2 or boxes.shape[1] != 4 or boxes.shape[0] != roi_logits.shape[0]:
+        raise ValueError(
+            f"Expected one xyxy box per ROI logit, got boxes={tuple(boxes.shape)} "
+            f"and logits={tuple(roi_logits.shape)}."
+        )
+    if max_chunk_size is not None and max_chunk_size <= 0:
+        raise ValueError(f"max_chunk_size must be positive when provided, got {max_chunk_size}.")
+
+    n = roi_logits.shape[0]
+    h, w = (int(image_shape[0]), int(image_shape[1]))
+    if h < 0 or w < 0:
+        raise ValueError(f"image_shape must be non-negative, got {image_shape}.")
+    if n == 0:
+        return roi_logits.new_zeros((0, h, w))
+
+    sample_dtype = (
+        torch.float32
+        if roi_logits.device.type == "cpu" and roi_logits.dtype in {torch.float16, torch.bfloat16}
+        else roi_logits.dtype
+    )
+    probabilities = roi_logits.to(dtype=sample_dtype).sigmoid()
+    sample_boxes = boxes.to(device=roi_logits.device, dtype=sample_dtype)
+    valid = torch.isfinite(sample_boxes).all(dim=1)
+    valid &= sample_boxes[:, 2] > sample_boxes[:, 0]
+    valid &= sample_boxes[:, 3] > sample_boxes[:, 1]
+    valid_indices = valid.nonzero(as_tuple=False).flatten()
+    canvases = probabilities.new_zeros((n, h, w))
+    if valid_indices.numel() == 0 or h == 0 or w == 0:
+        return canvases.to(dtype=roi_logits.dtype)
+
+    if max_chunk_size is None:
+        bytes_per_instance = max(h * w * probabilities.element_size() * 3, 1)
+        max_chunk_size = max(1, min(64, (256 * 1024**2) // bytes_per_instance))
+
+    image_y = torch.arange(h, device=roi_logits.device, dtype=sample_dtype) + 0.5
+    image_x = torch.arange(w, device=roi_logits.device, dtype=sample_dtype) + 0.5
+    for indices in valid_indices.split(max_chunk_size):
+        chunk_boxes = sample_boxes.index_select(0, indices)
+        x0, y0, x1, y1 = chunk_boxes.unbind(dim=1)
+        grid_x = (image_x[None] - x0[:, None]) / (x1 - x0)[:, None] * 2.0 - 1.0
+        grid_y = (image_y[None] - y0[:, None]) / (y1 - y0)[:, None] * 2.0 - 1.0
+        grid = torch.stack(
+            (
+                grid_x[:, None].expand(-1, h, -1),
+                grid_y[:, :, None].expand(-1, -1, w),
+            ),
+            dim=-1,
+        )
+        pasted = F.grid_sample(
+            probabilities.index_select(0, indices),
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        )[:, 0]
+        canvases = canvases.index_copy(0, indices, pasted)
+    return canvases.to(dtype=roi_logits.dtype)
+
+
 class PointRendPointHead(nn.Module):
     """Shared MLP that predicts a binary logit at each sampled point."""
 
@@ -312,9 +382,11 @@ class PointRendPointHead(nn.Module):
             self.fcs.append(nn.Conv1d(in_channels, hidden_channels, 1))
             in_channels = hidden_channels + 1
         self.fc_logits = nn.Conv1d(in_channels, 1, 1)
-        for layer in [*self.fcs, self.fc_logits]:
-            nn.init.normal_(layer.weight, std=0.001)
+        for layer in self.fcs:
+            nn.init.kaiming_normal_(layer.weight, mode="fan_out", nonlinearity="relu")
             nn.init.zeros_(layer.bias)
+        nn.init.normal_(self.fc_logits.weight, std=0.001)
+        nn.init.zeros_(self.fc_logits.bias)
 
     def forward(self, fine_features: Tensor, coarse_features: Tensor) -> Tensor:
         """Predict point logits from sampled fine and coarse features."""
@@ -353,6 +425,8 @@ class PointRendRefiner(nn.Module):
 
         if len(features) != len(self.projections):
             raise ValueError(f"Expected {len(self.projections)} PointRend features, got {len(features)}.")
+        if self.train_config.mode == "frozen":
+            features = [feature.detach() for feature in features]
         return [projection(feature) for projection, feature in zip(self.projections, features)]
 
     def _sample_fine_features(self, instances: PointRendInstances, point_coords: Tensor) -> Tensor:
@@ -386,13 +460,9 @@ class PointRendRefiner(nn.Module):
         targets = point_sample(instances.gt_masks.float(), image_points)[:, 0]
         return F.binary_cross_entropy_with_logits(point_logits, targets)
 
-    def refine(self, instances: PointRendInstances) -> Tensor:
-        """Iteratively upsample masks and replace their most uncertain logits."""
+    def _subdivide(self, instances: PointRendInstances, refined: Tensor) -> Tensor:
+        """Upsample a mask grid and replace its most uncertain logits at each subdivision."""
 
-        refined = instances.coarse_logits
-        if refined.shape[0] == 0:
-            scale = self.model_config.scale_factor**self.model_config.subdivision_steps
-            return refined.new_zeros((0, 1, refined.shape[-2] * scale, refined.shape[-1] * scale))
         for _ in range(self.model_config.subdivision_steps):
             refined = F.interpolate(
                 refined, scale_factor=self.model_config.scale_factor, mode="bilinear", align_corners=False
@@ -405,6 +475,32 @@ class PointRendRefiner(nn.Module):
             flat = flat.scatter(2, indices[:, None].expand(-1, flat.shape[1], -1), point_logits)
             refined = flat.reshape_as(refined)
         return refined
+
+    def refine(self, instances: PointRendInstances) -> Tensor:
+        """Run instance PointRend from a dense point-head grid, then perform adaptive subdivisions."""
+
+        n = instances.coarse_logits.shape[0]
+        resolution = self.model_config.coarse_resolution
+        if n == 0:
+            scale = self.model_config.scale_factor**self.model_config.subdivision_steps
+            return instances.coarse_logits.new_zeros((0, 1, resolution * scale, resolution * scale))
+        point_coords = _regular_roi_grid(
+            n,
+            resolution,
+            instances.coarse_logits.device,
+            instances.coarse_logits.dtype,
+        )
+        refined = self.predict_points(instances, point_coords).reshape(n, 1, resolution, resolution)
+        return self._subdivide(instances, refined)
+
+    def refine_from_coarse(self, instances: PointRendInstances) -> Tensor:
+        """Preserve the coarse-first refinement sequence used by the Mask2Former integration."""
+
+        refined = instances.coarse_logits
+        if refined.shape[0] == 0:
+            scale = self.model_config.scale_factor**self.model_config.subdivision_steps
+            return refined.new_zeros((0, 1, refined.shape[-2] * scale, refined.shape[-1] * scale))
+        return self._subdivide(instances, refined)
 
 
 class PointRendAdapter:
@@ -439,10 +535,21 @@ class PointRendAdapter:
         )
         return instances.detached_base() if self.refiner.train_config.mode == "frozen" else instances
 
-    def refined_image_logits(self, instances: PointRendInstances) -> Tensor:
-        """Refine ROI masks and paste logits into input-image coordinates."""
+    def refined_image_probabilities(self, instances: PointRendInstances) -> Tensor:
+        """Refine ROI masks and paste sigmoid probabilities into input-image coordinates."""
 
-        return paste_roi_logits(self.refiner.refine(instances), instances.boxes, instances.image_shape)
+        return paste_roi_probabilities(
+            self.refiner.refine(instances),
+            instances.boxes,
+            instances.image_shape,
+        )
+
+    def refined_image_logits(self, instances: PointRendInstances) -> Tensor:
+        """Return logits derived from the reference-aligned image probabilities."""
+
+        probabilities = self.refined_image_probabilities(instances)
+        eps = max(float(torch.finfo(probabilities.dtype).eps), 1e-6)
+        return torch.logit(probabilities.clamp(min=eps, max=1.0 - eps))
 
 
 class YOLOPrototypePointRendAdapter(PointRendAdapter):
@@ -481,6 +588,15 @@ class RTDETRPrototypePointRendAdapter(YOLOPrototypePointRendAdapter):
 
 class Mask2FormerPointRendAdapter(PointRendAdapter):
     """Adapter for Mask2Former query mask logits."""
+
+    def refined_image_logits(self, instances: PointRendInstances) -> Tensor:
+        """Preserve Mask2Former's coarse-first refinement and rounded-box logit pasting."""
+
+        return _paste_roi_logits_legacy(
+            self.refiner.refine_from_coarse(instances),
+            instances.boxes,
+            instances.image_shape,
+        )
 
 
 class RCNNPointRendAdapter(PointRendAdapter):

@@ -15,7 +15,7 @@ head:
   - [0, 1, Index, [2]] # 3-P4/16
   - [0, 1, Index, [3]] # 4-P5/32
 
-  - [[1, 2, 3, 4], 1, FPN, [256, {num_outs: 5, add_extra_convs: "on_output", relu_before_extra_convs: true}]] # 5
+  - [[1, 2, 3, 4], 1, FPN, [256, {implementation: reference, num_outs: 5, add_extra_convs: "on_output", relu_before_extra_convs: true}]] # 5
 
   - [5, 1, Index, [0]] # 6-P2/4
   - [5, 1, Index, [1]] # 7-P3/8

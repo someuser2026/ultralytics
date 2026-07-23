@@ -350,7 +350,7 @@ class RTDETRSegmentValidator(SegmentationValidator, RTDETRValidator):
                     fine,
                     imgsz,
                 )
-                masks = adapter.refined_image_logits(instances) > 0
+                masks = adapter.refined_image_probabilities(instances) >= 0.5
             else:
                 masks = (
                     self.process(proto_i, pred[:, 6:], pred[:, :4], shape=imgsz)

@@ -1200,7 +1200,7 @@ class _AxisRCNNBase(nn.Module):
                             fine_features=fine_features,
                             image_shape=image_shape,
                         )
-                        pred_masks = adapter.refined_image_logits(instances) > 0
+                        pred_masks = adapter.refined_image_probabilities(instances) >= 0.5
                     elif self.cascade:
                         pred_masks = _paste_mask_probabilities(
                             mask_probs, pred_boxes, image_shape, _mask_threshold_from_cfg(self.cfg)

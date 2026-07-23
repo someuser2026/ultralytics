@@ -8,8 +8,10 @@ import torch
 
 RCNN_ROOT = Path(__file__).resolve().parents[1] / "ultralytics" / "cfg" / "models" / "rcnn"
 RCNN_VARIANTS = {
+    "oriented_rcnn_legnet_small_fpn_le90_smallobj.yaml": ("OrientedRCNNHead", "obb"),
     "oriented_rcnn_r50_fpn_le90.yaml": ("OrientedRCNNHead", "obb"),
     "oriented_rcnn_r50_fpn_le90_smallobj.yaml": ("OrientedRCNNHead", "obb"),
+    "rotated_faster_rcnn_r50_fpn_le90_smallobj.yaml": ("RotatedFasterRCNNHead", "obb"),
     "rotated_faster_rcnn_unravelnet_fpn_le90.yaml": ("RotatedFasterRCNNHead", "obb"),
     "rotated_faster_rcnn_unravelnet_fpn_le90_smallobj.yaml": ("RotatedFasterRCNNHead", "obb"),
     "mask_rcnn_r50_fpn.yaml": ("MaskRCNNHead", "segment"),
@@ -52,6 +54,18 @@ def test_rcnn_variant_task_inference(model_name, expected):
     generic_model = YOLO(str(model_path))
     assert generic_model.__class__.__name__ == "RCNN"
     assert generic_model.task == task
+
+
+def test_smallobj_rcnn_variants_use_reduced_anchor_scales():
+    """Every explicit small-object RCNN config should use the requested [1, 2, 4] RPN scales."""
+    from ultralytics.nn.tasks import yaml_model_load
+
+    smallobj_configs = sorted(RCNN_ROOT.glob("*smallobj.yaml"))
+    assert smallobj_configs
+    for model_path in smallobj_configs:
+        cfg = yaml_model_load(model_path)
+        head_cfg = cfg["head"][-1][3][1]
+        assert head_cfg["rpn"]["anchor_scales"] == [1, 2, 4], model_path
 
 
 def test_rcnn_bbox_coders_roundtrip():
@@ -922,7 +936,9 @@ def _metadata_enabled_rcnn_cfg():
     [
         ("mask_rcnn_r50_fpn.yaml", "segment"),
         ("cascade_mask_rcnn_r50_fpn.yaml", "segment"),
+        ("oriented_rcnn_legnet_small_fpn_le90_smallobj.yaml", "obb"),
         ("oriented_rcnn_r50_fpn_le90.yaml", "obb"),
+        ("rotated_faster_rcnn_r50_fpn_le90_smallobj.yaml", "obb"),
         ("rotated_faster_rcnn_unravelnet_fpn_le90.yaml", "obb"),
     ],
 )

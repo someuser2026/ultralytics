@@ -174,6 +174,7 @@ class SegmentationValidator(DetectionValidator):
                         fine,
                         imgsz,
                     )
+                    pred["masks"] = adapter.refined_image_logits(instances) > 0
                 else:
                     instances = adapter.from_coefficients(
                         coefficient,
@@ -183,7 +184,7 @@ class SegmentationValidator(DetectionValidator):
                         fine,
                         imgsz,
                     )
-                pred["masks"] = adapter.refined_image_logits(instances) > 0
+                    pred["masks"] = adapter.refined_image_probabilities(instances) >= 0.5
             else:
                 pred["masks"] = (
                     self.process(proto[i], coefficient, pred["bboxes"], shape=imgsz)

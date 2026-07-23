@@ -18,6 +18,8 @@ MAMBA_BUILD_CASES = (
     ("mamba-hrnet-obb-shoreaux.yaml", "obb"),
     ("mamba-hrnet-seg.yaml", "segment"),
     ("mamba-hrnet-seg-dvss.yaml", "segment"),
+    ("mamba-yolo-B-hrnet-seg.yaml", "segment"),
+    ("mamba-yolo-B-hrnet-seg-pointrend.yaml", "segment"),
     ("yolo-mamba-seg-edgevss-backbone.yaml", "segment"),
     ("yolo-mamba-seg-edgevss-all.yaml", "segment"),
     ("mamba-hrnet-seg-edgevss.yaml", "segment"),
@@ -49,6 +51,20 @@ def test_mamba_configs_are_single_class():
         assert model_cfg["nc"] == 1
 
 
+@pytest.mark.parametrize(
+    "model_name",
+    ("mamba-yolo-B-hrnet-seg.yaml", "mamba-yolo-B-hrnet-seg-pointrend.yaml"),
+)
+def test_mamba_hrnet_b_configs_select_b_scale(model_name):
+    """B-specific Mamba-HRNet filenames should select the B compound scale."""
+    from ultralytics.nn.tasks import yaml_model_load
+
+    model_cfg = yaml_model_load(MAMBA_ROOT / model_name)
+
+    assert model_cfg["scale"] == "B"
+    assert model_cfg["scales"]["B"] == [0.33, 0.50, 1024]
+
+
 @pytest.mark.skipif(not MAMBA_TEST_READY, reason="cv2 and einops are required to import Mamba-YOLO blocks")
 @pytest.mark.parametrize(("model_name", "task"), MAMBA_BUILD_CASES)
 def test_mamba_model_construction_uses_build_only_cpu_fallback(model_name, task):
@@ -59,7 +75,14 @@ def test_mamba_model_construction_uses_build_only_cpu_fallback(model_name, task)
 
     expected_stride = (
         torch.tensor([4.0, 8.0, 16.0, 32.0])
-        if model_name in {"mamba-hrnet-seg.yaml", "mamba-hrnet-seg-dvss.yaml", "mamba-hrnet-seg-edgevss.yaml"}
+        if model_name
+        in {
+            "mamba-hrnet-seg.yaml",
+            "mamba-hrnet-seg-dvss.yaml",
+            "mamba-hrnet-seg-edgevss.yaml",
+            "mamba-yolo-B-hrnet-seg.yaml",
+            "mamba-yolo-B-hrnet-seg-pointrend.yaml",
+        }
         else torch.tensor([8.0, 16.0, 32.0])
     )
     assert torch.equal(model.model.stride.cpu(), expected_stride)
