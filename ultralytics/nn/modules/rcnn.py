@@ -12,13 +12,13 @@ from __future__ import annotations
 
 import math
 from collections import OrderedDict
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ultralytics.utils import ops
+from ultralytics.utils import LOGGER, ops
 from ultralytics.utils.metrics import batch_probiou, box_iou
 from ultralytics.utils.nms import TorchNMS
 from .roi import torchvision_native_roi_align
@@ -430,15 +430,23 @@ class _BBoxHead(nn.Module):
 
 
 class _MaskHead(nn.Module):
-    def __init__(self, in_channels: int, dim: int = 256, num_convs: int = 4):
+    def __init__(
+        self,
+        in_channels: int,
+        num_classes: int,
+        dim: int = 256,
+        num_convs: int = 4,
+        class_agnostic: bool = False,
+    ):
         super().__init__()
+        self.class_agnostic = bool(class_agnostic)
         blocks = []
         for i in range(num_convs):
             blocks.append(nn.Conv2d(in_channels if i == 0 else dim, dim, 3, padding=1))
             blocks.append(nn.ReLU(inplace=True))
         self.blocks = nn.Sequential(*blocks)
         self.up = nn.ConvTranspose2d(dim, dim, 2, stride=2)
-        self.out = nn.Conv2d(dim, 1, 1)
+        self.out = nn.Conv2d(dim, 1 if self.class_agnostic else num_classes, 1)
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
@@ -583,6 +591,50 @@ def _sample_matches(pos_mask: Tensor, neg_mask: Tensor, num_samples: int, pos_fr
     return torch.cat((pos_inds, neg_inds), dim=0)
 
 
+def _assign_and_sample_rpn(
+    anchors: Tensor,
+    match_gt_boxes: Tensor,
+    regression_gt_boxes: Tensor,
+    cfg: dict,
+    overlap_fn: Callable[[Tensor, Tensor], Tensor],
+    encode_fn: Callable[[Tensor, Tensor], Tensor],
+    reg_dim: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Assign and sample RPN anchors globally across all pyramid levels for one image."""
+    labels = anchors.new_full((anchors.shape[0],), -1, dtype=torch.long)
+    box_targets = anchors.new_zeros((anchors.shape[0], reg_dim))
+    if match_gt_boxes.numel() == 0:
+        labels.fill_(0)
+    else:
+        overlaps = overlap_fn(anchors, match_gt_boxes)
+        max_iou, matched_gt = overlaps.max(dim=1)
+        labels[max_iou < float(cfg["neg_iou"])] = 0
+        labels[max_iou >= float(cfg["pos_iou"])] = 1
+
+        if bool(cfg.get("match_low_quality", True)):
+            gt_max_iou = overlaps.max(dim=0).values
+            valid_gt = torch.where(gt_max_iou >= float(cfg.get("min_pos_iou", 0.0)))[0]
+            for gt_idx in valid_gt:
+                if bool(cfg.get("gt_max_assign_all", True)):
+                    forced = torch.where(overlaps[:, gt_idx] == gt_max_iou[gt_idx])[0]
+                else:
+                    forced = overlaps[:, gt_idx].argmax().view(1)
+                labels[forced] = 1
+                matched_gt[forced] = gt_idx
+
+        positive = labels == 1
+        if positive.any():
+            box_targets[positive] = encode_fn(anchors[positive], regression_gt_boxes[matched_gt[positive]])
+
+    sampled = _sample_matches(
+        labels == 1,
+        labels == 0,
+        int(cfg["samples_per_img"]),
+        float(cfg["pos_fraction"]),
+    )
+    return sampled, labels, box_targets
+
+
 def _match_hboxes(boxes: Tensor, gt_boxes: Tensor, gt_labels: Tensor, pos_iou: float, neg_iou: float, num_samples: int, pos_fraction: float):
     device = boxes.device
     if gt_boxes.numel() == 0:
@@ -653,6 +705,31 @@ def _paste_masks(mask_logits: Tensor, boxes: Tensor, image_shape: tuple[int, int
     return torch.stack(masks, dim=0) > mask_threshold
 
 
+def _paste_mask_probabilities(mask_probs: Tensor, boxes: Tensor, image_shape: tuple[int, int], mask_threshold: float = 0.5) -> Tensor:
+    """Paste already-sigmoid mask probabilities into image space and threshold once."""
+    if mask_probs.numel() == 0:
+        return mask_probs.new_zeros((0, image_shape[0], image_shape[1]), dtype=torch.bool)
+    masks = []
+    for mask, box in zip(mask_probs, boxes):
+        x1, y1, x2, y2 = box.round().long().tolist()
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(image_shape[1], x2), min(image_shape[0], y2)
+        canvas = mask.new_zeros(image_shape)
+        if x2 > x1 and y2 > y1:
+            resized = F.interpolate(mask[None, None], size=(y2 - y1, x2 - x1), mode="bilinear", align_corners=False)[0, 0]
+            canvas[y1:y2, x1:x2] = resized
+        masks.append(canvas)
+    return torch.stack(masks, dim=0) > mask_threshold
+
+
+def _select_mask_channels(mask_logits: Tensor, class_indices: Tensor) -> Tensor:
+    """Select class-specific mask logits, tolerating class-agnostic single-channel heads."""
+    if mask_logits.shape[1] == 1:
+        return mask_logits[:, 0]
+    rows = torch.arange(mask_logits.shape[0], device=mask_logits.device)
+    return mask_logits[rows, class_indices.long()]
+
+
 def _mask_threshold_from_cfg(cfg: dict) -> float:
     test_cfg = cfg.get("test", {}) if isinstance(cfg, dict) else {}
     return float(test_cfg.get("mask_threshold", 0.5)) if isinstance(test_cfg, dict) else 0.5
@@ -683,6 +760,9 @@ class _AxisRCNNBase(nn.Module):
             "min_box_size": 0.0,
             "pos_iou": 0.7,
             "neg_iou": 0.3,
+            "min_pos_iou": 0.3,
+            "match_low_quality": True,
+            "gt_max_assign_all": True,
             "samples_per_img": 256,
             "pos_fraction": 0.5,
             "beta": 1.0 / 9.0,
@@ -691,8 +771,12 @@ class _AxisRCNNBase(nn.Module):
         "train": {"pos_iou": 0.5, "neg_iou": 0.5, "samples_per_img": 512, "pos_fraction": 0.25},
         "test": {"score_thresh": 0.05, "nms_iou": 0.5, "max_dets": 300, "mask_threshold": 0.5},
         "bbox_head": {"hidden_dim": 1024, "loss": "smooth_l1", "beta": 1.0},
-        "mask_head": {"dim": 256, "num_convs": 4, "resolution": 28},
-        "cascade": {"iou_thresholds": [0.5, 0.6, 0.7], "bbox_stds": [[0.1, 0.1, 0.2, 0.2], [0.05, 0.05, 0.1, 0.1], [0.033, 0.033, 0.067, 0.067]]},
+        "mask_head": {"dim": 256, "num_convs": 4, "resolution": 28, "class_agnostic": False},
+        "cascade": {
+            "iou_thresholds": [0.5, 0.6, 0.7],
+            "bbox_stds": [[0.1, 0.1, 0.2, 0.2], [0.05, 0.05, 0.1, 0.1], [0.033, 0.033, 0.067, 0.067]],
+            "stage_loss_weights": [1.0, 0.5, 0.25],
+        },
     }
 
     def __init__(self, in_channels: list[int], nc: int, cfg: dict | None = None, with_mask: bool = False, cascade: bool = False):
@@ -710,19 +794,73 @@ class _AxisRCNNBase(nn.Module):
             ratios=self.cfg["rpn"]["anchor_ratios"],
         )
         self.rpn_head = _RPNHead(in_channels[0], self.anchor_generator.num_anchors, reg_dim=4)
-        stage_stds = self.cfg["cascade"]["bbox_stds"] if cascade else [self.cfg["cascade"]["bbox_stds"][0]]
+        if cascade:
+            cascade_cfg = self.cfg["cascade"]
+            lengths = {
+                "iou_thresholds": len(cascade_cfg["iou_thresholds"]),
+                "bbox_stds": len(cascade_cfg["bbox_stds"]),
+                "stage_loss_weights": len(cascade_cfg["stage_loss_weights"]),
+            }
+            if len(set(lengths.values())) != 1 or not next(iter(lengths.values())):
+                raise ValueError(f"Cascade configuration lengths must be equal and nonzero, received {lengths}.")
+            self.num_stages = lengths["iou_thresholds"]
+            self.stage_loss_weights = tuple(float(x) for x in cascade_cfg["stage_loss_weights"])
+            stage_stds = cascade_cfg["bbox_stds"]
+        else:
+            self.num_stages = 1
+            self.stage_loss_weights = (1.0,)
+            stage_stds = [self.cfg["cascade"]["bbox_stds"][0]]
         self.stage_coders = [HorizontalBoxCoder(stds=s) for s in stage_stds]
         self.bbox_heads = nn.ModuleList(
             [_BBoxHead(in_channels[0], num_classes=nc, reg_dim=4, pool_size=self.cfg["roi"]["pool_size"], hidden_dim=self.cfg["bbox_head"]["hidden_dim"]) for _ in stage_stds]
         )
         if cascade:
-            for stage in range(1, 4):
+            for stage in range(1, self.num_stages + 1):
                 self.loss_names.extend((f"s{stage}_cls", f"s{stage}_box"))
+                if with_mask:
+                    self.loss_names.append(f"s{stage}_mask")
         else:
             self.loss_names.extend(("rcnn_cls", "rcnn_box"))
         if with_mask:
-            self.mask_head = _MaskHead(in_channels[0], dim=self.cfg["mask_head"]["dim"], num_convs=self.cfg["mask_head"]["num_convs"])
-            self.loss_names.append("mask")
+            self.mask_heads = nn.ModuleList(
+                _MaskHead(
+                    in_channels[0],
+                    num_classes=nc,
+                    dim=self.cfg["mask_head"]["dim"],
+                    num_convs=self.cfg["mask_head"]["num_convs"],
+                    class_agnostic=self.cfg["mask_head"].get("class_agnostic", False),
+                )
+                for _ in range(self.num_stages if cascade else 1)
+            )
+            if not cascade:
+                self.loss_names.append("mask")
+
+    @property
+    def mask_head(self) -> _MaskHead:
+        """Return the final mask head for backward-compatible integrations such as PointRend."""
+        return self.mask_heads[-1]
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """Replicate legacy shared mask-head weights into all configured stage heads when shapes permit."""
+        legacy_prefix = f"{prefix}mask_head."
+        legacy_keys = [key for key in state_dict if key.startswith(legacy_prefix)]
+        if legacy_keys and hasattr(self, "mask_heads"):
+            current = self.state_dict()
+            copied = 0
+            for key in legacy_keys:
+                suffix = key[len(legacy_prefix) :]
+                value = state_dict.pop(key)
+                for stage in range(len(self.mask_heads)):
+                    target_key = f"{prefix}mask_heads.{stage}.{suffix}"
+                    local_target_key = f"mask_heads.{stage}.{suffix}"
+                    if local_target_key in current and current[local_target_key].shape == value.shape:
+                        state_dict[target_key] = value.clone()
+                        copied += 1
+            LOGGER.warning(
+                f"Loaded legacy shared RCNN mask-head weights into {len(self.mask_heads)} stage head(s); "
+                f"copied {copied} compatible tensors."
+            )
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
     def _image_shape_from_feats(self, feats: list[Tensor]) -> tuple[int, int]:
         stride = int(self.cfg["roi"]["featmap_strides"][0])
@@ -736,55 +874,63 @@ class _AxisRCNNBase(nn.Module):
 
     def _rpn_loss_and_proposals(self, feats: list[Tensor], gt_boxes: list[Tensor], image_shape: tuple[int, int], train: bool):
         obj_logits, bbox_deltas, anchors = self._rpn_forward(feats)
-        total_obj, total_box, proposals = 0.0, 0.0, []
+        zero = sum((x.sum() * 0.0 for x in obj_logits), feats[0].sum() * 0.0)
+        total_obj, total_box, total_samples, proposals = zero, zero, 0, []
         batch_size = obj_logits[0].shape[0]
         coder = HorizontalBoxCoder()
         pre_nms = self.cfg["rpn"]["pre_nms_topk_train" if train else "pre_nms_topk_test"]
         post_nms = self.cfg["rpn"]["post_nms_topk_train" if train else "post_nms_topk_test"]
+        all_anchors = torch.cat(anchors, dim=0)
         for bi in range(batch_size):
             per_img_scores, per_img_boxes, level_ids = [], [], []
-            if train:
-                img_cls_loss = feats[0].new_tensor(0.0)
-                img_box_loss = feats[0].new_tensor(0.0)
+            flat_scores, flat_deltas = [], []
             for level, (lvl_logits, lvl_deltas, lvl_anchors) in enumerate(zip(obj_logits, bbox_deltas, anchors)):
                 scores = lvl_logits[bi].permute(1, 2, 0).reshape(-1)
                 deltas = lvl_deltas[bi].permute(1, 2, 0).reshape(-1, 4)
-                if train:
-                    labels = lvl_anchors.new_full((lvl_anchors.shape[0],), -1, dtype=torch.long)
-                    box_targets = lvl_anchors.new_zeros((lvl_anchors.shape[0], 4))
-                    if gt_boxes[bi].numel():
-                        iou = box_iou(lvl_anchors, gt_boxes[bi])
-                        max_iou, matched = iou.max(dim=1)
-                        labels[max_iou < self.cfg["rpn"]["neg_iou"]] = 0
-                        labels[max_iou >= self.cfg["rpn"]["pos_iou"]] = 1
-                        labels[iou.argmax(dim=0)] = 1
-                        pos = labels == 1
-                        if pos.any():
-                            box_targets[pos] = coder.encode(lvl_anchors[pos], gt_boxes[bi][matched[pos]])
-                    sampled = _sample_matches(labels == 1, labels == 0, self.cfg["rpn"]["samples_per_img"] // len(anchors), self.cfg["rpn"]["pos_fraction"])
-                    if sampled.numel():
-                        cls_t = (labels[sampled] == 1).float()
-                        img_cls_loss = img_cls_loss + F.binary_cross_entropy_with_logits(scores[sampled], cls_t, reduction="mean")
-                        pos = labels[sampled] == 1
-                        if pos.any():
-                            img_box_loss = img_box_loss + F.smooth_l1_loss(deltas[sampled][pos], box_targets[sampled][pos], beta=self.cfg["rpn"]["beta"], reduction="mean")
+                flat_scores.append(scores)
+                flat_deltas.append(deltas)
                 probs = scores.sigmoid()
                 topk = min(pre_nms, probs.numel())
                 idx = probs.topk(topk).indices
-                boxes = _clip_boxes(coder.decode(lvl_anchors[idx], deltas[idx]), image_shape)
+                boxes = _clip_boxes(coder.decode(lvl_anchors[idx], deltas[idx].detach()), image_shape)
                 keep = _remove_small_boxes(boxes, self.cfg["rpn"]["min_box_size"])
                 per_img_scores.append(probs[idx][keep])
                 per_img_boxes.append(boxes[keep])
                 level_ids.append(boxes.new_full((keep.numel(),), level, dtype=torch.long))
+
             if train:
-                total_obj = total_obj + img_cls_loss / max(len(anchors), 1)
-                total_box = total_box + img_box_loss / max(len(anchors), 1)
+                scores = torch.cat(flat_scores, dim=0)
+                deltas = torch.cat(flat_deltas, dim=0)
+                sampled, labels, box_targets = _assign_and_sample_rpn(
+                    all_anchors,
+                    gt_boxes[bi],
+                    gt_boxes[bi],
+                    self.cfg["rpn"],
+                    box_iou,
+                    coder.encode,
+                    4,
+                )
+                if sampled.numel():
+                    total_obj = total_obj + F.binary_cross_entropy_with_logits(
+                        scores[sampled], (labels[sampled] == 1).to(scores.dtype), reduction="sum"
+                    )
+                    sampled_pos = sampled[labels[sampled] == 1]
+                    if sampled_pos.numel():
+                        total_box = total_box + F.smooth_l1_loss(
+                            deltas[sampled_pos],
+                            box_targets[sampled_pos].to(deltas.dtype),
+                            beta=self.cfg["rpn"]["beta"],
+                            reduction="sum",
+                        )
+                    total_samples += sampled.numel()
+
             boxes = torch.cat(per_img_boxes, dim=0) if per_img_boxes else feats[0].new_zeros((0, 4))
             scores = torch.cat(per_img_scores, dim=0) if per_img_scores else feats[0].new_zeros((0,))
             lvl_ids = torch.cat(level_ids, dim=0) if level_ids else feats[0].new_zeros((0,), dtype=torch.long)
             keep = TorchNMS.batched_nms(boxes, scores, lvl_ids, self.cfg["rpn"]["nms_thresh"])[:post_nms]
-            proposals.append(boxes[keep])
-        return total_obj / batch_size, total_box / batch_size, proposals
+            proposals.append(boxes[keep].detach())
+        denominator = max(total_samples, 1)
+        return total_obj / denominator, total_box / denominator, proposals
 
     def _bbox_reg_loss(self, pred: Tensor, target: Tensor) -> Tensor:
         if pred.numel() == 0:
@@ -812,15 +958,23 @@ class _AxisRCNNBase(nn.Module):
         pooled = _roi_align_multilevel(feats[:4], rois, self.cfg["roi"]["pool_size"], self.cfg["roi"]["sampling_ratio"], self.cfg["roi"]["featmap_strides"])
         if pooled.shape[0] == 0:
             zero = feats[0].sum() * 0.0
-            return zero, zero, rois.new_zeros((0, 5)), gt_inds.new_zeros((0,), dtype=torch.long)
+            return zero, zero, rois.new_zeros((0, 5)), gt_inds.new_zeros((0,), dtype=torch.long), labels.new_zeros((0,))
         cls_logits, box_deltas = self.bbox_heads[0](pooled)
         cls_loss = F.cross_entropy(cls_logits, labels)
         pos = labels > 0
         box_loss = self._bbox_reg_loss(box_deltas[pos], self.stage_coders[0].encode(rois[:, 1:5][pos], matched[pos])) if pos.any() else cls_loss * 0.0
-        return cls_loss, box_loss, rois[pos], gt_inds[pos]
+        return cls_loss, box_loss, rois[pos], gt_inds[pos], labels[pos] - 1
 
-    def _cascade_stage_loss(self, feats: list[Tensor], proposals: list[Tensor], gt_boxes: list[Tensor], gt_labels: list[Tensor], image_shape: tuple[int, int]):
-        stage_losses, stage_pos_rois, stage_gt_inds = [], None, None
+    def _cascade_stage_loss(
+        self,
+        feats: list[Tensor],
+        proposals: list[Tensor],
+        gt_boxes: list[Tensor],
+        gt_labels: list[Tensor],
+        gt_masks: list[Tensor | None],
+        image_shape: tuple[int, int],
+    ):
+        stage_losses, point_loss = [], None
         current_props = [torch.cat((props, gt_boxes[i]), dim=0) if gt_boxes[i].numel() else props for i, props in enumerate(proposals)]
         for stage_idx, (head, coder, iou_thr) in enumerate(zip(self.bbox_heads, self.stage_coders, self.cfg["cascade"]["iou_thresholds"])):
             all_rois = []
@@ -833,7 +987,8 @@ class _AxisRCNNBase(nn.Module):
             cls_logits_all, box_deltas_all = head(pooled)
 
             offset = 0
-            sampled_global, labels_all, reg_targets, pos_rois, pos_gt_inds = [], [], [], [], []
+            sampled_global, labels_all, reg_targets = [], [], []
+            pos_rois, pos_gt_inds, pos_class_indices = [], [], []
             refined_props = []
             for bi, props in enumerate(current_props):
                 num = counts[bi]
@@ -849,6 +1004,7 @@ class _AxisRCNNBase(nn.Module):
                     pos_idx = sampled[labels > 0]
                     pos_rois.append(torch.cat((props.new_full((pos_idx.numel(), 1), bi), boxes[labels > 0]), dim=1))
                     pos_gt_inds.append(gt_inds[labels > 0])
+                    pos_class_indices.append(labels[labels > 0] - 1)
                 offset += num
             current_props = refined_props
             sample_idx = torch.cat(sampled_global, dim=0) if sampled_global else feats[0].new_zeros((0,), dtype=torch.long)
@@ -861,21 +1017,52 @@ class _AxisRCNNBase(nn.Module):
                 box_loss = self._bbox_reg_loss(reg_pred, reg_target)
             else:
                 box_loss = cls_loss * 0.0
-            stage_losses.extend((cls_loss, box_loss))
-            if pos_rois:
-                stage_pos_rois = torch.cat(pos_rois, dim=0)
-                stage_gt_inds = torch.cat(pos_gt_inds, dim=0)
-        return stage_losses, current_props, stage_pos_rois, stage_gt_inds
+            stage_weight = self.stage_loss_weights[stage_idx]
+            stage_losses.extend((cls_loss * stage_weight, box_loss * stage_weight))
+            if self.with_mask:
+                stage_pos_rois = torch.cat(pos_rois, dim=0) if pos_rois else feats[0].new_zeros((0, 5))
+                stage_gt_inds = torch.cat(pos_gt_inds, dim=0) if pos_gt_inds else feats[0].new_zeros((0,), dtype=torch.long)
+                stage_classes = (
+                    torch.cat(pos_class_indices, dim=0)
+                    if pos_class_indices
+                    else feats[0].new_zeros((0,), dtype=torch.long)
+                )
+                mask_result = self._mask_loss(
+                    feats,
+                    stage_pos_rois,
+                    stage_gt_inds,
+                    stage_classes,
+                    gt_masks,
+                    stage_idx=stage_idx,
+                    include_point=stage_idx == self.num_stages - 1,
+                )
+                if isinstance(mask_result, tuple):
+                    mask_loss, point = mask_result
+                    point_loss = point * stage_weight
+                else:
+                    mask_loss = mask_result
+                stage_losses.append(mask_loss * stage_weight)
+        return stage_losses, current_props, point_loss
 
-    def _mask_loss(self, feats: list[Tensor], pos_rois: Tensor, gt_inds: Tensor, gt_masks: list[Tensor | None]) -> Tensor | tuple[Tensor, Tensor]:
+    def _mask_loss(
+        self,
+        feats: list[Tensor],
+        pos_rois: Tensor,
+        gt_inds: Tensor,
+        class_indices: Tensor,
+        gt_masks: list[Tensor | None],
+        *,
+        stage_idx: int = 0,
+        include_point: bool = True,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         if pos_rois is None or pos_rois.numel() == 0:
             base_zero = feats[0].sum() * 0.0
-            if self.point_rend_enabled and hasattr(self, "point_rend"):
+            if include_point and self.point_rend_enabled and hasattr(self, "point_rend"):
                 point_zero = sum((p.sum() * 0.0 for p in self.point_rend.parameters()), base_zero)
                 return base_zero, point_zero
             return base_zero
         pooled = _roi_align_multilevel(feats[:4], pos_rois, self.cfg["roi"]["mask_pool_size"], self.cfg["roi"]["sampling_ratio"], self.cfg["roi"]["featmap_strides"])
-        logits = self.mask_head(pooled).squeeze(1)
+        logits = _select_mask_channels(self.mask_heads[stage_idx](pooled), class_indices)
         targets = []
         for bi_tensor in pos_rois[:, 0].long().unique(sorted=True):
             bi = int(bi_tensor.item())
@@ -883,7 +1070,7 @@ class _AxisRCNNBase(nn.Module):
             targets.append(_crop_mask_targets(gt_masks[bi], pos_rois[idx, 1:5], gt_inds[idx], self.cfg["mask_head"]["resolution"]))
         target = torch.cat(targets, dim=0) if targets else logits.new_zeros((0, self.cfg["mask_head"]["resolution"], self.cfg["mask_head"]["resolution"]))
         mask_loss = F.binary_cross_entropy_with_logits(logits, target)
-        if not self.point_rend_enabled or not hasattr(self, "point_rend"):
+        if not include_point or not self.point_rend_enabled or not hasattr(self, "point_rend"):
             return mask_loss
 
         from ultralytics.nn.modules.pointrend import RCNNPointRendAdapter
@@ -915,16 +1102,19 @@ class _AxisRCNNBase(nn.Module):
         image_shape = tuple(batch["img"].shape[2:])
         rpn_cls, rpn_box, proposals = self._rpn_loss_and_proposals(feats, gt_boxes, image_shape, train=True)
         if self.cascade:
-            stage_losses, final_props, pos_rois, gt_inds = self._cascade_stage_loss(feats, proposals, gt_boxes, gt_labels, image_shape)
+            stage_losses, _, point_loss = self._cascade_stage_loss(
+                feats, proposals, gt_boxes, gt_labels, gt_masks, image_shape
+            )
             losses = [rpn_cls, rpn_box, *stage_losses]
-            if self.with_mask:
-                mask_result = self._mask_loss(feats, pos_rois, gt_inds, gt_masks)
-                losses.extend(mask_result if isinstance(mask_result, tuple) else (mask_result,))
+            if point_loss is not None:
+                losses.append(point_loss)
         else:
-            cls_loss, box_loss, pos_rois, gt_inds = self._single_stage_loss(feats, proposals, gt_boxes, gt_labels)
+            cls_loss, box_loss, pos_rois, gt_inds, pos_classes = self._single_stage_loss(
+                feats, proposals, gt_boxes, gt_labels
+            )
             losses = [rpn_cls, rpn_box, cls_loss, box_loss]
             if self.with_mask:
-                mask_result = self._mask_loss(feats, pos_rois, gt_inds, gt_masks)
+                mask_result = self._mask_loss(feats, pos_rois, gt_inds, pos_classes, gt_masks)
                 losses.extend(mask_result if isinstance(mask_result, tuple) else (mask_result,))
         loss_items = torch.stack([x if isinstance(x, Tensor) else feats[0].new_tensor(float(x)) for x in losses])
         if self.point_rend_enabled and hasattr(self, "point_rend") and self.point_rend.train_config.mode == "frozen":
@@ -937,41 +1127,41 @@ class _AxisRCNNBase(nn.Module):
         _, _, proposals = self._rpn_loss_and_proposals(feats, [feats[0].new_zeros((0, 4)) for _ in range(feats[0].shape[0])], image_shape, train=False)
         if self.cascade:
             current_props = proposals
-            cls_logits_all = None
-            offset_boxes = None
+            stage_scores = [[] for _ in current_props]
             for head, coder in zip(self.bbox_heads, self.stage_coders):
                 rois = torch.cat([torch.cat((p.new_full((p.shape[0], 1), i), p), dim=1) for i, p in enumerate(current_props)], dim=0)
                 pooled = _roi_align_multilevel(feats[:4], rois, self.cfg["roi"]["pool_size"], self.cfg["roi"]["sampling_ratio"], self.cfg["roi"]["featmap_strides"])
                 cls_logits_all, bbox_deltas_all = head(pooled)
                 new_props, offset = [], 0
-                for props in current_props:
+                for bi, props in enumerate(current_props):
                     num = props.shape[0]
+                    stage_scores[bi].append(cls_logits_all[offset : offset + num].softmax(dim=-1))
                     pred_boxes = _clip_boxes(coder.decode(props, bbox_deltas_all[offset : offset + num]), image_shape)
                     new_props.append(pred_boxes)
                     offset += num
                 current_props = new_props
             per_image_props = current_props
-            per_image_logits = []
-            offset = 0
-            for props in per_image_props:
-                per_image_logits.append(cls_logits_all[offset : offset + props.shape[0]])
-                offset += props.shape[0]
+            per_image_scores = [
+                torch.stack(scores, dim=0).mean(dim=0)[:, 1:]
+                if scores
+                else props.new_zeros((props.shape[0], self.nc))
+                for props, scores in zip(per_image_props, stage_scores)
+            ]
         else:
-            per_image_props, per_image_logits = [], []
+            per_image_props, per_image_scores = [], []
             for i, props in enumerate(proposals):
                 if props.numel() == 0:
                     per_image_props.append(props.new_zeros((0, 4)))
-                    per_image_logits.append(props.new_zeros((0, self.nc + 1)))
+                    per_image_scores.append(props.new_zeros((0, self.nc)))
                     continue
                 rois = torch.cat((props.new_full((props.shape[0], 1), i), props), dim=1)
                 pooled = _roi_align_multilevel(feats[:4], rois, self.cfg["roi"]["pool_size"], self.cfg["roi"]["sampling_ratio"], self.cfg["roi"]["featmap_strides"])
                 logits, deltas = self.bbox_heads[0](pooled)
                 per_image_props.append(_clip_boxes(self.stage_coders[0].decode(props, deltas), image_shape))
-                per_image_logits.append(logits)
+                per_image_scores.append(logits.softmax(dim=-1)[:, 1:])
 
         outputs = []
-        for bi, (boxes, logits) in enumerate(zip(per_image_props, per_image_logits)):
-            scores = logits.softmax(dim=-1)[:, 1:]
+        for bi, (boxes, scores) in enumerate(zip(per_image_props, per_image_scores)):
             num_classes = scores.shape[1]
             all_boxes = boxes[:, None, :].expand(boxes.shape[0], num_classes, 4).reshape(-1, 4)
             all_scores = scores.reshape(-1)
@@ -987,7 +1177,16 @@ class _AxisRCNNBase(nn.Module):
                 if pred_boxes.numel():
                     rois = torch.cat((pred_boxes.new_full((pred_boxes.shape[0], 1), bi), pred_boxes), dim=1)
                     pooled = _roi_align_multilevel(feats[:4], rois, self.cfg["roi"]["mask_pool_size"], self.cfg["roi"]["sampling_ratio"], self.cfg["roi"]["featmap_strides"])
-                    mask_logits = self.mask_head(pooled).squeeze(1)
+                    if self.cascade:
+                        stage_mask_probs = [
+                            _select_mask_channels(mask_head(pooled), pred_labels).sigmoid()
+                            for mask_head in self.mask_heads
+                        ]
+                        mask_probs = torch.stack(stage_mask_probs, dim=0).mean(dim=0)
+                        mask_logits = torch.logit(mask_probs.clamp(1e-6, 1 - 1e-6))
+                    else:
+                        mask_logits = _select_mask_channels(self.mask_heads[0](pooled), pred_labels)
+                        mask_probs = mask_logits.sigmoid()
                     if self.point_rend_enabled and hasattr(self, "point_rend"):
                         from ultralytics.nn.modules.pointrend import RCNNPointRendAdapter
 
@@ -1002,6 +1201,10 @@ class _AxisRCNNBase(nn.Module):
                             image_shape=image_shape,
                         )
                         pred_masks = adapter.refined_image_logits(instances) > 0
+                    elif self.cascade:
+                        pred_masks = _paste_mask_probabilities(
+                            mask_probs, pred_boxes, image_shape, _mask_threshold_from_cfg(self.cfg)
+                        )
                     else:
                         pred_masks = _paste_masks(mask_logits, pred_boxes, image_shape, _mask_threshold_from_cfg(self.cfg))
                     pred_boxes, pred_scores, pred_labels, pred_masks = _filter_empty_mask_predictions(pred_boxes, pred_scores, pred_labels, pred_masks)
@@ -1026,6 +1229,9 @@ class _RotatedRCNNBase(nn.Module):
             "min_box_size": 0.0,
             "pos_iou": 0.7,
             "neg_iou": 0.3,
+            "min_pos_iou": 0.3,
+            "match_low_quality": True,
+            "gt_max_assign_all": True,
             "samples_per_img": 256,
             "pos_fraction": 0.5,
             "beta": 1.0 / 9.0,
@@ -1061,39 +1267,21 @@ class _RotatedRCNNBase(nn.Module):
     def _rpn_loss_and_proposals(self, feats: list[Tensor], gt_boxes: list[Tensor], image_shape: tuple[int, int], train: bool):
         obj_logits, bbox_deltas = self.rpn_head(feats)
         anchors = self.anchor_generator.grid_anchors([(x.shape[2], x.shape[3]) for x in feats], feats[0].device)
-        total_obj, total_box, proposals = 0.0, 0.0, []
+        zero = sum((x.sum() * 0.0 for x in obj_logits), feats[0].sum() * 0.0)
+        total_obj, total_box, total_samples, proposals = zero, zero, 0, []
         batch_size = obj_logits[0].shape[0]
         gt_hboxes = [_rboxes_to_xyxy(x) if x.numel() else x.new_zeros((0, 4)) for x in gt_boxes]
         pre_nms = self.cfg["rpn"]["pre_nms_topk_train" if train else "pre_nms_topk_test"]
         post_nms = self.cfg["rpn"]["post_nms_topk_train" if train else "post_nms_topk_test"]
+        all_anchors = torch.cat(anchors, dim=0)
         for bi in range(batch_size):
-            img_cls_loss = feats[0].new_tensor(0.0)
-            img_box_loss = feats[0].new_tensor(0.0)
             per_scores, per_boxes, level_ids = [], [], []
+            flat_scores, flat_deltas = [], []
             for level, (lvl_logits, lvl_deltas, lvl_anchors) in enumerate(zip(obj_logits, bbox_deltas, anchors)):
                 scores = lvl_logits[bi].permute(1, 2, 0).reshape(-1)
                 deltas = lvl_deltas[bi].permute(1, 2, 0).reshape(-1, 6 if self.oriented_proposals else 4)
-                if train:
-                    labels = lvl_anchors.new_full((lvl_anchors.shape[0],), -1, dtype=torch.long)
-                    # Keep regression targets in anchor precision so AMP half deltas do not
-                    # downcast the encoded targets before assignment.
-                    box_targets = lvl_anchors.new_zeros((lvl_anchors.shape[0], deltas.shape[1]))
-                    if gt_hboxes[bi].numel():
-                        iou = box_iou(lvl_anchors, gt_hboxes[bi])
-                        max_iou, matched = iou.max(dim=1)
-                        labels[max_iou < self.cfg["rpn"]["neg_iou"]] = 0
-                        labels[max_iou >= self.cfg["rpn"]["pos_iou"]] = 1
-                        labels[iou.argmax(dim=0)] = 1
-                        pos = labels == 1
-                        if pos.any():
-                            targets = gt_boxes[bi][matched[pos]] if self.oriented_proposals else gt_hboxes[bi][matched[pos]]
-                            box_targets[pos] = self.rpn_coder.encode(lvl_anchors[pos], targets)
-                    sampled = _sample_matches(labels == 1, labels == 0, self.cfg["rpn"]["samples_per_img"] // len(anchors), self.cfg["rpn"]["pos_fraction"])
-                    if sampled.numel():
-                        img_cls_loss = img_cls_loss + F.binary_cross_entropy_with_logits(scores[sampled], (labels[sampled] == 1).float(), reduction="mean")
-                        pos = labels[sampled] == 1
-                        if pos.any():
-                            img_box_loss = img_box_loss + F.smooth_l1_loss(deltas[sampled][pos], box_targets[sampled][pos], beta=self.cfg["rpn"]["beta"], reduction="mean")
+                flat_scores.append(scores)
+                flat_deltas.append(deltas)
                 probs = scores.sigmoid()
                 topk = min(pre_nms, probs.numel())
                 idx = probs.topk(topk).indices
@@ -1103,8 +1291,32 @@ class _RotatedRCNNBase(nn.Module):
                 per_scores.append(probs[idx][keep])
                 per_boxes.append(decoded[keep])
                 level_ids.append(decoded.new_full((keep.numel(),), level, dtype=torch.long))
-            total_obj = total_obj + img_cls_loss / max(len(anchors), 1)
-            total_box = total_box + img_box_loss / max(len(anchors), 1)
+            if train:
+                scores = torch.cat(flat_scores, dim=0)
+                deltas = torch.cat(flat_deltas, dim=0)
+                regression_gt = gt_boxes[bi] if self.oriented_proposals else gt_hboxes[bi]
+                sampled, labels, box_targets = _assign_and_sample_rpn(
+                    all_anchors,
+                    gt_hboxes[bi],
+                    regression_gt,
+                    self.cfg["rpn"],
+                    box_iou,
+                    self.rpn_coder.encode,
+                    deltas.shape[1],
+                )
+                if sampled.numel():
+                    total_obj = total_obj + F.binary_cross_entropy_with_logits(
+                        scores[sampled], (labels[sampled] == 1).to(scores.dtype), reduction="sum"
+                    )
+                    sampled_pos = sampled[labels[sampled] == 1]
+                    if sampled_pos.numel():
+                        total_box = total_box + F.smooth_l1_loss(
+                            deltas[sampled_pos],
+                            box_targets[sampled_pos].to(deltas.dtype),
+                            beta=self.cfg["rpn"]["beta"],
+                            reduction="sum",
+                        )
+                    total_samples += sampled.numel()
             boxes = torch.cat(per_boxes, dim=0) if per_boxes else feats[0].new_zeros((0, 5 if self.oriented_proposals else 4))
             scores = torch.cat(per_scores, dim=0) if per_scores else feats[0].new_zeros((0,))
             lvl_ids = torch.cat(level_ids, dim=0) if level_ids else feats[0].new_zeros((0,), dtype=torch.long)
@@ -1112,8 +1324,9 @@ class _RotatedRCNNBase(nn.Module):
                 keep = TorchNMS.batched_nms(_rboxes_to_xyxy(boxes), scores, lvl_ids, self.cfg["rpn"]["nms_thresh"])[:post_nms]
             else:
                 keep = TorchNMS.batched_nms(boxes, scores, lvl_ids, self.cfg["rpn"]["nms_thresh"])[:post_nms]
-            proposals.append(boxes[keep])
-        return total_obj / batch_size, total_box / batch_size, proposals
+            proposals.append(boxes[keep].detach())
+        denominator = max(total_samples, 1)
+        return total_obj / denominator, total_box / denominator, proposals
 
     def _roi_pool(self, feats: list[Tensor], rois: Tensor) -> Tensor:
         if self.oriented_proposals:

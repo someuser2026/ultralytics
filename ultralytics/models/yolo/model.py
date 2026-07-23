@@ -105,6 +105,12 @@ class YOLO(Model):
                 new_instance = RCNN(self, task=task)
                 self.__class__ = type(new_instance)
                 self.__dict__ = new_instance.__dict__
+            elif hasattr(self.model, "model") and self.model.model[-1].__class__.__name__ == "Mask2FormerHead":
+                from ultralytics import Mask2Former
+
+                new_instance = Mask2Former(self, task=task)
+                self.__class__ = type(new_instance)
+                self.__dict__ = new_instance.__dict__
 
     @property
     def task_map(self) -> dict[str, dict[str, Any]]:

@@ -830,6 +830,8 @@ class AutoBackend(nn.Module):
 
         # for x in y:
         #     print(type(x), len(x)) if isinstance(x, (list, tuple)) else print(type(x), x.shape)  # debug shapes
+        if isinstance(y, dict):
+            return y
         if isinstance(y, (list, tuple)):
             if len(y) == 1 and isinstance(y[0], dict):
                 return list(y)

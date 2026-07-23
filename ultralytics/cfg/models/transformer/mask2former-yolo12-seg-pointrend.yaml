@@ -41,6 +41,8 @@ head:
         mask_dim: 256,
         hidden_dim: 256,
         num_queries: 100,
+        max_per_image: 100,
+        mask_threshold: 0.5,
         nheads: 8,
         dec_layers: 10,
         enc_layers: 6,

@@ -11,7 +11,7 @@ backbone:
   - [0, 1, Index, [3]]
 
 head:
-  - [[1, 2, 3, 4], 1, FPN, [256, {num_outs: 5}]]
+  - [[1, 2, 3, 4], 1, FPN, [256, {implementation: reference, num_outs: 5}]]
   - [[5], 1, CascadeMaskRCNNHead, [nc, {
       rpn: {
         anchor_scales: [1, 2, 4],
@@ -25,6 +25,9 @@ head:
         min_box_size: 0.0,
         pos_iou: 0.7,
         neg_iou: 0.3,
+        min_pos_iou: 0.3,
+        match_low_quality: true,
+        gt_max_assign_all: true,
         samples_per_img: 256,
         pos_fraction: 0.5,
         beta: 0.1111111111111111
@@ -33,9 +36,10 @@ head:
       train: {pos_iou: 0.5, neg_iou: 0.5, samples_per_img: 512, pos_fraction: 0.25},
       test: {score_thresh: 0.05, nms_iou: 0.5, max_dets: 100},
       bbox_head: {hidden_dim: 1024, loss: smooth_l1, beta: 1.0},
-      mask_head: {dim: 256, num_convs: 4, resolution: 28},
+      mask_head: {dim: 256, num_convs: 4, resolution: 28, class_agnostic: false},
       cascade: {
         iou_thresholds: [0.5, 0.6, 0.7],
-        bbox_stds: [[0.1, 0.1, 0.2, 0.2], [0.05, 0.05, 0.1, 0.1], [0.033, 0.033, 0.067, 0.067]]
+        bbox_stds: [[0.1, 0.1, 0.2, 0.2], [0.05, 0.05, 0.1, 0.1], [0.033, 0.033, 0.067, 0.067]],
+        stage_loss_weights: [1.0, 0.5, 0.25]
       }
     }]]

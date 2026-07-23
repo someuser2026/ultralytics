@@ -4427,9 +4427,20 @@ class Mask2FormerInstanceLoss(nn.Module):
                 continue
             query_indices = query_indices[: self.point_rend.train_config.train_max_instances]
             target_indices = target_indices[: query_indices.numel()]
-            full_logits.append(outputs["pred_masks"][image_index, query_indices, None])
-            query_boxes = outputs["boxes"][image_index, :, query_indices].transpose(0, 1).detach()
-            query_boxes = xywh2xyxy(query_boxes)
+            query_mask_logits = outputs["pred_masks"][image_index, query_indices]
+            full_logits.append(query_mask_logits[:, None])
+            resized_masks = F.interpolate(
+                query_mask_logits[:, None], size=(image_h, image_w), mode="bilinear", align_corners=False
+            )[:, 0] > 0
+            query_boxes = query_mask_logits.new_zeros((query_indices.numel(), 4))
+            x_any = resized_masks.any(dim=1)
+            y_any = resized_masks.any(dim=2)
+            for box_index in range(query_indices.numel()):
+                x = torch.where(x_any[box_index])[0]
+                y = torch.where(y_any[box_index])[0]
+                if x.numel() and y.numel():
+                    query_boxes[box_index] = query_boxes.new_tensor((x[0], y[0], x[-1] + 1, y[-1] + 1))
+            query_boxes = query_boxes.detach()
             query_boxes[:, [0, 2]].clamp_(0, image_w)
             query_boxes[:, [1, 3]].clamp_(0, image_h)
             boxes.append(query_boxes)

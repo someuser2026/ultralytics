@@ -190,6 +190,62 @@ def smooth_3x3(c: int, conv_cfg: dict, dcn: bool) -> nn.Module:
                       act=True)
 
 
+def _reference_fpn_conv(
+    c1: int,
+    c2: int,
+    k: int,
+    s: int,
+    conv_cfg: dict,
+    *,
+    dcn: bool = False,
+) -> nn.Module:
+    """Build an MMDetection-style FPN convolution with configurable norm and activation."""
+    groups = int(conv_cfg.get("groups", 1))
+    dilation = int(conv_cfg.get("dilation", 1))
+    norm = conv_cfg.get("norm")
+    act = conv_cfg.get("act")
+    bias_cfg = conv_cfg.get("bias", "auto")
+    bias = norm in {None, False, "none"} if bias_cfg == "auto" else bool(bias_cfg)
+    padding = dilation * (k - 1) // 2
+    conv = (
+        DeformableConv2d(c1, c2, k, s, p=padding, d=dilation, bias=bias)
+        if dcn
+        else nn.Conv2d(c1, c2, k, s, padding, dilation=dilation, groups=groups, bias=bias)
+    )
+
+    layers: list[nn.Module] = [conv]
+    if norm not in {None, False, "none"}:
+        if norm in {True, "bn", "batchnorm", "batch_norm"}:
+            layers.append(nn.BatchNorm2d(c2))
+        elif norm in {"gn", "groupnorm", "group_norm"}:
+            requested_groups = int(conv_cfg.get("norm_groups", 32))
+            norm_groups = min(requested_groups, c2)
+            while c2 % norm_groups:
+                norm_groups -= 1
+            layers.append(nn.GroupNorm(norm_groups, c2))
+        else:
+            raise ValueError(f"Unsupported reference FPN norm={norm!r}.")
+
+    if act not in {None, False, "none"}:
+        if act in {True, "silu"}:
+            layers.append(nn.SiLU(inplace=True))
+        elif act == "relu":
+            layers.append(nn.ReLU(inplace=True))
+        elif act == "gelu":
+            layers.append(nn.GELU())
+        elif isinstance(act, nn.Module):
+            layers.append(act)
+        else:
+            raise ValueError(f"Unsupported reference FPN act={act!r}.")
+
+    for module in conv.modules():
+        if isinstance(module, nn.Conv2d):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+    return conv if len(layers) == 1 else nn.Sequential(*layers)
+
+
 def make_align_layers(in_channels: Sequence[int], out_channels: int, normalize: bool) -> nn.ModuleList:
     """
     Build channel alignment layers for input features.
@@ -1213,18 +1269,67 @@ class FPN(BaseNeck):
         ... )
     """
     def __init__(self, in_channels: Sequence[int], out_channels: int, cfg: dict):
-        super().__init__(in_channels, out_channels, cfg)
+        cfg = dict(cfg or {})
+        implementation = cfg.get("implementation", "enhanced")
+        if implementation not in {"enhanced", "reference"}:
+            raise ValueError(
+                f"FPN implementation must be 'enhanced' or 'reference', received {implementation!r}."
+            )
+        base_cfg = dict(cfg)
+        if implementation == "reference":
+            # Reference FPN owns a learned lateral convolution at every level.
+            base_cfg["normalize_channels"] = False
+        super().__init__(in_channels, out_channels, base_cfg)
+        self.implementation = implementation
         L = len(self.in_channels)
         self.num_outs = cfg.get("num_outs", L)
         self.add_extra_convs = cfg.get("add_extra_convs", False)
         self.relu_before_extra_convs = cfg.get("relu_before_extra_convs", False)
         if self.num_outs < L:
             raise ValueError(f"FPN num_outs must be >= number of inputs, got {self.num_outs} < {L}.")
-        if self.add_extra_convs not in {False, True, "on_output"}:
+        allowed_extra_sources = {False, True, "on_input", "on_lateral", "on_output"}
+        if self.add_extra_convs not in allowed_extra_sources:
             raise ValueError(
-                "FPN add_extra_convs must be False, True, or 'on_output'. "
+                "FPN add_extra_convs must be False, True, 'on_input', 'on_lateral', or 'on_output'. "
                 f"Received {self.add_extra_convs!r}."
             )
+
+        if self.implementation == "reference":
+            if self.fusion_mode != "add":
+                raise ValueError("Reference FPN requires fusion='add'.")
+            self.add_extra_convs = "on_input" if self.add_extra_convs is True else self.add_extra_convs
+            self.laterals = nn.ModuleList(
+                _reference_fpn_conv(c, self.out_channels, 1, 1, self.conv_cfg, dcn=self._dcn("lateral", i))
+                for i, c in enumerate(self.in_channels)
+            )
+            self.smooth = nn.ModuleList(
+                _reference_fpn_conv(
+                    self.out_channels,
+                    self.out_channels,
+                    3,
+                    1,
+                    self.conv_cfg,
+                    dcn=self._dcn("smooth_td", i),
+                )
+                for i in range(L)
+            )
+            self.upsample = build_upsampler(self.out_channels, self.resample_cfg)
+            extra_levels = self.num_outs - L if self.add_extra_convs else 0
+            first_extra_channels = self.in_channels[-1] if self.add_extra_convs == "on_input" else self.out_channels
+            self.extra_convs = nn.ModuleList()
+            for i in range(extra_levels):
+                self.extra_convs.append(
+                    _reference_fpn_conv(
+                        first_extra_channels if i == 0 else self.out_channels,
+                        self.out_channels,
+                        3,
+                        2,
+                        self.conv_cfg,
+                        dcn=self._dcn("extra", i),
+                    )
+                )
+            self._fusions = nn.ModuleList()
+            return
 
         # Lateral 1x1 convs (only needed if not using normalize_channels)
         # When normalize_channels=True, alignment is done in BaseNeck.align
@@ -1276,6 +1381,11 @@ class FPN(BaseNeck):
             FPN output features [P2_out, P3_out, P4_out, P5_out, ...]
             All outputs have out_channels and enhanced multi-scale information
         """
+        if len(xs) != len(self.in_channels):
+            raise ValueError(f"FPN expected {len(self.in_channels)} input levels, received {len(xs)}.")
+        if self.implementation == "reference":
+            return self._forward_reference(xs, metadata_vec)
+
         # Step 1: Channel alignment and per-level attention
         xs = self._apply_align_and_attn(xs)
         xs = self._apply_metadata_modulation(xs, metadata_vec)
@@ -1321,6 +1431,41 @@ class FPN(BaseNeck):
                 extra_source = F.max_pool2d(extra_source, kernel_size=1, stride=2)
             outs.append(extra_source)
 
+        return outs
+
+    def _forward_reference(
+        self, xs: List[torch.Tensor], metadata_vec: Optional[torch.Tensor] = None
+    ) -> List[torch.Tensor]:
+        """Run the canonical lateral-top-down-output ordering used by MMDetection FPN."""
+        laterals = [attn(conv(x)) for x, conv, attn in zip(xs, self.laterals, self.attn_per_level)]
+        laterals = self._apply_metadata_modulation(laterals, metadata_vec)
+
+        for i in range(len(laterals) - 1, 0, -1):
+            up = self.upsample(laterals[i])
+            up = self._resize_to(up, laterals[i - 1])
+            fused = laterals[i - 1] + up
+            laterals[i - 1] = self.drop_td(self.attn_after_fuse(fused))
+
+        outs = [conv(lateral) for conv, lateral in zip(self.smooth, laterals)]
+        if self.num_outs == len(outs):
+            return outs
+
+        if not self.add_extra_convs:
+            while len(outs) < self.num_outs:
+                outs.append(F.max_pool2d(outs[-1], kernel_size=1, stride=2))
+            return outs
+
+        if self.add_extra_convs == "on_input":
+            extra_source = xs[-1]
+        elif self.add_extra_convs == "on_lateral":
+            extra_source = laterals[-1]
+        else:
+            extra_source = outs[-1]
+        for i, extra_conv in enumerate(self.extra_convs):
+            if i > 0 and self.relu_before_extra_convs:
+                extra_source = F.relu(extra_source)
+            extra_source = extra_conv(extra_source)
+            outs.append(extra_source)
         return outs
 
 

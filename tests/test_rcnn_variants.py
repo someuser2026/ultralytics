@@ -289,6 +289,206 @@ def _rcnn_feats(dtype=torch.float32):
     ]
 
 
+def test_rpn_negative_only_image_has_objectness_loss_and_gradient():
+    from ultralytics.nn.modules.rcnn import MaskRCNNHead
+
+    head = MaskRCNNHead(
+        [8, 8],
+        1,
+        cfg={
+            "rpn": {
+                "strides": [4, 8],
+                "anchor_scales": [1],
+                "anchor_ratios": [1.0],
+                "pre_nms_topk_train": 20,
+                "post_nms_topk_train": 10,
+                "samples_per_img": 8,
+            },
+            "roi": {"featmap_strides": [4, 8]},
+        },
+    )
+    feats = [torch.randn(1, 8, 4, 4), torch.randn(1, 8, 2, 2)]
+    cls_loss, box_loss, _ = head._rpn_loss_and_proposals(
+        feats, [torch.empty((0, 4))], image_shape=(16, 16), train=True
+    )
+    (cls_loss + box_loss).backward()
+
+    assert torch.isfinite(cls_loss) and cls_loss > 0
+    assert box_loss == 0
+    assert head.rpn_head.obj.weight.grad.abs().sum() > 0
+
+
+def test_rpn_assignment_is_global_and_forced_matches_update_regression_gt():
+    from ultralytics.nn.modules.rcnn import _assign_and_sample_rpn
+
+    anchors = torch.zeros(4, 4)
+    match_gt = torch.zeros(2, 4)
+    regression_gt = torch.tensor([[10.0, 0, 0, 0], [20.0, 0, 0, 0]])
+    overlaps = torch.tensor([[0.4, 0.5], [0.1, 0.8], [0.0, 0.0], [0.0, 0.0]])
+    cfg = {
+        "pos_iou": 0.7,
+        "neg_iou": 0.3,
+        "min_pos_iou": 0.3,
+        "match_low_quality": True,
+        "gt_max_assign_all": True,
+        "samples_per_img": 4,
+        "pos_fraction": 1.0,
+    }
+
+    sampled, labels, targets = _assign_and_sample_rpn(
+        anchors,
+        match_gt,
+        regression_gt,
+        cfg,
+        lambda _anchors, _gt: overlaps,
+        lambda _anchors, target: target,
+        4,
+    )
+
+    assert sampled.numel() <= cfg["samples_per_img"]
+    assert labels[:2].tolist() == [1, 1]
+    assert targets[0, 0] == 10  # Anchor 0 initially preferred GT 1 but was forced to GT 0.
+    assert targets[1, 0] == 20
+
+
+def test_rpn_low_quality_matching_respects_minimum_iou():
+    from ultralytics.nn.modules.rcnn import _assign_and_sample_rpn
+
+    anchors = torch.zeros(3, 4)
+    gt = torch.zeros(1, 4)
+    cfg = {
+        "pos_iou": 0.7,
+        "neg_iou": 0.3,
+        "min_pos_iou": 0.3,
+        "match_low_quality": True,
+        "gt_max_assign_all": True,
+        "samples_per_img": 3,
+        "pos_fraction": 1.0,
+    }
+    _, labels, _ = _assign_and_sample_rpn(
+        anchors,
+        gt,
+        gt,
+        cfg,
+        lambda _anchors, _gt: torch.zeros(3, 1),
+        lambda source, _target: source,
+        4,
+    )
+
+    assert not (labels == 1).any()
+
+
+def test_cascade_builds_per_stage_class_specific_masks_and_all_stages_receive_gradients():
+    from ultralytics.nn.modules.rcnn import CascadeMaskRCNNHead
+
+    cfg = {
+        "rpn": {
+            "strides": [4, 8, 16, 32, 64],
+            "anchor_scales": [1],
+            "anchor_ratios": [1.0],
+            "pre_nms_topk_train": 30,
+            "post_nms_topk_train": 20,
+            "samples_per_img": 16,
+        },
+        "train": {"samples_per_img": 16},
+        "bbox_head": {"hidden_dim": 32},
+        "mask_head": {"dim": 8, "num_convs": 1, "class_agnostic": False},
+    }
+    head = CascadeMaskRCNNHead([16] * 5, 2, cfg)
+    batch = _segment_batch()
+    batch["cls"] = torch.tensor([[0], [1]], dtype=torch.float32)
+    loss, items = head.loss(_rcnn_feats(), batch)
+    loss.backward()
+
+    assert head.num_stages == 3
+    assert head.stage_loss_weights == (1.0, 0.5, 0.25)
+    assert len(head.mask_heads) == 3
+    assert all(mask_head.out.out_channels == 2 for mask_head in head.mask_heads)
+    assert items.numel() == len(head.loss_names)
+    assert all(any(p.grad is not None and p.grad.abs().sum() > 0 for p in mask_head.parameters()) for mask_head in head.mask_heads)
+    assert all(any(p.grad is not None and p.grad.abs().sum() > 0 for p in bbox_head.parameters()) for bbox_head in head.bbox_heads)
+
+
+def test_cascade_rejects_inconsistent_stage_configuration():
+    from ultralytics.nn.modules.rcnn import CascadeMaskRCNNHead
+
+    with pytest.raises(ValueError, match="lengths"):
+        CascadeMaskRCNNHead(
+            [8],
+            1,
+            {"cascade": {"iou_thresholds": [0.5, 0.6], "stage_loss_weights": [1.0]}},
+        )
+
+
+def test_cascade_loads_legacy_shared_mask_head_into_every_stage(monkeypatch):
+    import ultralytics.nn.modules.rcnn as rcnn_module
+    from ultralytics.nn.modules.rcnn import CascadeMaskRCNNHead
+
+    cfg = {
+        "rpn": {"strides": [4], "anchor_scales": [1], "anchor_ratios": [1.0]},
+        "roi": {"featmap_strides": [4]},
+        "bbox_head": {"hidden_dim": 8},
+        "mask_head": {"dim": 4, "num_convs": 1, "class_agnostic": False},
+    }
+    source = CascadeMaskRCNNHead([4], 2, cfg)
+    target = CascadeMaskRCNNHead([4], 2, cfg)
+    legacy = {f"mask_head.{key}": value.clone() for key, value in source.mask_heads[0].state_dict().items()}
+    warnings = []
+    monkeypatch.setattr(rcnn_module.LOGGER, "warning", warnings.append)
+
+    target.load_state_dict(legacy, strict=False)
+
+    assert any("legacy shared RCNN mask-head weights" in warning for warning in warnings)
+    for stage_head in target.mask_heads:
+        for key, value in stage_head.state_dict().items():
+            assert torch.equal(value, source.mask_heads[0].state_dict()[key])
+
+
+def test_cascade_inference_averages_stage_scores_and_mask_probabilities(monkeypatch):
+    from ultralytics.nn.modules.rcnn import CascadeMaskRCNNHead
+
+    class FixedBBoxHead(torch.nn.Module):
+        def __init__(self, class_logit):
+            super().__init__()
+            self.class_logit = class_logit
+
+        def forward(self, pooled):
+            logits = pooled.new_tensor([0.0, self.class_logit]).repeat(pooled.shape[0], 1)
+            return logits, pooled.new_zeros((pooled.shape[0], 4))
+
+    class FixedMaskHead(torch.nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.value = value
+
+        def forward(self, pooled):
+            return pooled.new_full((pooled.shape[0], 1, 28, 28), self.value)
+
+    head = CascadeMaskRCNNHead(
+        [4],
+        1,
+        {
+            "rpn": {"strides": [4], "anchor_scales": [1], "anchor_ratios": [1.0]},
+            "roi": {"featmap_strides": [4]},
+            "test": {"score_thresh": 0.0, "max_dets": 10},
+            "bbox_head": {"hidden_dim": 8},
+            "mask_head": {"dim": 4, "num_convs": 1},
+        },
+    )
+    head.bbox_heads = torch.nn.ModuleList([FixedBBoxHead(1.0), FixedBBoxHead(2.0), FixedBBoxHead(3.0)])
+    head.mask_heads = torch.nn.ModuleList([FixedMaskHead(10.0), FixedMaskHead(10.0), FixedMaskHead(-10.0)])
+    proposal = torch.tensor([[0.0, 0.0, 4.0, 4.0]])
+    monkeypatch.setattr(head, "_rpn_loss_and_proposals", lambda *args, **kwargs: (torch.tensor(0.0), torch.tensor(0.0), [proposal]))
+
+    pred = head.eval()([torch.zeros(1, 4, 1, 1)])[0]
+    expected_score = torch.stack([torch.softmax(torch.tensor([0.0, value]), 0)[1] for value in (1.0, 2.0, 3.0)]).mean()
+
+    assert pred["conf"].shape == (1,)
+    assert torch.allclose(pred["conf"][0], expected_score)
+    assert pred["masks"].shape == (1, 4, 4)
+    assert pred["masks"].all()  # The final-stage mask alone is negative; probability merging keeps it.
+
+
 def test_oriented_rcnn_routes_through_rotated_roi_align(monkeypatch):
     import ultralytics.nn.modules.rcnn as rcnn_module
 

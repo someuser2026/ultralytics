@@ -46,20 +46,19 @@ def test_mask2former_head_train_and_eval_contracts():
     head = Mask2FormerHead(2, _mask2former_cfg(), ch=[8, 16, 32, 64])
 
     raw = head.train()(_features())
-    assert {"boxes", "scores", "feats", "mask_coefficient", "proto"} <= set(raw)
+    assert {"pred_logits", "pred_masks", "aux_outputs", "feats"} <= set(raw)
     assert raw["pred_logits"].shape == (2, 6, 3)
     assert raw["pred_masks"].shape == (2, 6, 16, 16)
-    assert raw["boxes"].shape == (2, 4, 6)
-    assert raw["scores"].shape == (2, head.nc, 6)
-    assert raw["mask_coefficient"].shape == (2, head.num_queries, head.num_queries)
-    assert raw["proto"].shape == raw["pred_masks"].shape
     assert len(raw["aux_outputs"]) == 2
 
-    (pred, proto), eval_raw = head.eval()(_features())
-    assert {"boxes", "scores", "feats", "mask_coefficient", "proto"} <= set(eval_raw)
+    eval_raw = head.eval()(_features())
+    assert {"pred_logits", "pred_masks", "feats"} <= set(eval_raw)
     assert eval_raw["pred_logits"].shape == (2, 6, 3)
-    assert pred.shape == (2, 4 + head.nc + head.num_queries, head.num_queries)
-    assert proto.shape == (2, head.num_queries, 16, 16)
+
+    head.export = True
+    logits, masks = head(_features())
+    assert logits.shape == (2, 6, 3)
+    assert masks.shape == (2, 6, 16, 16)
 
 
 @pytest.mark.skipif(not TORCH_READY, reason="torch is required")
@@ -156,3 +155,111 @@ def test_mask2former_builds_from_segmentation_yaml_style_config():
     assert type(head).__name__ == "Mask2FormerHead"
     assert head.stride.tolist() == [2.0, 4.0, 8.0, 16.0]
     assert isinstance(model.init_criterion(), Mask2FormerInstanceLoss)
+
+
+@pytest.mark.skipif(not TORCH_READY, reason="torch is required")
+def test_mask2former_reference_instance_postprocess_matches_expected_scores_and_boxes():
+    from ultralytics.models.mask2former.postprocess import (
+        finalize_mask2former_instances,
+        select_mask2former_instances,
+    )
+
+    logits = torch.tensor([[[4.0, 0.0, -3.0], [3.0, 2.0, -2.0]]])
+    masks = torch.full((1, 2, 4, 4), -2.0)
+    masks[0, 0, 1:3, 1:3] = 2.0
+    selection = select_mask2former_instances(logits, masks, num_classes=2, max_per_image=2)[0]
+    result = finalize_mask2former_instances(selection, selection["mask_logits"])
+
+    assert result["bboxes"].tolist() == [[1.0, 1.0, 3.0, 3.0], [0.0, 0.0, 0.0, 0.0]]
+    assert result["masks"].shape == (2, 4, 4)
+    assert result["conf"][0] > 0
+    assert result["conf"][1] == 0
+
+
+@pytest.mark.skipif(not TORCH_READY, reason="torch is required")
+def test_mask2former_reference_selection_keeps_overlapping_instances_without_nms():
+    from ultralytics.models.mask2former.postprocess import select_mask2former_instances
+
+    logits = torch.tensor([[[6.0, -3.0], [5.0, -3.0]]])
+    masks = torch.ones(1, 2, 4, 4)
+    selection = select_mask2former_instances(logits, masks, num_classes=1, max_per_image=2)[0]
+
+    assert selection["query_indices"].numel() == 2
+    assert set(selection["query_indices"].tolist()) == {0, 1}
+
+
+@pytest.mark.skipif(not TORCH_READY, reason="torch is required")
+def test_mask2former_predictor_returns_standard_results_without_generic_nms():
+    import numpy as np
+    from types import SimpleNamespace
+
+    from ultralytics.models.mask2former.predict import Mask2FormerPredictor
+
+    predictor = Mask2FormerPredictor.__new__(Mask2FormerPredictor)
+    predictor.args = SimpleNamespace(max_det=2)
+    predictor.model = SimpleNamespace(names={0: "foreground"})
+    predictor.batch = (["image.png"],)
+    raw = {
+        "pred_logits": torch.tensor([[[6.0, -3.0], [5.0, -3.0]]]),
+        "pred_masks": torch.ones(1, 2, 4, 4),
+    }
+    results = predictor.postprocess(raw, torch.zeros(1, 3, 8, 8), [np.zeros((8, 8, 3), dtype=np.uint8)])
+
+    assert len(results) == 1
+    assert results[0].boxes.data.shape == (2, 6)
+    assert results[0].masks.data.shape == (2, 8, 8)
+
+
+@pytest.mark.skipif(not TORCH_READY, reason="torch is required")
+def test_mask2former_validator_returns_standard_segmentation_dictionary():
+    from ultralytics.models.mask2former.val import Mask2FormerValidator
+
+    validator = Mask2FormerValidator.__new__(Mask2FormerValidator)
+    validator.args = types.SimpleNamespace(max_det=2)
+    validator.nc = 1
+    validator._last_imgsz = (8, 8)
+    validator.segment_head = types.SimpleNamespace(
+        max_per_image=2,
+        mask_threshold=0.5,
+        point_rend_enabled=False,
+    )
+    raw = {
+        "pred_logits": torch.tensor([[[6.0, -3.0], [5.0, -3.0]]]),
+        "pred_masks": torch.ones(1, 2, 4, 4),
+    }
+
+    predictions = validator.postprocess(raw)
+
+    assert len(predictions) == 1
+    assert set(predictions[0]) == {"bboxes", "conf", "cls", "masks"}
+    assert predictions[0]["bboxes"].shape == (2, 4)
+    assert predictions[0]["masks"].shape == (2, 8, 8)
+
+
+@pytest.mark.skipif(not TORCH_READY, reason="torch is required")
+def test_yolo_routes_mask2former_head_to_dedicated_family(tmp_path):
+    import numpy as np
+
+    from ultralytics import YOLO
+    from ultralytics.models.mask2former import Mask2Former
+    from ultralytics.utils import YAML
+
+    cfg = {
+        "nc": 1,
+        "backbone": [
+            [-1, 1, "Conv", [8, 3, 2]],
+            [-1, 1, "Conv", [16, 3, 2]],
+            [-1, 1, "Conv", [32, 3, 2]],
+            [-1, 1, "Conv", [64, 3, 2]],
+        ],
+        "head": [[[0, 1, 2, 3], 1, "Mask2FormerHead", [1, _mask2former_cfg(feature_strides=[2, 4, 8, 16], common_stride=2)]]],
+    }
+    model_yaml = tmp_path / "tiny-mask2former.yaml"
+    YAML.save(model_yaml, cfg)
+    model = YOLO(model_yaml, task="segment", verbose=False)
+
+    assert isinstance(model, Mask2Former)
+    results = model.predict(np.zeros((32, 32, 3), dtype=np.uint8), imgsz=32, max_det=2, verbose=False)
+    assert len(results) == 1
+    assert results[0].boxes.data.shape == (2, 6)
+    assert results[0].masks.data.shape == (2, 32, 32)

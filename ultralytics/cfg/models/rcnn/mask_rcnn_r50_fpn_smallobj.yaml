@@ -14,7 +14,7 @@ backbone:
   - [0, 1, Index, [3]]
 
 head:
-  - [[1, 2, 3, 4], 1, FPN, [256, {num_outs: 5}]]
+  - [[1, 2, 3, 4], 1, FPN, [256, {implementation: reference, num_outs: 5}]]
   - [[5], 1, MaskRCNNHead, [nc, {
       rpn: {
         anchor_scales: [1, 2, 4],
@@ -28,6 +28,9 @@ head:
         min_box_size: 0.0,
         pos_iou: 0.7,
         neg_iou: 0.3,
+        min_pos_iou: 0.3,
+        match_low_quality: true,
+        gt_max_assign_all: true,
         samples_per_img: 256,
         pos_fraction: 0.5,
         beta: 0.1111111111111111

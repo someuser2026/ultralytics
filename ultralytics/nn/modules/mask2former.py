@@ -678,7 +678,8 @@ class Mask2FormerHead(nn.Module):
         self.nm = self.num_queries
         self.common_stride = int(cfg["common_stride"])
         self.mask_threshold = float(cfg.get("mask_threshold", 0.5))
-        self.max_det = int(cfg.get("max_det", 300))
+        self.max_per_image = int(cfg.get("max_per_image", cfg.get("max_det", 100)))
+        self.max_det = self.max_per_image  # Backward-compatible attribute alias.
         self.end2end = False
         self.export = False
         self.format = None
@@ -749,68 +750,19 @@ class Mask2FormerHead(nn.Module):
         out.setdefault("num_queries", 100)
         return out
 
-    def forward(self, x: list[Tensor]) -> dict[str, Any] | tuple:
-        """Run Mask2Former and adapt eval output to Ultralytics segmentation format."""
+    def forward(self, x: list[Tensor]) -> dict[str, Any] | tuple[Tensor, Tensor]:
+        """Return native Mask2Former predictions; family adapters perform reference instance inference."""
         mask_features, _, multi_scale_features = self.pixel_decoder.forward_features(x)
         outputs = self.predictor(multi_scale_features, mask_features, None)
-        outputs = self._add_standard_outputs(outputs, multi_scale_features)
+        outputs["feats"] = multi_scale_features
         if self.point_rend_enabled and hasattr(self, "point_rend"):
             outputs["pointrend_features"] = self.point_rend.project_features([mask_features])
         self._last_outputs = outputs
         if self.training:
             return outputs
-        pred, proto = self._to_ultralytics(outputs)
-        return (pred, proto) if self.export else ((pred, proto), outputs)
-
-    def _add_standard_outputs(
-        self, outputs: dict[str, Any], feats: list[Tensor]
-    ) -> dict[str, Any]:
-        """Attach standard Ultralytics segmentation raw fields alongside Mask2Former-native fields."""
-        logits = outputs["pred_logits"]
-        masks = outputs["pred_masks"]
-        boxes = self._masks_to_xywh(masks).transpose(1, 2).contiguous()
-        scores = logits.softmax(-1)[..., : self.nc].transpose(1, 2).contiguous()
-        eye = torch.eye(self.num_queries, device=masks.device, dtype=masks.dtype).unsqueeze(0).repeat(masks.shape[0], 1, 1)
-        outputs = dict(outputs)
-        outputs.update(
-            {
-                "boxes": boxes,
-                "scores": scores,
-                "feats": feats,
-                "mask_coefficient": eye.transpose(1, 2).contiguous(),
-                "proto": masks,
-            }
-        )
+        if self.export:
+            return outputs["pred_logits"], outputs["pred_masks"]
         return outputs
-
-    def _to_ultralytics(self, outputs: dict[str, Any]) -> tuple[Tensor, Tensor]:
-        """Convert query logits/masks into the standard `(pred, proto)` segmentation contract."""
-        pred = torch.cat((outputs["boxes"], outputs["scores"], outputs["mask_coefficient"]), dim=1).contiguous()
-        return pred, outputs["proto"]
-
-    def _masks_to_xywh(self, masks: Tensor) -> Tensor:
-        """Derive input-space xywh boxes from predicted query masks."""
-        b, q, h, w = masks.shape
-        probs = masks.sigmoid()
-        binary = probs > self.mask_threshold
-        yy = torch.arange(h, device=masks.device, dtype=masks.dtype).view(1, 1, h, 1).expand(b, q, h, w)
-        xx = torch.arange(w, device=masks.device, dtype=masks.dtype).view(1, 1, 1, w).expand(b, q, h, w)
-        any_pixels = binary.flatten(2).any(-1)
-        fallback = probs == probs.flatten(2).amax(-1).view(b, q, 1, 1)
-        support = torch.where(any_pixels.view(b, q, 1, 1), binary, fallback)
-
-        inf = torch.full((), float("inf"), device=masks.device, dtype=masks.dtype)
-        ninf = torch.full((), float("-inf"), device=masks.device, dtype=masks.dtype)
-        x1 = torch.where(support, xx, inf).flatten(2).amin(-1)
-        y1 = torch.where(support, yy, inf).flatten(2).amin(-1)
-        x2 = torch.where(support, xx, ninf).flatten(2).amax(-1) + 1.0
-        y2 = torch.where(support, yy, ninf).flatten(2).amax(-1) + 1.0
-
-        scale = masks.new_tensor(float(self.common_stride))
-        x1, y1, x2, y2 = x1 * scale, y1 * scale, x2 * scale, y2 * scale
-        bw = (x2 - x1).clamp_min(1.0)
-        bh = (y2 - y1).clamp_min(1.0)
-        return torch.stack((x1 + bw / 2, y1 + bh / 2, bw, bh), dim=-1)
 
 
 def _get_activation_fn(activation: str):
