@@ -5,8 +5,8 @@ nc: 80
 stride: 32
 
 backbone:
-  # Detectron2 FREEZE_AT=2 freezes the stem and res2 (torchvision layer1).
-  - [-1, 1, ResNetBackbone, [resnet50, DEFAULT, 1, true, true]] # 0 -> [C2, C3, C4, C5]
+  # Timm ResNet-50 with torchvision ImageNet-1K V2 weights; stages 1-4 are C2-C5.
+  - [-1, 1, Timm, [resnet50.tv2_in1k, true, 3, true, [1, 2, 3, 4], 32, null, auto, false, false, false, false, 0.0, 0.0]] # 0 -> [C2, C3, C4, C5]
   - [0, 1, Index, [0]]
   - [0, 1, Index, [1]]
   - [0, 1, Index, [2]]
@@ -24,6 +24,7 @@ head:
         anchor_scales: [1, 2, 4],
         anchor_ratios: [0.5, 1.0, 2.0],
         strides: [4, 8, 16, 32, 64],
+        anchor_offset: 0.0,
         pre_nms_topk_train: 2000,
         post_nms_topk_train: 1000,
         pre_nms_topk_test: 1000,
@@ -32,11 +33,13 @@ head:
         min_box_size: 0.0,
         pos_iou: 0.7,
         neg_iou: 0.3,
-        min_pos_iou: 0.3,
+        min_pos_iou: 0.0,
         match_low_quality: true,
         gt_max_assign_all: true,
+        low_quality_reassign_gt: false,
         samples_per_img: 256,
         pos_fraction: 0.5,
+        loss_normalizer: fixed_batch_size,
         beta: 0.0
       },
       roi: {

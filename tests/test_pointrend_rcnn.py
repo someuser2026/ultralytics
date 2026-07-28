@@ -94,15 +94,36 @@ def test_yaml_matches_detectron2_style_architecture_and_small_anchors():
     backbone_args = cfg["backbone"][0][3]
     fpn_cfg = cfg["head"][0][3][1]
     head_cfg = cfg["head"][-1][3][1]
+    rpn_cfg = head_cfg["rpn"]
     point_cfg = head_cfg["pointrend"]
 
     assert guess_model_task(cfg) == "segment"
     assert cfg["head"][-1][-2] == "PointRendRCNNHead"
-    assert backbone_args == ["resnet50", "DEFAULT", 1, True, True]
+    assert cfg["backbone"][0][-2] == "Timm"
+    assert backbone_args == [
+        "resnet50.tv2_in1k",
+        True,
+        3,
+        True,
+        [1, 2, 3, 4],
+        32,
+        None,
+        "auto",
+        False,
+        False,
+        False,
+        False,
+        0.0,
+        0.0,
+    ]
     assert fpn_cfg["implementation"] == "reference"
     assert fpn_cfg["num_outs"] == 5
     assert fpn_cfg["weight_init"] == "detectron2"
-    assert head_cfg["rpn"]["anchor_scales"] == [1, 2, 4]
+    assert rpn_cfg["anchor_scales"] == [1, 2, 4]
+    assert rpn_cfg["anchor_offset"] == 0.0
+    assert rpn_cfg["min_pos_iou"] == 0.0
+    assert rpn_cfg["low_quality_reassign_gt"] is False
+    assert rpn_cfg["loss_normalizer"] == "fixed_batch_size"
     assert head_cfg["roi"] == {"pool_size": 7, "sampling_ratio": 0, "featmap_strides": [4, 8, 16, 32]}
     assert point_cfg["coarse_pool_resolution"] == 14
     assert point_cfg["coarse_output_resolution"] == 7
@@ -148,6 +169,10 @@ def test_dedicated_head_topology_initialization_and_class_specific_outputs():
     assert coarse.predictor.weight.std().item() == pytest.approx(0.001, rel=0.15)
     assert point.predictor.weight.std().item() == pytest.approx(0.001, rel=0.2)
     assert head.bbox_head.bbox_pred.weight.std().item() == pytest.approx(0.001, rel=0.15)
+    assert head.anchor_generator.offset == 0.0
+    assert head.cfg["rpn"]["min_pos_iou"] == 0.0
+    assert head.cfg["rpn"]["low_quality_reassign_gt"] is False
+    assert head.cfg["rpn"]["loss_normalizer"] == "fixed_batch_size"
 
 
 def test_coarse_grid_uses_direct_p2_and_reference_regular_coordinates(monkeypatch):
@@ -242,7 +267,7 @@ def test_aligned_coarse_targets_pass_fractional_boxes_without_rounding(monkeypat
     assert targets.dtype == torch.bool and targets.all()
 
 
-def test_mask_training_uses_gt_class_predicted_boxes():
+def test_mask_training_uses_unclipped_gt_class_predicted_boxes():
     head = _tiny_head(nc=2)
     features = _features()
     proposal = torch.tensor([[17.0, 14.0, 47.0, 51.0]])
@@ -251,21 +276,26 @@ def test_mask_training_uses_gt_class_predicted_boxes():
     with torch.no_grad():
         for parameter in head.bbox_head.parameters():
             parameter.zero_()
-        head.bbox_head.bbox_pred.bias[4] = 0.25
+        head.bbox_head.bbox_pred.bias[6] = 5.0
 
     _, _, mask_rois, gt_indices, classes = head._box_losses_and_mask_rois(
         features,
         [proposal],
         gt_boxes,
         gt_labels,
-        (64, 64),
     )
+    expected_deltas = proposal.new_tensor([[0.0, 0.0, 5.0, 0.0]]).expand(mask_rois.shape[0], -1)
+    expected_boxes = head.stage_coders[0].decode(proposal.expand(mask_rois.shape[0], -1), expected_deltas)
 
     assert mask_rois.shape == (2, 5)
+    assert torch.all(mask_rois[:, 0] == 0)
     assert torch.all(classes == 1)
     assert torch.all(gt_indices == 0)
-    assert torch.all(mask_rois[:, 1] > proposal[0, 0])
-    assert not torch.equal(mask_rois[:, 1:5], proposal.expand_as(mask_rois[:, 1:5]))
+    assert torch.allclose(mask_rois[:, 1:5], expected_boxes)
+    assert torch.all(mask_rois[:, 1] < 0)
+    assert torch.all(mask_rois[:, 3] > 64)
+    assert not mask_rois.requires_grad
+    assert mask_rois.grad_fn is None
 
 
 def test_joint_loss_has_finite_nonzero_gradients_for_every_expected_group():
@@ -421,7 +451,7 @@ def test_model_build_overrides_dataset_classes_without_generic_adapter(monkeypat
     from ultralytics.nn.tasks import RCNNSegmentationModel, yaml_model_load
 
     cfg = deepcopy(yaml_model_load(MODEL_YAML))
-    cfg["backbone"][0][3][1] = None
+    cfg["backbone"][0][3][1] = False
     model = RCNNSegmentationModel(cfg, nc=1, verbose=False)
     head = model.model[-1]
 

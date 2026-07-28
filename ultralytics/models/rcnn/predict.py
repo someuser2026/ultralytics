@@ -53,19 +53,23 @@ class RCNNSegmentationPredictor(SegmentationPredictor):
                 )
                 masks = probabilities >= _RCNN_MASK_THRESHOLD
             else:
-                masks = boxes.new_zeros((0, orig_img.shape[0], orig_img.shape[1]), dtype=torch.bool)
-        elif masks is not None and masks.numel():
-            masks = ops.scale_image(
-                masks.permute(1, 2, 0).contiguous().float().cpu().numpy(),
-                orig_img.shape,
-            )
-            masks = torch.as_tensor(np.transpose(masks, (2, 0, 1))) > _RCNN_MASK_THRESHOLD
-            keep = masks.flatten(1).any(dim=1)
-            det = det[keep.to(det.device)]
-            masks = masks[keep]
+                masks = boxes.new_zeros((det.shape[0], orig_img.shape[0], orig_img.shape[1]), dtype=torch.bool)
+        elif masks is not None:
+            if masks.shape[0] != det.shape[0]:
+                raise ValueError(
+                    "RCNN output has mismatched detection and image-mask counts: "
+                    f"{det.shape[0]} detections versus {masks.shape[0]} masks."
+                )
+            if masks.numel():
+                masks = ops.scale_image(
+                    masks.permute(1, 2, 0).contiguous().float().cpu().numpy(),
+                    orig_img.shape,
+                )
+                masks = torch.as_tensor(np.transpose(masks, (2, 0, 1))) >= _RCNN_MASK_THRESHOLD
+            else:
+                masks = boxes.new_zeros((det.shape[0], orig_img.shape[0], orig_img.shape[1]), dtype=torch.bool)
         else:
-            det = det[:0]
-            masks = det.new_zeros((0, orig_img.shape[0], orig_img.shape[1]), dtype=torch.bool)
+            masks = boxes.new_zeros((det.shape[0], orig_img.shape[0], orig_img.shape[1]), dtype=torch.bool)
         return Results(orig_img, path=img_path, names=self.model.names, boxes=det, masks=masks)
 
 

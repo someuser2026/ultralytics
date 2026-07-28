@@ -544,10 +544,14 @@ class PointRendRCNNHead(_AxisRCNNBase):
         _AxisRCNNBase.default_cfg,
         {
             "rpn": {
+                "anchor_offset": 0.0,
                 "pre_nms_topk_train": 2000,
                 "post_nms_topk_train": 1000,
                 "pre_nms_topk_test": 1000,
                 "post_nms_topk_test": 1000,
+                "min_pos_iou": 0.0,
+                "low_quality_reassign_gt": False,
+                "loss_normalizer": "fixed_batch_size",
                 "beta": 0.0,
             },
             "roi": {"pool_size": 7, "sampling_ratio": 0},
@@ -597,9 +601,8 @@ class PointRendRCNNHead(_AxisRCNNBase):
         proposals: list[Tensor],
         gt_boxes: list[Tensor],
         gt_labels: list[Tensor],
-        image_shape: tuple[int, int],
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Compute Fast R-CNN losses and return GT-class predicted positive boxes."""
+        """Compute Fast R-CNN losses and return intentionally unclipped GT-class predicted positive boxes."""
 
         sampled_rois, labels_all, matched_boxes, matched_gt_indices = [], [], [], []
         for batch_index, props in enumerate(proposals):
@@ -659,10 +662,7 @@ class PointRendRCNNHead(_AxisRCNNBase):
                 reduction="sum",
             ) / max(labels.numel(), 1)
             with torch.no_grad():
-                predicted_boxes = _clip_boxes(
-                    self.stage_coders[0].decode(rois[positive, 1:5], selected_deltas),
-                    image_shape,
-                )
+                predicted_boxes = self.stage_coders[0].decode(rois[positive, 1:5], selected_deltas)
             mask_rois = torch.cat((rois[positive, :1], predicted_boxes.detach()), dim=1)
             return class_loss, box_loss, mask_rois, gt_indices[positive], classes
 
@@ -691,7 +691,6 @@ class PointRendRCNNHead(_AxisRCNNBase):
             proposals,
             gt_boxes,
             gt_labels,
-            image_shape,
         )
         coarse_mask, point = self.point_rend.losses(
             feats[0],
