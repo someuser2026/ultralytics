@@ -56,8 +56,8 @@ reset_args_keys:
   - single_cls
 
 # Segmentation
-overlap_mask: true # (bool) merge instance masks into one mask during training (segment only)
-mask_ratio: 8 # (int) mask downsample ratio (segment only)
+overlap_mask: false # (bool) merge instance masks into one mask during training (segment only)
+mask_ratio: 1 # (int) mask downsample ratio (segment only)
 pointrend_mode: joint # (str) PointRend training mode: joint or frozen
 pointrend_train_num_points: 196 # (int) uncertainty-biased points supervised per training instance
 pointrend_oversample_ratio: 3.0 # (float) random candidate oversampling ratio for training points

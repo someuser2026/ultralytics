@@ -1,6 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-# RHINO-ResNet50 oriented bounding box model with 4 decoder feature levels.
+# RHINO PHC-Haus R50 parity model. All RHINO behavior remains in RHINO-only modules.
 
 nc: 80
 scales:
@@ -8,55 +8,44 @@ scales:
 
 rhino:
   version: v2
-  num_queries: 300
-  num_denoising_queries: 200
+  num_queries: 900
+  num_denoising_queries: 100
   dn_group_mode: dynamic
   max_num_groups: 30
+  max_candidates: 500
+  focal_alpha: 0.25
+  focal_gamma: 2.0
   matcher_costs:
     - {type: focal, weight: 2.0}
     - {type: hausdorff, weight: 5.0, num_points: 4}
-    - {type: probiou, weight: 2.0}
+    - {type: gdcost, loss_type: kld, fun: log1p, tau: 1.0, alpha: 1.0, sqrt: false, weight: 5.0}
   dn_matcher_costs:
     - {type: focal, weight: 2.0}
-    - {type: center_l1, weight: 5.0}
-    - {type: probiou, weight: 2.0}
-  loss_weights: {class: 1.0, bbox: 5.0, giou: 2.0, no_object: 0.1}
-  loss_types: {bbox: l1, giou: probiou}
+    - {type: hausdorff, weight: 5.0, num_points: 4}
+    - {type: gdcost, loss_type: kld, fun: log1p, tau: 1.0, alpha: 1.0, sqrt: false, weight: 5.0}
+  loss_weights: {class: 1.0, bbox: 5.0, giou: 5.0, no_object: 0.0}
+  loss_types: {bbox: l1, giou: kld}
 
 backbone:
-  - [-1, 1, ResNetLayer, [3, 64, 1, True, 1]]
-  - [-1, 1, ResNetLayer, [64, 64, 1, False, 3]]
-  - [-1, 1, ResNetLayer, [256, 128, 2, False, 4]]
-  - [-1, 1, ResNetLayer, [512, 256, 2, False, 6]]
-  - [-1, 1, ResNetLayer, [1024, 512, 2, False, 3]]
+  - [-1, 1, Timm, [
+      resnet50,
+      false,
+      3,
+      true,
+      [2, 3, 4],
+      32,
+      null,
+      auto,
+      false,
+      false,
+      false,
+      false,
+      0.0,
+      0.0
+    ]]
+  - [0, 1, Index, [0]]
+  - [0, 1, Index, [1]]
+  - [0, 1, Index, [2]]
 
 head:
-  - [-1, 1, Conv, [256, 1, 1, None, 1, 1, False]]
-  - [-1, 1, AIFI, [1024, 8]]
-  - [-1, 1, Conv, [256, 1, 1]]
-
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [3, 1, Conv, [256, 1, 1, None, 1, 1, False]]
-  - [[-2, -1], 1, Concat, [1]]
-  - [-1, 3, RepC3, [256]]
-  - [-1, 1, Conv, [256, 1, 1]]
-
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [2, 1, Conv, [256, 1, 1, None, 1, 1, False]]
-  - [[-2, -1], 1, Concat, [1]]
-  - [-1, 3, RepC3, [256]]
-
-  - [-1, 1, Conv, [256, 3, 2]]
-  - [[-1, 12], 1, Concat, [1]]
-  - [-1, 3, RepC3, [256]]
-
-  - [-1, 1, Conv, [256, 3, 2]]
-  - [[-1, 7], 1, Concat, [1]]
-  - [-1, 3, RepC3, [256]]
-
-  - [16, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [1, 1, Conv, [256, 1, 1, None, 1, 1, False]]
-  - [[-2, -1], 1, Concat, [1]]
-  - [-1, 3, RepC3, [256]]
-
-  - [[26, 16, 19, 22], 1, RHINOOBBDecoder, [nc]]
+  - [[1, 2, 3], 1, RHINOOBBDecoder, [nc, 256, 900, 4, 8, 6, 2048]]

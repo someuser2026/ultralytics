@@ -1630,6 +1630,8 @@ class RTDETROBBModel(RTDETRDetectionModel):
 class RHINOOBBModel(RTDETROBBModel):
     """RHINO OBB model that configures the decoder and criterion from the YAML rhino block."""
 
+    _VALIDATION_CONTEXT_KEY = "_rhino_inference_context"
+
     def __init__(self, cfg="rhino-r50-obb.yaml", ch=3, nc=None, verbose=True):
         self.task = "obb"
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
@@ -1651,6 +1653,8 @@ class RHINOOBBModel(RTDETROBBModel):
             dn_matcher_costs=rhino_cfg.get("dn_matcher_costs"),
             loss_weights=rhino_cfg.get("loss_weights"),
             loss_types=rhino_cfg.get("loss_types"),
+            gamma=float(rhino_cfg.get("focal_gamma", 2.0)),
+            alpha=float(rhino_cfg.get("focal_alpha", 0.25)),
             use_shoreline_prior_loss=bool(_get_cfg_value(model_args, "use_shoreline_prior_loss", False)),
             use_land_water_prior_loss=bool(_get_cfg_value(model_args, "use_land_water_prior_loss", False)),
             shoreline_prior_point_mode=_get_cfg_value(model_args, "shoreline_prior_point_mode", "center"),
@@ -1669,12 +1673,40 @@ class RHINOOBBModel(RTDETROBBModel):
         bs = img.shape[0]
         batch_idx = batch["batch_idx"]
         gt_groups = [(batch_idx == i).sum().item() for i in range(bs)]
+        image_shapes = batch.get("img_shapes")
+        if image_shapes is None:
+            image_shapes = torch.tensor(
+                [[int(img.shape[-2]), int(img.shape[-1])]] * bs,
+                dtype=torch.long,
+                device=img.device,
+            )
+        else:
+            image_shapes = torch.as_tensor(image_shapes, device=img.device, dtype=torch.long)
+        image_shapes = image_shapes.reshape(bs, 2)
+
+        from ultralytics.utils import ops
+
+        target_batch_idx = batch_idx.to(img.device, dtype=torch.long).view(-1)
+        gt_bboxes = batch["bboxes"].to(device=img.device).clone()
+        target_shapes = image_shapes[target_batch_idx]
+        target_scales = torch.stack(
+            (target_shapes[:, 1], target_shapes[:, 0], target_shapes[:, 1], target_shapes[:, 0]), dim=-1
+        ).to(dtype=gt_bboxes.dtype)
+        gt_bboxes[..., :4] *= target_scales
+        gt_bboxes = ops.regularize_rboxes(gt_bboxes, angle_mode="le90")
+        gt_bboxes[..., :4] /= target_scales
+        gt_bboxes[..., 4] = torch.remainder(gt_bboxes[..., 4], math.pi) / math.pi
         targets = {
             "cls": batch["cls"].to(img.device, dtype=torch.long).view(-1),
-            "bboxes": batch["bboxes"].to(device=img.device),
-            "batch_idx": batch_idx.to(img.device, dtype=torch.long).view(-1),
+            "bboxes": gt_bboxes,
+            "batch_idx": target_batch_idx,
             "gt_groups": gt_groups,
+            "img_shapes": image_shapes,
         }
+        if "padding_mask" in batch:
+            targets["padding_mask"] = batch["padding_mask"].to(
+                img.device, dtype=torch.bool, non_blocking=img.device.type == "cuda"
+            )
         if "land_water_mask" in batch:
             targets["land_water_mask"] = batch["land_water_mask"].to(
                 img.device, non_blocking=img.device.type == "cuda"
@@ -1685,15 +1717,12 @@ class RHINOOBBModel(RTDETROBBModel):
             )
 
         if preds is None:
-            preds = self.predict(
-                img,
-                batch={
-                    "cls": targets["cls"],
-                    "bboxes": targets["bboxes"],
-                    "batch_idx": targets["batch_idx"],
-                    "gt_groups": targets["gt_groups"],
-                },
-            )
+            head_batch = {
+                key: targets[key]
+                for key in ("cls", "bboxes", "batch_idx", "gt_groups", "img_shapes", "padding_mask")
+                if key in targets
+            }
+            preds = self.predict(img, batch=head_batch, metadata_vec=batch.get("metadata_vec"))
         dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = preds if self.training else preds[1]
         if dn_meta is None:
             dn_bboxes, dn_scores = None, None
@@ -1719,6 +1748,36 @@ class RHINOOBBModel(RTDETROBBModel):
                 )
             ],
             device=img.device,
+        )
+
+    def predict(
+        self,
+        x,
+        profile=False,
+        visualize=False,
+        batch=None,
+        augment=False,
+        embed=None,
+        metadata_vec=None,
+    ):
+        """Predict with an optional RHINO-only validation mask context."""
+        if isinstance(metadata_vec, dict) and metadata_vec.get(self._VALIDATION_CONTEXT_KEY, False):
+            context = metadata_vec
+            metadata_vec = context.get("metadata_vec")
+            context_batch = {
+                key: context[key]
+                for key in ("padding_mask", "img_shapes")
+                if context.get(key) is not None
+            }
+            batch = {**context_batch, **(batch or {})}
+        return super().predict(
+            x,
+            profile=profile,
+            visualize=visualize,
+            batch=batch,
+            augment=augment,
+            embed=embed,
+            metadata_vec=metadata_vec,
         )
 
 

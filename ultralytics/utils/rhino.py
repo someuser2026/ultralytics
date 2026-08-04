@@ -11,9 +11,38 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from torch import nn
 
-from ultralytics.utils.loss import DETRLoss, RTDETROBBLoss, _compute_obb_spatial_prior_losses
+from ultralytics.utils.loss import RTDETROBBLoss, _compute_obb_spatial_prior_losses
 from ultralytics.utils.metrics import batch_probiou, probiou
 from ultralytics.utils.ops import xywhr2xyxyxyxy
+
+
+def rhino_boxes_to_physical(boxes: torch.Tensor, image_shape: tuple[int, int] | torch.Tensor) -> torch.Tensor:
+    """Convert normalized RHINO boxes to pixel ``cxcywh`` and radian angles."""
+    shape = torch.as_tensor(image_shape, dtype=boxes.dtype, device=boxes.device).flatten()
+    if shape.numel() < 2:
+        raise ValueError(f"RHINO image_shape must contain height and width, got {image_shape!r}.")
+    height, width = shape[0], shape[1]
+    factor = torch.stack((width, height, width, height, boxes.new_tensor(torch.pi)))
+    return boxes[..., :5] * factor
+
+
+def _rhino_boxes_to_hausdorff_space(boxes: torch.Tensor) -> torch.Tensor:
+    """Keep RHINO ``cxcywh`` normalized and convert only ``angle/pi`` to radians."""
+    converted = boxes[..., :5].clone()
+    converted[..., 4] *= torch.pi
+    return converted
+
+
+def _distributed_mean(value: int | float | torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Synchronize a RHINO loss normalizer across distributed workers."""
+    if torch.is_tensor(value):
+        normalizer = value.detach().to(device=device, dtype=torch.float32).reshape(1)
+    else:
+        normalizer = torch.tensor([float(value)], device=device)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(normalizer)
+        normalizer /= torch.distributed.get_world_size()
+    return normalizer.clamp_min(1.0)
 
 
 def xy_wh_r_2_xy_sigma(xywhr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -152,7 +181,15 @@ class RHINOHungarianMatcher(nn.Module):
     DEFAULT_COSTS = (
         {"type": "focal", "weight": 2.0},
         {"type": "hausdorff", "weight": 5.0, "num_points": 4},
-        {"type": "gdcost", "loss_type": "kld", "fun": "log1p", "tau": 1.0, "alpha": 1.0, "sqrt": False, "weight": 2.0},
+        {
+            "type": "gdcost",
+            "loss_type": "kld",
+            "fun": "log1p",
+            "tau": 1.0,
+            "alpha": 1.0,
+            "sqrt": False,
+            "weight": 5.0,
+        },
     )
 
     def __init__(
@@ -175,18 +212,30 @@ class RHINOHungarianMatcher(nn.Module):
         gt_bboxes: torch.Tensor,
         gt_cls: torch.Tensor,
         gt_groups: list[int],
+        image_shapes: list[tuple[int, int]] | torch.Tensor | None = None,
         **_: Any,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         bs = pred_scores.shape[0]
         device = pred_bboxes.device
         if sum(gt_groups) == 0:
-            return [(torch.zeros(0, dtype=torch.long, device=device), torch.zeros(0, dtype=torch.long, device=device)) for _ in range(bs)]
+            return [
+                (
+                    torch.zeros(0, dtype=torch.long, device=device),
+                    torch.zeros(0, dtype=torch.long, device=device),
+                )
+                for _ in range(bs)
+            ]
 
         results = []
         gt_offset = 0
         for batch_idx, num_gt in enumerate(gt_groups):
             if num_gt == 0:
-                results.append((torch.zeros(0, dtype=torch.long, device=device), torch.zeros(0, dtype=torch.long, device=device)))
+                results.append(
+                    (
+                        torch.zeros(0, dtype=torch.long, device=device),
+                        torch.zeros(0, dtype=torch.long, device=device),
+                    )
+                )
                 continue
             gt_slice = slice(gt_offset, gt_offset + num_gt)
             cost = self.cost_matrix(
@@ -194,6 +243,7 @@ class RHINOHungarianMatcher(nn.Module):
                 pred_scores[batch_idx],
                 gt_bboxes[gt_slice],
                 gt_cls[gt_slice],
+                image_shape=image_shapes[batch_idx] if image_shapes is not None else (1, 1),
             )
             row_ind, col_ind = linear_sum_assignment(cost.detach().cpu())
             row = torch.as_tensor(row_ind, dtype=torch.long, device=pred_bboxes.device)
@@ -208,6 +258,7 @@ class RHINOHungarianMatcher(nn.Module):
         pred_scores: torch.Tensor,
         gt_bboxes: torch.Tensor,
         gt_cls: torch.Tensor,
+        image_shape: tuple[int, int] | torch.Tensor = (1, 1),
     ) -> torch.Tensor:
         nq = pred_scores.shape[0]
         ng = gt_bboxes.shape[0]
@@ -235,10 +286,14 @@ class RHINOHungarianMatcher(nn.Module):
             elif name in {"centerl1", "center"}:
                 cost = torch.cdist(pred_bboxes[:, :2], gt_bboxes[:, :2], p=1)
             elif name in {"hausdorff", "hausdorffcost"}:
-                cost = hausdorff_pairwise_cost(pred_bboxes, gt_bboxes, num_points=int(cfg.get("num_points", 4)))
+                cost = hausdorff_pairwise_cost(
+                    _rhino_boxes_to_hausdorff_space(pred_bboxes),
+                    _rhino_boxes_to_hausdorff_space(gt_bboxes),
+                    num_points=int(cfg.get("num_points", 4)),
+                )
             elif name in {"gdcost", "gd", "kld"}:
-                pred_gaussian = xy_wh_r_2_xy_sigma(pred_bboxes)
-                gt_gaussian = xy_wh_r_2_xy_sigma(gt_bboxes)
+                pred_gaussian = xy_wh_r_2_xy_sigma(rhino_boxes_to_physical(pred_bboxes, image_shape))
+                gt_gaussian = xy_wh_r_2_xy_sigma(rhino_boxes_to_physical(gt_bboxes, image_shape))
                 cost = pairwise_kld_loss(
                     pred_gaussian,
                     gt_gaussian,
@@ -248,7 +303,9 @@ class RHINOHungarianMatcher(nn.Module):
                     sqrt=bool(cfg.get("sqrt", False)),
                 )
             elif name in {"probiou", "rotatediou", "iou"}:
-                cost = 1.0 - batch_probiou(gt_bboxes, pred_bboxes).transpose(0, 1)
+                physical_pred = rhino_boxes_to_physical(pred_bboxes, image_shape)
+                physical_gt = rhino_boxes_to_physical(gt_bboxes, image_shape)
+                cost = 1.0 - batch_probiou(physical_gt, physical_pred).transpose(0, 1)
             else:
                 raise ValueError(f"Unsupported RHINO matcher cost type {cfg.get('type', name)!r}.")
 
@@ -279,13 +336,18 @@ class DNGroupHungarianAssigner:
         gt_bboxes: torch.Tensor,
         gt_cls: torch.Tensor,
         num_groups: int,
+        image_shape: tuple[int, int] | torch.Tensor = (1, 1),
     ) -> torch.Tensor:
         num_gt = gt_bboxes.shape[0]
         if num_gt == 0 or dn_bboxes.numel() == 0:
             return gt_cls.new_full((dn_bboxes.shape[0],), -1)
 
-        dn_cost = self.matcher.cost_matrix(dn_bboxes, dn_scores, gt_bboxes, gt_cls).view(num_groups, num_gt, num_gt)
-        main_cost = self.matcher.cost_matrix(pred_bboxes, pred_scores, gt_bboxes, gt_cls)
+        dn_cost = self.matcher.cost_matrix(
+            dn_bboxes, dn_scores, gt_bboxes, gt_cls, image_shape=image_shape
+        ).view(num_groups, num_gt, num_gt)
+        main_cost = self.matcher.cost_matrix(
+            pred_bboxes, pred_scores, gt_bboxes, gt_cls, image_shape=image_shape
+        )
         assigned = gt_cls.new_full((num_groups * num_gt,), -1)
 
         for group_idx in range(num_groups):
@@ -303,8 +365,16 @@ class RHINOOBBLoss(RTDETROBBLoss):
 
     DEFAULT_DN_COSTS = (
         {"type": "focal", "weight": 2.0},
-        {"type": "center_l1", "weight": 5.0},
-        {"type": "gdcost", "loss_type": "kld", "fun": "log1p", "tau": 1.0, "alpha": 1.0, "sqrt": False, "weight": 2.0},
+        {"type": "hausdorff", "weight": 5.0, "num_points": 4},
+        {
+            "type": "gdcost",
+            "loss_type": "kld",
+            "fun": "log1p",
+            "tau": 1.0,
+            "alpha": 1.0,
+            "sqrt": False,
+            "weight": 5.0,
+        },
     )
 
     def __init__(
@@ -316,7 +386,7 @@ class RHINOOBBLoss(RTDETROBBLoss):
         loss_types: dict[str, Any] | None = None,
         aux_loss: bool = True,
         use_fl: bool = True,
-        gamma: float = 1.5,
+        gamma: float = 2.0,
         alpha: float = 0.25,
         use_shoreline_prior_loss: bool = False,
         use_land_water_prior_loss: bool = False,
@@ -327,6 +397,15 @@ class RHINOOBBLoss(RTDETROBBLoss):
         land_water_prior_land_threshold: float = 0.05,
         land_water_prior_exp_beta: float = 4.0,
     ):
+        if loss_weights is None:
+            loss_weights = {
+                "class": 1.0,
+                "bbox": 5.0,
+                "giou": 5.0,
+                "no_object": 0.0,
+                "mask": 1.0,
+                "dice": 1.0,
+            }
         super().__init__(
             nc=nc,
             loss_gain=loss_weights,
@@ -352,49 +431,166 @@ class RHINOOBBLoss(RTDETROBBLoss):
             gamma=gamma,
         )
         self.loss_types = {"bbox": "l1", "giou": "kld"}
+        self.focal_gamma = float(gamma)
+        self.focal_alpha = float(alpha)
+        self.bg_cls_weight = 0.0
         if loss_types:
             self.loss_types.update(deepcopy(loss_types))
 
     def _get_loss_bbox(
-        self, pred_bboxes: torch.Tensor, gt_bboxes: torch.Tensor, postfix: str = ""
+        self,
+        pred_bboxes: torch.Tensor,
+        gt_bboxes: torch.Tensor,
+        postfix: str = "",
+        image_shapes: list[tuple[int, int]] | torch.Tensor | None = None,
+        image_indices: torch.Tensor | None = None,
+        normalizer: torch.Tensor | float | None = None,
     ) -> dict[str, torch.Tensor]:
+        """Compute normalized 5D L1 and pixel/radian RHINO geometry loss."""
         name_bbox = f"loss_bbox{postfix}"
         name_giou = f"loss_giou{postfix}"
 
         if len(gt_bboxes) == 0:
+            zero = pred_bboxes.sum() * 0.0
             return {
-                name_bbox: torch.tensor(0.0, device=self.device),
-                name_giou: torch.tensor(0.0, device=self.device),
+                name_bbox: zero,
+                name_giou: zero,
             }
 
-        pred_boxes = pred_bboxes
-        gt_boxes = gt_bboxes
-        if pred_boxes.shape[-1] >= 4:
-            pred_boxes = torch.cat((pred_boxes[..., :2], pred_boxes[..., 2:4].clamp_min(1e-6), pred_boxes[..., 4:]), dim=-1)
-        if gt_boxes.shape[-1] >= 4:
-            gt_boxes = torch.cat((gt_boxes[..., :2], gt_boxes[..., 2:4].clamp_min(1e-6), gt_boxes[..., 4:]), dim=-1)
-
-        bbox_dim = 5 if str(self.loss_types.get("bbox", "l1")).lower() in {"l1", "rboxl1", "xywha"} else 4
+        pred_boxes = torch.cat(
+            (pred_bboxes[..., :2], pred_bboxes[..., 2:4].clamp_min(1e-6), pred_bboxes[..., 4:5]), dim=-1
+        )
+        gt_boxes = torch.cat(
+            (gt_bboxes[..., :2], gt_bboxes[..., 2:4].clamp_min(1e-6), gt_bboxes[..., 4:5]), dim=-1
+        )
+        denominator = (
+            _distributed_mean(len(gt_boxes), pred_boxes.device)
+            if normalizer is None
+            else torch.as_tensor(normalizer, dtype=pred_boxes.dtype, device=pred_boxes.device).clamp_min(1.0)
+        )
         loss_bbox = self.loss_gain["bbox"] * F.l1_loss(
-            pred_boxes[..., :bbox_dim], gt_boxes[..., :bbox_dim], reduction="sum"
-        ) / len(gt_bboxes)
+            pred_boxes, gt_boxes, reduction="sum"
+        ) / denominator
 
+        if image_shapes is None:
+            image_shapes = [(1, 1)]
+        if image_indices is None:
+            image_indices = torch.zeros(len(pred_boxes), dtype=torch.long, device=pred_boxes.device)
+        physical_pred, physical_gt = [], []
+        for image_index in range(len(image_shapes)):
+            selected = image_indices == image_index
+            if selected.any():
+                physical_pred.append(rhino_boxes_to_physical(pred_boxes[selected], image_shapes[image_index]))
+                physical_gt.append(rhino_boxes_to_physical(gt_boxes[selected], image_shapes[image_index]))
+        physical_pred = torch.cat(physical_pred)
+        physical_gt = torch.cat(physical_gt)
         giou_type = str(self.loss_types.get("giou", "kld")).lower()
         if giou_type == "probiou":
-            loss_giou = 1.0 - probiou(pred_boxes[..., :5], gt_boxes[..., :5])
+            loss_giou = 1.0 - probiou(physical_pred, physical_gt)
         elif giou_type == "hausdorff":
-            loss_giou = hausdorff_distance(pred_boxes[..., :5], gt_boxes[..., :5])
+            loss_giou = hausdorff_distance(physical_pred, physical_gt)
         else:
             loss_giou = kld_loss(
-                xy_wh_r_2_xy_sigma(pred_boxes[..., :5]),
-                xy_wh_r_2_xy_sigma(gt_boxes[..., :5]),
+                xy_wh_r_2_xy_sigma(physical_pred),
+                xy_wh_r_2_xy_sigma(physical_gt),
                 fun="log1p",
                 tau=1.0,
                 alpha=1.0,
                 sqrt=False,
             )
-        loss_giou = self.loss_gain["giou"] * (loss_giou.sum() / len(gt_bboxes))
+        loss_giou = self.loss_gain["giou"] * loss_giou.sum() / denominator
         return {name_bbox: loss_bbox.squeeze(), name_giou: loss_giou.squeeze()}
+
+    def _focal_classification_loss(
+        self,
+        scores: torch.Tensor,
+        labels: torch.Tensor,
+        normalizer: torch.Tensor | float,
+        postfix: str = "",
+    ) -> dict[str, torch.Tensor]:
+        """Reference sigmoid focal classification loss."""
+        one_hot = F.one_hot(labels, self.nc + 1)[..., : self.nc].to(scores.dtype)
+        probability = scores.sigmoid()
+        cross_entropy = F.binary_cross_entropy_with_logits(scores, one_hot, reduction="none")
+        probability_target = probability * one_hot + (1 - probability) * (1 - one_hot)
+        alpha_target = self.focal_alpha * one_hot + (1 - self.focal_alpha) * (1 - one_hot)
+        loss = cross_entropy * ((1 - probability_target) ** self.focal_gamma) * alpha_target
+        denominator = torch.as_tensor(normalizer, dtype=scores.dtype, device=scores.device).clamp_min(1.0)
+        return {f"loss_class{postfix}": self.loss_gain["class"] * loss.sum() / denominator}
+
+    def _single_matching_loss(
+        self,
+        pred_bboxes: torch.Tensor,
+        pred_scores: torch.Tensor,
+        batch: dict[str, Any],
+        postfix: str = "",
+    ) -> dict[str, torch.Tensor]:
+        """Match and score one encoder/decoder layer using PHC-Haus costs."""
+        gt_bboxes = batch["bboxes"]
+        gt_cls = batch["cls"]
+        gt_groups = batch["gt_groups"]
+        image_shapes = batch.get("img_shapes", [(1, 1)] * pred_bboxes.shape[0])
+        matches = self.matcher(
+            pred_bboxes,
+            pred_scores,
+            gt_bboxes,
+            gt_cls,
+            gt_groups,
+            image_shapes=image_shapes,
+        )
+        batch_indices = torch.cat(
+            [torch.full_like(source, index) for index, (source, _) in enumerate(matches)]
+        )
+        source_indices = torch.cat([source for source, _ in matches])
+        target_indices = torch.cat([target for _, target in matches])
+
+        labels = torch.full(
+            pred_scores.shape[:2], self.nc, dtype=gt_cls.dtype, device=pred_scores.device
+        )
+        if target_indices.numel():
+            labels[batch_indices, source_indices] = gt_cls[target_indices]
+        positive_normalizer = _distributed_mean(target_indices.numel(), pred_scores.device)
+        losses = self._focal_classification_loss(pred_scores, labels, positive_normalizer, postfix)
+
+        if target_indices.numel():
+            assigned_pred = pred_bboxes[batch_indices, source_indices]
+            assigned_gt = gt_bboxes[target_indices]
+            losses.update(
+                self._get_loss_bbox(
+                    assigned_pred,
+                    assigned_gt,
+                    postfix,
+                    image_shapes=image_shapes,
+                    image_indices=batch_indices,
+                    normalizer=positive_normalizer,
+                )
+            )
+        else:
+            zero = pred_bboxes.sum() * 0.0
+            losses.update({f"loss_bbox{postfix}": zero, f"loss_giou{postfix}": zero})
+        return losses
+
+    def _compute_matching_losses(
+        self, pred_bboxes: torch.Tensor, pred_scores: torch.Tensor, batch: dict[str, Any]
+    ) -> dict[str, torch.Tensor]:
+        """Compute final plus encoder/intermediate auxiliary RHINO losses."""
+        final_losses = self._single_matching_loss(pred_bboxes[-1], pred_scores[-1], batch)
+        if self.aux_loss and len(pred_bboxes) > 1:
+            auxiliary = [
+                self._single_matching_loss(boxes, scores, batch)
+                for boxes, scores in zip(pred_bboxes[:-1], pred_scores[:-1])
+            ]
+            final_losses.update(
+                {
+                    "loss_class_aux": torch.stack([loss["loss_class"] for loss in auxiliary]).sum(),
+                    "loss_bbox_aux": torch.stack([loss["loss_bbox"] for loss in auxiliary]).sum(),
+                    "loss_giou_aux": torch.stack([loss["loss_giou"] for loss in auxiliary]).sum(),
+                }
+            )
+        else:
+            zero = pred_bboxes.sum() * 0.0
+            final_losses.update({"loss_class_aux": zero, "loss_bbox_aux": zero, "loss_giou_aux": zero})
+        return final_losses
 
     def _dn_single(
         self,
@@ -405,22 +601,29 @@ class RHINOOBBLoss(RTDETROBBLoss):
         batch: dict[str, Any],
         dn_meta: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute one PHC denoising layer."""
         device = dn_scores.device
-        bs, num_dn = dn_scores.shape[:2]
+        batch_size, num_dn = dn_scores.shape[:2]
         gt_cls = batch["cls"].to(device=device, dtype=torch.long).view(-1)
         gt_bboxes = batch["bboxes"].to(device=device)
         gt_groups = batch["gt_groups"]
+        image_shapes = batch.get("img_shapes", [(1, 1)] * batch_size)
 
         num_groups = int(dn_meta["num_denoising_groups"])
+        if num_groups <= 0 or num_dn == 0:
+            zero = dn_scores.sum() * 0.0
+            return zero, zero, zero
         queries_per_group = int(num_dn / num_groups)
-        labels = torch.full((bs, num_dn), self.nc, device=device, dtype=gt_cls.dtype)
-        gt_scores = torch.zeros((bs, num_dn), device=device)
+        labels = torch.full((batch_size, num_dn), self.nc, device=device, dtype=gt_cls.dtype)
         pos_pred_boxes: list[torch.Tensor] = []
         pos_target_boxes: list[torch.Tensor] = []
+        pos_image_indices: list[torch.Tensor] = []
         total_new_pos = 0
+        total_new_neg = 0
+        total_original_pos = 0
         gt_offset = 0
 
-        for batch_idx, num_gt in enumerate(gt_groups):
+        for batch_index, num_gt in enumerate(gt_groups):
             if num_gt == 0:
                 continue
 
@@ -429,37 +632,60 @@ class RHINOOBBLoss(RTDETROBBLoss):
             gt_cls_img = gt_cls[gt_slice]
 
             base = torch.arange(num_groups, device=device)[:, None] * queries_per_group
-            pos_inds = (base + torch.arange(num_gt, device=device)[None, :]).reshape(-1)
+            positive_indices = (base + torch.arange(num_gt, device=device)[None]).reshape(-1)
+            negative_indices = positive_indices + queries_per_group // 2
 
             repeated_boxes = gt_boxes_img.repeat(num_groups, 1)
-            pos_pred_boxes.append(dn_bboxes[batch_idx, pos_inds])
+            pos_pred_boxes.append(dn_bboxes[batch_index, positive_indices])
             pos_target_boxes.append(repeated_boxes)
+            pos_image_indices.append(
+                torch.full((len(positive_indices),), batch_index, dtype=torch.long, device=device)
+            )
+            total_original_pos += len(positive_indices)
 
             assigned = self.dn_assigner.assign(
-                pred_bboxes=matching_bboxes[batch_idx],
-                pred_scores=matching_scores[batch_idx],
-                dn_bboxes=dn_bboxes[batch_idx, pos_inds],
-                dn_scores=dn_scores[batch_idx, pos_inds],
+                pred_bboxes=matching_bboxes[batch_index],
+                pred_scores=matching_scores[batch_index],
+                dn_bboxes=dn_bboxes[batch_index, positive_indices],
+                dn_scores=dn_scores[batch_index, positive_indices],
                 gt_bboxes=gt_boxes_img,
                 gt_cls=gt_cls_img,
                 num_groups=num_groups,
+                image_shape=image_shapes[batch_index],
             )
             expected = torch.arange(num_gt, device=device).repeat(num_groups)
-            matched = assigned == expected
-            if matched.any():
-                labels[batch_idx, pos_inds[matched]] = gt_cls_img.repeat(num_groups)[matched]
-                total_new_pos += int(matched.sum())
+            accepted = assigned == expected
+            repeated_classes = gt_cls_img.repeat(num_groups)
+            labels[batch_index, positive_indices[accepted]] = repeated_classes[accepted]
+            total_new_pos += int(accepted.sum())
+            total_new_neg += int((~accepted).sum()) + len(negative_indices)
 
             gt_offset += num_gt
 
-        class_loss = self._get_loss_class(dn_scores, labels, gt_scores, max(total_new_pos, 1))["loss_class"]
+        class_normalizer = _distributed_mean(
+            total_new_pos + total_new_neg * self.bg_cls_weight, device
+        )
+        class_loss = self._focal_classification_loss(dn_scores, labels, class_normalizer)["loss_class"]
         if pos_pred_boxes:
-            bbox_losses = self._get_loss_bbox(torch.cat(pos_pred_boxes, dim=0), torch.cat(pos_target_boxes, dim=0))
+            regression_normalizer = _distributed_mean(total_original_pos, device)
+            bbox_losses = self._get_loss_bbox(
+                torch.cat(pos_pred_boxes),
+                torch.cat(pos_target_boxes),
+                image_shapes=image_shapes,
+                image_indices=torch.cat(pos_image_indices),
+                normalizer=regression_normalizer,
+            )
             bbox_loss = bbox_losses["loss_bbox"]
             giou_loss = bbox_losses["loss_giou"]
         else:
-            bbox_loss = torch.tensor(0.0, device=device)
-            giou_loss = torch.tensor(0.0, device=device)
+            bbox_loss = dn_bboxes.sum() * 0.0
+            giou_loss = dn_bboxes.sum() * 0.0
+        self.last_dn_targets = {
+            "labels": labels.detach(),
+            "new_positive_count": total_new_pos,
+            "new_negative_count": total_new_neg,
+            "original_positive_count": total_original_pos,
+        }
         return class_loss, bbox_loss, giou_loss
 
     def _compute_dn_losses(
@@ -471,6 +697,16 @@ class RHINOOBBLoss(RTDETROBBLoss):
         batch: dict[str, Any],
         dn_meta: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
+        if dn_bboxes.shape[2] == 0 or int(dn_meta.get("num_denoising_groups", 0)) <= 0:
+            zero = dn_bboxes.sum() * 0.0 + dn_scores.sum() * 0.0
+            return {
+                "loss_class_dn": zero,
+                "loss_bbox_dn": zero,
+                "loss_giou_dn": zero,
+                "loss_class_aux_dn": zero,
+                "loss_bbox_aux_dn": zero,
+                "loss_giou_aux_dn": zero,
+            }
         layer_losses = [
             self._dn_single(dn_box, dn_score, mtc_box, mtc_score, batch, dn_meta)
             for dn_box, dn_score, mtc_box, mtc_score in zip(dn_bboxes, dn_scores, matching_bboxes, matching_scores)
@@ -481,9 +717,9 @@ class RHINOOBBLoss(RTDETROBBLoss):
             aux_bbox = torch.stack([x[1] for x in layer_losses[:-1]]).sum()
             aux_giou = torch.stack([x[2] for x in layer_losses[:-1]]).sum()
         else:
-            aux_cls = main_cls.new_tensor(0.0)
-            aux_bbox = main_bbox.new_tensor(0.0)
-            aux_giou = main_giou.new_tensor(0.0)
+            aux_cls = main_cls * 0.0
+            aux_bbox = main_bbox * 0.0
+            aux_giou = main_giou * 0.0
         return {
             "loss_class_dn": main_cls,
             "loss_bbox_dn": main_bbox,
@@ -502,12 +738,22 @@ class RHINOOBBLoss(RTDETROBBLoss):
         dn_meta: dict[str, Any] | None = None,
     ) -> dict[str, torch.Tensor]:
         pred_bboxes, pred_scores = preds
-        total_loss = DETRLoss.forward(self, pred_bboxes, pred_scores, batch)
+        self.device = pred_bboxes.device
+        total_loss = self._compute_matching_losses(pred_bboxes, pred_scores, batch)
 
         if dn_meta is not None and dn_bboxes is not None and dn_scores is not None:
-            total_loss.update(self._compute_dn_losses(dn_bboxes, dn_scores, pred_bboxes[1:], pred_scores[1:], batch, dn_meta))
+            total_loss.update(
+                self._compute_dn_losses(
+                    dn_bboxes,
+                    dn_scores,
+                    pred_bboxes[1:],
+                    pred_scores[1:],
+                    batch,
+                    dn_meta,
+                )
+            )
         else:
-            zero = pred_bboxes.new_tensor(0.0)
+            zero = pred_bboxes.sum() * 0.0
             total_loss.update(
                 {
                     "loss_class_dn": zero,
@@ -526,9 +772,21 @@ class RHINOOBBLoss(RTDETROBBLoss):
             final_bboxes_norm = pred_bboxes[-1]
             final_bboxes = final_bboxes_norm.clone()
             final_scores = pred_scores[-1]
-            _, _, height, width = land_water_map.shape
-            final_bboxes[..., [0, 2]] *= width
-            final_bboxes[..., [1, 3]] *= height
+            image_shapes = batch.get("img_shapes")
+            if image_shapes is None:
+                _, _, height, width = land_water_map.shape
+                image_shapes = final_bboxes.new_tensor([[height, width]]).expand(final_bboxes.shape[0], -1)
+            else:
+                image_shapes = torch.as_tensor(
+                    image_shapes, device=final_bboxes.device, dtype=final_bboxes.dtype
+                ).reshape(final_bboxes.shape[0], 2)
+            heights = image_shapes[:, 0].view(-1, 1)
+            widths = image_shapes[:, 1].view(-1, 1)
+            final_bboxes[..., 0] *= widths
+            final_bboxes[..., 2] *= widths
+            final_bboxes[..., 1] *= heights
+            final_bboxes[..., 3] *= heights
+            final_bboxes[..., 4] *= torch.pi
 
             loss_shoreline_prior, loss_land_water_prior = _compute_obb_spatial_prior_losses(
                 final_bboxes,

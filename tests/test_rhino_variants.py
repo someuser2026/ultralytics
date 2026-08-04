@@ -92,12 +92,13 @@ def test_rhino_decoder_forward_and_loss_smoke(num_levels):
             [
                 [0.25, 0.25, 0.20, 0.10, 0.00],
                 [0.70, 0.60, 0.15, 0.12, 0.20],
-                [0.52, 0.40, 0.10, 0.08, -0.10],
+                [0.52, 0.40, 0.10, 0.08, 0.90],
             ],
             dtype=torch.float32,
         ),
         "batch_idx": torch.tensor([0, 0, 1], dtype=torch.long),
         "gt_groups": [2, 1],
+        "img_shapes": [(128, 128), (128, 128)],
     }
 
     dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = decoder(feats, batch=batch)

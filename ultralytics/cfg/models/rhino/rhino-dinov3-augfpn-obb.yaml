@@ -11,6 +11,9 @@ rhino:
   num_denoising_queries: 100
   dn_group_mode: dynamic
   max_num_groups: 20
+  max_candidates: 500
+  focal_alpha: 0.25
+  focal_gamma: 2.0
   matcher_costs:
     - {type: focal, weight: 2.0}
     - {type: hausdorff, weight: 5.0, num_points: 4}
@@ -77,4 +80,4 @@ head:
   - [22, 1, Index, [2]]
   - [22, 1, Index, [3]]
 
-  - [[23, 24, 25], 1, RHINOOBBDecoder, [nc]]
+  - [[23, 24, 25], 1, RHINOOBBDecoder, [nc, 256, 200, 4, 8, 6, 2048]]
