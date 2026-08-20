@@ -363,7 +363,7 @@ def on_pretrain_routine_start(trainer):
         # req_parts.extend([proj_name_parts[-1]])
         # project_cleaned = "-".join(req_parts) if req_parts else "Ultralytics"
         # project_cleaned = project_cleaned.replace("yolo", "")
-        project_cleaned = trainer.args.project
+        project_cleaned = trainer.args.project.split(os.sep)[-1]
         
         wb.init(
             project=project_cleaned,
