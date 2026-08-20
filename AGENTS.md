@@ -65,6 +65,7 @@ Do not edit the code during the smoke test unless specifcally asked to. Simply r
 - Reuse existing components before adding new abstractions.
 - Check nearby tests/configs before making assumptions.
 - Be careful with absolute dataset paths, scratch paths, and HPC env variables.
+- In hpc submit scripts, keep `plots=False` to prevent large image uploads to `wandb` when `wandb=True`.
 - Ask before deleting non-temporary files.
 - When asked to `check`/`find`/`investigate`/`brainstorm` do not edit any code. Only read the required files.
 - Always ask for clarification if there is ambiguity in a instruction or information provided. Do not assume anything.
