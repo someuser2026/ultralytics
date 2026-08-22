@@ -66,7 +66,7 @@ submit_job() {
   [[ -f "$config" ]] || { echo "Missing config: $config"; exit 1; }
 
   job_name="ab_dino_${prefix}_${dataset}_c${imgsz}"
-  varlist="TASK=${task},IMGSZ=${imgsz},CHECKPOINT=null,TIME_FLOAT=null,EPOCHS=${EPOCHS},DEVICE=0,EXPERIMENT_MODE=${RUN_TAG}_${job_name},OVERLAP=35,KEEP_FRAC=20,MULTISPECTRAL=${multispectral},BATCH=${batch},WORKERS=${WORKERS},CONFIG_YAML=${config},FREEZE=1,SEED=${SEED},WANDB=true,PROJECT=${project}${task_args}${NO_AUG}"
+  varlist="TASK=${task},IMGSZ=${imgsz},CHECKPOINT=null,TIME_FLOAT=null,EPOCHS=${EPOCHS},DEVICE=0,EXPERIMENT_MODE=${RUN_TAG}_${job_name},OVERLAP=35,KEEP_FRAC=20,MULTISPECTRAL=${multispectral},BATCH=${batch},WORKERS=${WORKERS},CONFIG_YAML=${config},FREEZE=1,SEED=${SEED},WANDB=true,PLOTS=false,PROJECT=${project}${task_args}${NO_AUG}"
 
   echo "Submitting ${job_name}: task=${task}, imgsz=${imgsz}, dataset=${dataset}"
   if [[ "$DRY_RUN" == "1" ]]; then
