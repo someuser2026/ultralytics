@@ -14,6 +14,8 @@ set -euo pipefail
 #   bash jobs/train/hpc/bash_scripts_joint/submit_benchmark_models.sh all 8 8 100 0 1
 #   bash jobs/train/hpc/bash_scripts_joint/submit_benchmark_models.sh pointrend,mask2former,rhino 8 8 100 0 0
 #   bash jobs/train/hpc/bash_scripts_joint/submit_benchmark_models.sh --list
+#
+# Optional environment overrides: IMGSZ_OBB, IMGSZ_SEG, MULTISPECTRAL, PROJECT_OBB, PROJECT_SEG
 
 PBS_SCRIPT="jobs/train/hpc/planet_full.pbs"
 MODELS="${1:-all}"
@@ -23,8 +25,11 @@ EPOCHS="${4:-100}"
 SEED="${5:-0}"
 DRY_RUN="${6:-0}"
 
-IMGSZ=448
-MULTISPECTRAL=21
+IMGSZ_OBB="${IMGSZ_OBB:-448}"
+IMGSZ_SEG="${IMGSZ_SEG:-448}"
+MULTISPECTRAL="${MULTISPECTRAL:-21}"
+PROJECT_OBB="${PROJECT_OBB:-benchmark_obb}"
+PROJECT_SEG="${PROJECT_SEG:-benchmark_segment}"
 WORKERS="${WORKERS:-1}"
 BATCH_RHINO="${BATCH_RHINO:-4}"
 BATCH_MASK2FORMER="${BATCH_MASK2FORMER:-4}"
@@ -63,6 +68,8 @@ fi
 
 [[ "$BATCH_OBB" =~ ^[0-9]+$ && "$BATCH_OBB" -ge 1 ]] || { echo "BATCH_OBB must be an integer >= 1"; exit 1; }
 [[ "$BATCH_SEG" =~ ^[0-9]+$ && "$BATCH_SEG" -ge 1 ]] || { echo "BATCH_SEG must be an integer >= 1"; exit 1; }
+[[ "$IMGSZ_OBB" =~ ^[0-9]+$ && "$IMGSZ_OBB" -ge 32 ]] || { echo "IMGSZ_OBB must be an integer >= 32"; exit 1; }
+[[ "$IMGSZ_SEG" =~ ^[0-9]+$ && "$IMGSZ_SEG" -ge 32 ]] || { echo "IMGSZ_SEG must be an integer >= 32"; exit 1; }
 [[ "$EPOCHS" =~ ^[0-9]+$ && "$EPOCHS" -ge 1 ]] || { echo "EPOCHS must be an integer >= 1"; exit 1; }
 [[ "$SEED" =~ ^[0-9]+$ ]] || { echo "SEED must be a non-negative integer"; exit 1; }
 [[ "$DRY_RUN" =~ ^[01]$ ]] || { echo "DRY_RUN must be 0 or 1"; exit 1; }
@@ -82,25 +89,27 @@ submit_job() {
   local job_name="$3"
   local config="$4"
   local freeze="$5"
-  local batch project task_args varlist
+  local batch imgsz project task_args varlist
 
   [[ -f "$config" ]] || { echo "Missing config: $config"; exit 1; }
 
   if [[ "$task" == "obb" ]]; then
     batch="$BATCH_OBB"
-    project="benchmark_obb"
+    imgsz="$IMGSZ_OBB"
+    project="$PROJECT_OBB"
     task_args=",ANGLE_MODE=le90"
   else
     batch="$BATCH_SEG"
-    project="benchmark_segment"
+    imgsz="$IMGSZ_SEG"
+    project="$PROJECT_SEG"
     task_args=",USE_SOFT_IGNORE=false,SDICE=1"
   fi
   [[ "$alias" == "rhino" ]] && batch="$BATCH_RHINO"
   [[ "$alias" == "mask2former" ]] && batch="$BATCH_MASK2FORMER"
 
-  varlist="TASK=${task},IMGSZ=${IMGSZ},CHECKPOINT=null,TIME_FLOAT=null,EPOCHS=${EPOCHS},DEVICE=0,EXPERIMENT_MODE=${RUN_TAG}_${alias},OVERLAP=35,KEEP_FRAC=20,MULTISPECTRAL=${MULTISPECTRAL},BATCH=${batch},WORKERS=${WORKERS},CONFIG_YAML=${config},FREEZE=${freeze},SEED=${SEED},WANDB=true,PROJECT=${project}${task_args}${NO_AUG}"
+  varlist="TASK=${task},IMGSZ=${imgsz},CHECKPOINT=null,TIME_FLOAT=null,EPOCHS=${EPOCHS},DEVICE=0,EXPERIMENT_MODE=${RUN_TAG}_${alias},OVERLAP=35,KEEP_FRAC=20,MULTISPECTRAL=${MULTISPECTRAL},BATCH=${batch},WORKERS=${WORKERS},CONFIG_YAML=${config},FREEZE=${freeze},SEED=${SEED},WANDB=true,PLOTS=false,PROJECT=${project}${task_args}${NO_AUG}"
 
-  echo "Submitting ${alias}: task=${task}, batch=${batch}, config=${config}"
+  echo "Submitting ${alias}: task=${task}, imgsz=${imgsz}, batch=${batch}, config=${config}"
   if [[ "$DRY_RUN" == "1" ]]; then
     printf 'DRY_RUN qsub -V -v %q -N %q %q\n' "$varlist" "$job_name" "$PBS_SCRIPT"
   else
