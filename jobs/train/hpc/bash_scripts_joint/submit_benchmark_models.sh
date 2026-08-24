@@ -57,11 +57,12 @@ JOBS=(
   "mask_rcnn|segment|b_mask_rcnn|ultralytics/cfg/models/rcnn/mask_rcnn_r50_fpn_smallobj.yaml|0"
   "pointrend|segment|b_pointrend|ultralytics/cfg/models/rcnn/pointrend_rcnn_r50_fpn_smallobj.yaml|0"
   "mask2former|segment|b_mask2former|ultralytics/cfg/models/transformer/mask2former-swin-timm-seg.yaml|0"
+  "mask2former_hrnet|segment|b_m2f_hr32|ultralytics/cfg/models/transformer/mask2former-hrnet-w32-timm-seg.yaml|0"
 )
 
 if [[ "$MODELS" == "--list" ]]; then
   echo "OBB: yolo11_obb yolo12_obb dino_obb mamba_yolo_obb mamba_hr_obb hr32_obb rfrcnn orcnn_leg rfcos_r50 rfcos_leg rhino"
-  echo "SEG: yolo11_seg yolo12_seg dino_seg mamba_yolo_seg mamba_hr_seg cascade mask_rcnn pointrend mask2former"
+  echo "SEG: yolo11_seg yolo12_seg dino_seg mamba_yolo_seg mamba_hr_seg cascade mask_rcnn pointrend mask2former mask2former_hrnet"
   echo "UNAVAILABLE: roit_leg (listed in the manuscript but no native Ultralytics config exists)"
   exit 0
 fi
@@ -105,7 +106,7 @@ submit_job() {
     task_args=",USE_SOFT_IGNORE=false,SDICE=1"
   fi
   [[ "$alias" == "rhino" ]] && batch="$BATCH_RHINO"
-  [[ "$alias" == "mask2former" ]] && batch="$BATCH_MASK2FORMER"
+  [[ "$alias" == "mask2former" || "$alias" == "mask2former_hrnet" ]] && batch="$BATCH_MASK2FORMER"
 
   varlist="TASK=${task},IMGSZ=${imgsz},CHECKPOINT=null,TIME_FLOAT=null,EPOCHS=${EPOCHS},DEVICE=0,EXPERIMENT_MODE=${RUN_TAG}_${alias},OVERLAP=35,KEEP_FRAC=20,MULTISPECTRAL=${MULTISPECTRAL},BATCH=${batch},WORKERS=${WORKERS},CONFIG_YAML=${config},FREEZE=${freeze},SEED=${SEED},WANDB=true,PLOTS=false,PROJECT=${project}${task_args}${NO_AUG}"
 

@@ -1,4 +1,5 @@
 from importlib.util import find_spec
+from pathlib import Path
 import types
 
 import pytest
@@ -263,3 +264,56 @@ def test_yolo_routes_mask2former_head_to_dedicated_family(tmp_path):
     assert len(results) == 1
     assert results[0].boxes.data.shape == (2, 6)
     assert results[0].masks.data.shape == (2, 32, 32)
+
+
+@pytest.mark.skipif(not TORCH_READY or find_spec("timm") is None, reason="torch and timm are required")
+def test_timm_swin_dynamic_attention_masks_support_rectangular_inputs():
+    from ultralytics.nn.modules.block import Timm
+
+    backbone = Timm(
+        "swin_tiny_patch4_window7_224.ms_in22k",
+        pretrained=False,
+        in_chans=3,
+        features_only=True,
+        out_indices=(0, 1, 2, 3),
+        pure_transformers=True,
+        dynamic_img_size=True,
+        drop_path_rate=0.0,
+    ).eval()
+    blocks = [module for module in backbone.m.modules() if module.__class__.__name__ == "SwinTransformerBlock"]
+
+    assert blocks
+    assert all(block.dynamic_mask and block.always_partition for block in blocks)
+    assert blocks[-1].shift_size == (3, 3)
+
+    with torch.no_grad():
+        features = backbone(torch.zeros(1, 3, 416, 448))
+
+    assert [tuple(feature.shape) for feature in features] == [
+        (1, 104, 112, 96),
+        (1, 52, 56, 192),
+        (1, 26, 28, 384),
+        (1, 13, 14, 768),
+    ]
+
+
+@pytest.mark.skipif(not TORCH_READY or find_spec("timm") is None, reason="torch and timm are required")
+def test_mask2former_hrnet_w32_timm_config_builds_and_forwards():
+    from ultralytics.nn.tasks import SegmentationModel
+
+    cfg = Path(__file__).parents[1] / "ultralytics/cfg/models/transformer/mask2former-hrnet-w32-timm-seg.yaml"
+    model = SegmentationModel(cfg, ch=3, nc=1, verbose=False).eval()
+    backbone = model.model[0]
+    head = model.model[-1]
+
+    assert backbone.model_name == "hrnet_w32.ms_in1k"
+    assert backbone.out_indices == [1, 2, 3, 4]
+    assert backbone.channels == [128, 256, 512, 1024]
+    assert backbone.strides == [4, 8, 16, 32]
+    assert head.stride.tolist() == [4.0, 8.0, 16.0, 32.0]
+
+    with torch.no_grad():
+        outputs = model(torch.zeros(1, 3, 64, 64))
+
+    assert outputs["pred_logits"].shape == (1, 100, 2)
+    assert outputs["pred_masks"].shape == (1, 100, 16, 16)

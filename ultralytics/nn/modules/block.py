@@ -2360,6 +2360,12 @@ class Timm(nn.Module):
         self.model_name = model
         self.drop_path_rate = drop_path_rate
         self.dynamic_img_size = dynamic_img_size
+
+        # Swin must be configured for dynamic inputs before construction so its shifted-window blocks create
+        # runtime attention masks. Changing PatchEmbed after construction leaves the original static 224px masks.
+        dynamic_model_kwargs = {}
+        if dynamic_img_size and model.startswith("swin"):
+            dynamic_model_kwargs = {"strict_img_size": False, "always_partition": True}
         
         # Try to create model with features_only first to validate out_indices
         try:
@@ -2370,6 +2376,7 @@ class Timm(nn.Module):
                     'pretrained': True,
                     'in_chans': 3,
                     'features_only': features_only,
+                    **dynamic_model_kwargs,
                 }
                 
                 if features_only:
@@ -2395,6 +2402,7 @@ class Timm(nn.Module):
                     'pretrained': pretrained,
                     'in_chans': in_chans,
                     'features_only': features_only,
+                    **dynamic_model_kwargs,
                 }
                 
                 if features_only:
@@ -2422,6 +2430,7 @@ class Timm(nn.Module):
                         'pretrained': pretrained,
                         'in_chans': in_chans,
                         'features_only': False,  # KEY CHANGE: Load as full model
+                        **dynamic_model_kwargs,
                     }
                     if norm_layer is not None:
                         model_kwargs['norm_layer'] = norm_layer
@@ -2515,6 +2524,19 @@ class Timm(nn.Module):
                 # Set img_size to None to allow any size
                 if hasattr(module, 'img_size'):
                     module.img_size = None
+
+        if self.model_name.startswith("swin"):
+            invalid_blocks = [
+                name
+                for name, module in self.m.named_modules()
+                if module.__class__.__name__ == "SwinTransformerBlock"
+                and (not getattr(module, "dynamic_mask", False) or not getattr(module, "always_partition", False))
+            ]
+            if invalid_blocks:
+                raise RuntimeError(
+                    "Dynamic Swin inputs require runtime attention masks and full window partitioning, but the "
+                    f"following blocks remain static: {invalid_blocks}"
+                )
         
         if modified_count > 0:
             print(f"✓ Enabled dynamic image size for model '{self.model_name}' ({modified_count} PatchEmbed modules modified)")
