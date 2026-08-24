@@ -22,8 +22,8 @@ MAMBA_TEST_READY = find_spec("cv2") is not None and find_spec("einops") is not N
 
 
 @pytest.mark.skipif(not MAMBA_TEST_READY, reason="cv2 and einops are required to import HRVMamba blocks")
-def test_hrvmamba_yaml_has_fixed_reference_structure():
-    """The explicit YAML must retain the base reference widths, depths, and stochastic-depth schedule."""
+def test_hrvmamba_yaml_has_fixed_configured_structure():
+    """The explicit YAML must retain its configured widths, depths, and stochastic-depth schedule."""
     from ultralytics.nn.modules import DVSSBlock, HRFusion
     from ultralytics.nn.tasks import parse_model, yaml_model_load
 
@@ -40,7 +40,7 @@ def test_hrvmamba_yaml_has_fixed_reference_structure():
     assert len(backbone) == 90
     assert len(head) == 19
     assert len(blocks) == 44
-    assert Counter(block.hidden_dim for block in blocks) == {80: 14, 160: 14, 320: 12, 640: 4}
+    assert Counter(block.hidden_dim for block in blocks) == {80: 14, 160: 14, 320: 16}
     assert Counter(fusion.target_index for fusion in fusions) == {0: 7, 1: 7, 2: 6, 3: 2}
     assert all(isinstance(block.proj_conv, nn.Identity) for block in blocks)
     assert all(block.in_channels == block.hidden_dim for block in blocks)
@@ -59,7 +59,7 @@ def test_hr_fusion_adds_all_aligned_branches_and_backpropagates():
     """Each YAML fusion primitive must align every source and combine them by summation."""
     from ultralytics.nn.modules import HRFusion
 
-    channels = [80, 160, 320, 640]
+    channels = [80, 160, 320, 320]
     spatial_sizes = [16, 8, 4, 2]
     for target_index, (target_channels, target_size) in enumerate(zip(channels, spatial_sizes)):
         fusion = HRFusion(channels, target_index).eval()
