@@ -15,7 +15,7 @@ set -euo pipefail
 MODELS="${1:-all}"
 DRY_RUN="${2:-0}"
 
-export IMGSZ_OBB=896
+export IMGSZ_OBB=448
 export IMGSZ_SEG=448
 export MULTISPECTRAL=003
 export PROJECT_OBB="model_comparison_rscmc1_obb"

@@ -13,14 +13,38 @@ FCOS_ROOT = Path(__file__).resolve().parents[1] / "ultralytics" / "cfg" / "model
 
 @pytest.mark.skipif(not ULTRA_READY, reason="cv2 and torch are required")
 def test_rotated_fcos_r50_yaml_parses_with_reference_fpn():
-    """The benchmark ResNet-50 RFCOS config should expose canonical P3-P7 features."""
-    from ultralytics.nn.modules import FPN
+    """The benchmark timm ResNet-50 RFCOS config should expose canonical P3-P7 features."""
+    from ultralytics.nn.modules import FPN, Timm
     from ultralytics.nn.tasks import parse_model, yaml_model_load
 
     cfg = yaml_model_load(FCOS_ROOT / "rotated_fcos_r50_fpn_le90.yaml")
+    backbone_args = cfg["backbone"][0][3]
+    assert cfg["backbone"][0][-2] == "Timm"
+    assert backbone_args == [
+        "resnet50.tv2_in1k",
+        True,
+        3,
+        True,
+        [1, 2, 3, 4],
+        32,
+        None,
+        "auto",
+        False,
+        False,
+        False,
+        False,
+        0.0,
+        0.0,
+    ]
+
+    # Keep architecture tests independent of network access and local pretrained-weight caches.
+    cfg["backbone"][0][3][1] = False
     model, save, backbone_layers, head_layers = parse_model(deepcopy(cfg), ch=3, verbose=False)
 
     assert save and backbone_layers and head_layers
+    assert isinstance(model[0], Timm)
+    assert model[0].model_name == "resnet50.tv2_in1k"
+    assert model[0].channels == [256, 512, 1024, 2048]
     assert model[-1].__class__.__name__ == "RotatedFCOS"
     assert model[-1].stride.tolist() == [8.0, 16.0, 32.0, 64.0, 128.0]
     assert next(module for module in model if isinstance(module, FPN)).implementation == "reference"
