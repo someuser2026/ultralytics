@@ -15,7 +15,8 @@ set -euo pipefail
 #   bash jobs/train/hpc/bash_scripts_joint/submit_benchmark_models.sh pointrend,mask2former,rhino 8 8 100 0 0
 #   bash jobs/train/hpc/bash_scripts_joint/submit_benchmark_models.sh --list
 #
-# Optional environment overrides: IMGSZ_OBB, IMGSZ_SEG, MULTISPECTRAL, PROJECT_OBB, PROJECT_SEG
+# Optional environment overrides: IMGSZ_OBB, IMGSZ_SEG, MULTISPECTRAL, PROJECT_OBB, PROJECT_SEG,
+# OPTIMIZER, LR0, LRF, WEIGHT_DECAY, WARMUP_EPOCHS, GRAD_CLIP_NORM
 
 PBS_SCRIPT="jobs/train/hpc/planet_full.pbs"
 MODELS="${1:-all}"
@@ -34,6 +35,15 @@ WORKERS="${WORKERS:-1}"
 BATCH_RHINO="${BATCH_RHINO:-4}"
 BATCH_MASK2FORMER="${BATCH_MASK2FORMER:-4}"
 RUN_TAG="${RUN_TAG:-$(date +%m%d-%H%M%S)}"
+
+# Stable transformer-style optimization for the RHINO and standard Mamba-YOLO OBB models.
+# Mamba-HR OBB keeps the generic Ultralytics defaults because its existing run is stable.
+OPTIMIZER="${OPTIMIZER:-AdamW}"
+LR0="${LR0:-0.0001}"
+LRF="${LRF:-0.01}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
+WARMUP_EPOCHS="${WARMUP_EPOCHS:-0}"
+GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-0.01}"
 
 # alias|task|job_name|config|freeze
 JOBS=(
@@ -90,7 +100,7 @@ submit_job() {
   local job_name="$3"
   local config="$4"
   local freeze="$5"
-  local batch imgsz project task_args varlist
+  local batch imgsz project task_args optimizer_args varlist
 
   [[ -f "$config" ]] || { echo "Missing config: $config"; exit 1; }
 
@@ -108,9 +118,18 @@ submit_job() {
   [[ "$alias" == "rhino" ]] && batch="$BATCH_RHINO"
   [[ "$alias" == "mask2former" || "$alias" == "mask2former_hrnet" ]] && batch="$BATCH_MASK2FORMER"
 
-  varlist="TASK=${task},IMGSZ=${imgsz},CHECKPOINT=null,TIME_FLOAT=null,EPOCHS=${EPOCHS},DEVICE=0,EXPERIMENT_MODE=${RUN_TAG}_${alias},OVERLAP=35,KEEP_FRAC=20,MULTISPECTRAL=${MULTISPECTRAL},BATCH=${batch},WORKERS=${WORKERS},CONFIG_YAML=${config},FREEZE=${freeze},SEED=${SEED},WANDB=true,PLOTS=false,PROJECT=${project}${task_args}${NO_AUG}"
+  optimizer_args=""
+  if [[ "$alias" == "mamba_yolo_obb" || "$alias" == "rhino" ]]; then
+    optimizer_args=",OPTIMIZER=${OPTIMIZER},LR0=${LR0},LRF=${LRF},WEIGHT_DECAY=${WEIGHT_DECAY},WARMUP_EPOCHS=${WARMUP_EPOCHS},GRAD_CLIP_NORM=${GRAD_CLIP_NORM}"
+  fi
 
-  echo "Submitting ${alias}: task=${task}, imgsz=${imgsz}, batch=${batch}, config=${config}"
+  varlist="TASK=${task},IMGSZ=${imgsz},CHECKPOINT=null,TIME_FLOAT=null,EPOCHS=${EPOCHS},DEVICE=0,EXPERIMENT_MODE=${RUN_TAG}_${alias},OVERLAP=35,KEEP_FRAC=20,MULTISPECTRAL=${MULTISPECTRAL},BATCH=${batch},WORKERS=${WORKERS},CONFIG_YAML=${config},FREEZE=${freeze},SEED=${SEED},WANDB=true,PLOTS=false,PROJECT=${project}${task_args}${optimizer_args}${NO_AUG}"
+
+  if [[ -n "$optimizer_args" ]]; then
+    echo "Submitting ${alias}: task=${task}, imgsz=${imgsz}, batch=${batch}, config=${config}, optimizer=${OPTIMIZER}, lr0=${LR0}"
+  else
+    echo "Submitting ${alias}: task=${task}, imgsz=${imgsz}, batch=${batch}, config=${config}"
+  fi
   if [[ "$DRY_RUN" == "1" ]]; then
     printf 'DRY_RUN qsub -V -v %q -N %q %q\n' "$varlist" "$job_name" "$PBS_SCRIPT"
   else
