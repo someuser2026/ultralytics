@@ -180,14 +180,19 @@ class PointRendInstances:
 
 
 def point_sample(input: Tensor, point_coords: Tensor) -> Tensor:
-    """Sample ``input`` at [0, 1] point coordinates using PointRend conventions."""
+    """Sample ``input`` at [0, 1] point coordinates using Detectron2 PointRend conventions."""
 
-    if point_coords.ndim != 3 or point_coords.shape[-1] != 2:
-        raise ValueError(f"Expected point coordinates shaped (N, P, 2), got {tuple(point_coords.shape)}.")
+    if point_coords.ndim not in {3, 4} or point_coords.shape[-1] != 2:
+        raise ValueError(
+            "Expected point coordinates shaped (N, P, 2) or (N, R, P, 2), "
+            f"got {tuple(point_coords.shape)}."
+        )
     if input.shape[0] != point_coords.shape[0]:
         raise ValueError(f"Point batch {point_coords.shape[0]} does not match input batch {input.shape[0]}.")
-    grid = point_coords.mul(2.0).sub(1.0).unsqueeze(2)
-    return F.grid_sample(input, grid, mode="bilinear", align_corners=False).squeeze(3)
+    add_point_grid_dim = point_coords.ndim == 3
+    grid = point_coords.unsqueeze(2) if add_point_grid_dim else point_coords
+    sampled = F.grid_sample(input, grid.mul(2.0).sub(1.0), mode="bilinear", align_corners=False)
+    return sampled.squeeze(3) if add_point_grid_dim else sampled
 
 
 def calculate_uncertainty(logits: Tensor) -> Tensor:
@@ -252,6 +257,64 @@ def roi_points_to_image_points(point_coords: Tensor, boxes: Tensor, image_shape:
     xy = boxes[:, None, :2] + point_coords * wh[:, None]
     scale = point_coords.new_tensor((max(w, 1), max(h, 1)))
     return xy / scale
+
+
+def sample_point_features_by_image(
+    feature_maps: list[Tensor] | tuple[Tensor, ...],
+    batch_indices: Tensor,
+    image_point_coords: Tensor,
+) -> Tensor:
+    """Sample all ROI points from each source image without repeating full feature maps per ROI."""
+
+    if not feature_maps:
+        raise ValueError("PointRend grouped sampling requires at least one feature map.")
+    if image_point_coords.ndim != 3 or image_point_coords.shape[-1] != 2:
+        raise ValueError(
+            f"Expected image point coordinates shaped (R, P, 2), got {tuple(image_point_coords.shape)}."
+        )
+    if batch_indices.ndim != 1 or batch_indices.shape[0] != image_point_coords.shape[0]:
+        raise ValueError(
+            "PointRend batch indices must be one-dimensional with one value per ROI, "
+            f"got indices {tuple(batch_indices.shape)} and points {tuple(image_point_coords.shape)}."
+        )
+
+    batch_size = feature_maps[0].shape[0]
+    for feature in feature_maps:
+        if feature.ndim != 4:
+            raise ValueError(f"Expected PointRend feature maps shaped (N, C, H, W), got {tuple(feature.shape)}.")
+        if feature.shape[0] != batch_size:
+            raise ValueError(
+                "All PointRend feature maps must have the same image batch size, "
+                f"got {batch_size} and {feature.shape[0]}."
+            )
+
+    num_rois, num_points = image_point_coords.shape[:2]
+    output_channels = sum(feature.shape[1] for feature in feature_maps)
+    if num_rois == 0:
+        return feature_maps[0].new_zeros((0, output_channels, num_points))
+
+    batch_indices = batch_indices.long()
+    grouped_features = []
+    grouped_roi_indices = []
+    for image_index in range(batch_size):
+        roi_indices = torch.nonzero(batch_indices == image_index, as_tuple=False).flatten()
+        if roi_indices.numel() == 0:
+            continue
+        point_grid = image_point_coords.index_select(0, roi_indices).unsqueeze(0)
+        per_image_features = []
+        for feature in feature_maps:
+            sampled = point_sample(feature[image_index : image_index + 1], point_grid)
+            per_image_features.append(sampled.squeeze(0).transpose(0, 1))
+        grouped_features.append(torch.cat(per_image_features, dim=1))
+        grouped_roi_indices.append(roi_indices)
+
+    if not grouped_features:
+        raise ValueError(f"PointRend batch indices must be in [0, {batch_size}), got no valid indices.")
+    grouped_order = torch.cat(grouped_roi_indices)
+    if grouped_order.numel() != num_rois:
+        raise ValueError(f"PointRend batch indices must be in [0, {batch_size}).")
+    restore_order = torch.argsort(grouped_order)
+    return torch.cat(grouped_features, dim=0).index_select(0, restore_order)
 
 
 def _regular_roi_grid(n: int, resolution: int, device: torch.device, dtype: torch.dtype) -> Tensor:
@@ -436,11 +499,7 @@ class PointRendRefiner(nn.Module):
 
     def _sample_fine_features(self, instances: PointRendInstances, point_coords: Tensor) -> Tensor:
         image_points = roi_points_to_image_points(point_coords, instances.boxes, instances.image_shape)
-        sampled = []
-        for feature in instances.fine_features:
-            per_instance = feature.index_select(0, instances.batch_indices.long())
-            sampled.append(point_sample(per_instance, image_points))
-        return torch.cat(sampled, dim=1)
+        return sample_point_features_by_image(instances.fine_features, instances.batch_indices, image_points)
 
     def predict_points(self, instances: PointRendInstances, point_coords: Tensor) -> Tensor:
         """Predict binary logits at ROI-relative coordinates."""

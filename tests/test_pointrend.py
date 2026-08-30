@@ -87,6 +87,81 @@ def test_uncertain_point_selection_prefers_logits_near_zero():
     assert torch.allclose(coords[0, 0], torch.tensor([0.25, 0.75]))
 
 
+def test_point_sample_supports_detectron2_per_image_roi_grids():
+    import torch.nn.functional as F
+
+    from ultralytics.nn.modules.pointrend import point_sample
+
+    torch.manual_seed(0)
+    feature = torch.randn(1, 3, 6, 7)
+    point_grid = torch.rand(1, 2, 5, 2)
+
+    grouped = point_sample(feature, point_grid)
+    direct = F.grid_sample(feature, point_grid.mul(2.0).sub(1.0), mode="bilinear", align_corners=False)
+    flattened = point_sample(feature, point_grid.reshape(1, -1, 2)).reshape_as(grouped)
+
+    assert grouped.shape == (1, 3, 2, 5)
+    assert torch.allclose(grouped, direct)
+    assert torch.allclose(grouped, flattened)
+
+
+def test_grouped_point_features_match_per_roi_values_gradients_and_order():
+    from ultralytics.nn.modules.pointrend import point_sample, sample_point_features_by_image
+
+    torch.manual_seed(1)
+    base_features = [torch.randn(4, 3, 7, 9), torch.randn(4, 2, 4, 5)]
+    grouped_features = [feature.clone().requires_grad_() for feature in base_features]
+    per_roi_features = [feature.clone().requires_grad_() for feature in base_features]
+    batch_indices = torch.tensor([2, 0, 2, 1, 0])
+    image_points = torch.rand(5, 6, 2).mul(1.2).sub(0.1)
+
+    grouped = sample_point_features_by_image(grouped_features, batch_indices, image_points)
+    reference = torch.cat(
+        [point_sample(feature.index_select(0, batch_indices), image_points) for feature in per_roi_features],
+        dim=1,
+    )
+    weights = torch.randn_like(grouped)
+    (grouped * weights).sum().backward()
+    (reference * weights).sum().backward()
+
+    assert grouped.shape == (5, 5, 6)
+    assert torch.allclose(grouped, reference)
+    for grouped_feature, per_roi_feature in zip(grouped_features, per_roi_features):
+        assert torch.allclose(grouped_feature.grad, per_roi_feature.grad)
+
+
+def test_grouped_point_features_sample_once_per_nonempty_image_and_level(monkeypatch):
+    import ultralytics.nn.modules.pointrend as pointrend
+
+    torch.manual_seed(2)
+    feature_maps = [torch.randn(3, 4, 10, 10), torch.randn(3, 6, 5, 5)]
+    batch_indices = torch.tensor([2, 0, 2, 0, 2])
+    image_points = torch.rand(5, 7, 2)
+    calls = []
+    original_grid_sample = pointrend.F.grid_sample
+
+    def record_grid_sample(input, grid, *args, **kwargs):
+        calls.append((tuple(input.shape), tuple(grid.shape)))
+        return original_grid_sample(input, grid, *args, **kwargs)
+
+    monkeypatch.setattr(pointrend.F, "grid_sample", record_grid_sample)
+    sampled = pointrend.sample_point_features_by_image(feature_maps, batch_indices, image_points)
+    empty = pointrend.sample_point_features_by_image(
+        feature_maps,
+        torch.zeros(0, dtype=torch.long),
+        torch.zeros(0, 7, 2),
+    )
+
+    assert sampled.shape == (5, 10, 7)
+    assert empty.shape == (0, 10, 7)
+    assert calls == [
+        ((1, 4, 10, 10), (1, 2, 7, 2)),
+        ((1, 6, 5, 5), (1, 2, 7, 2)),
+        ((1, 4, 10, 10), (1, 3, 7, 2)),
+        ((1, 6, 5, 5), (1, 3, 7, 2)),
+    ]
+
+
 def test_point_head_uses_msra_hidden_initialization_and_small_predictor():
     from ultralytics.nn.modules.pointrend import PointRendPointHead
 

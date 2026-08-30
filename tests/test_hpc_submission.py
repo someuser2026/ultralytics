@@ -180,6 +180,65 @@ def test_pointrend_joint_segment_submitter(tmp_path: Path) -> None:
         assert vars_map["FREEZE"] == "0"
 
 
+def test_mask2former_rscmc1_submitter_uses_reference_style_optimization(tmp_path: Path) -> None:
+    """The dedicated Mask2Former wrapper should submit both pretrained backbones with stable optimizer settings."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{\n"
+        "  echo CALL\n"
+        "  for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done\n"
+        "  echo END\n"
+        "} >> \"$QSUB_LOG\"\n",
+    )
+    _write_stub(bin_dir / "sleep", "#!/usr/bin/env bash\nexit 0\n")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["QSUB_LOG"] = str(qsub_log)
+    subprocess.run(
+        [
+            "bash",
+            "jobs/train/hpc/bash_scripts_joint/submit_mask2former_rscmc1.sh",
+            "all",
+            "4",
+            "5",
+            "0",
+            "0",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == 2
+    expected_configs = {
+        "ultralytics/cfg/models/transformer/mask2former-swin-timm-seg.yaml",
+        "ultralytics/cfg/models/transformer/mask2former-hrnet-w32-timm-seg.yaml",
+    }
+    assert {_parse_varlist(call)["CONFIG_YAML"] for call in calls} == expected_configs
+
+    for call in calls:
+        assert call[-1] == "jobs/train/hpc/planet_full.pbs"
+        vars_map = _parse_varlist(call)
+        assert vars_map["TASK"] == "segment"
+        assert vars_map["BATCH"] == "4"
+        assert vars_map["EPOCHS"] == "5"
+        assert vars_map["OPTIMIZER"] == "AdamW"
+        assert vars_map["LR0"] == "0.0001"
+        assert vars_map["LRF"] == "0.01"
+        assert vars_map["WEIGHT_DECAY"] == "0.05"
+        assert vars_map["WARMUP_EPOCHS"] == "0"
+        assert vars_map["BACKBONE_LR_MULTIPLIER"] == "0.1"
+        assert vars_map["GRAD_CLIP_NORM"] == "0.01"
+
+
 def test_joint_mamba_launcher_includes_edgevss_variants(tmp_path: Path) -> None:
     """Smoke-test the joint Mamba launcher after adding EdgeVSS variants."""
     bin_dir = tmp_path / "bin"
@@ -1025,6 +1084,13 @@ def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
     env_base["KEEP_FRAC"] = "20"
     env_base["BATCH"] = "4"
     env_base["WORKERS"] = "1"
+    env_base["OPTIMIZER"] = "AdamW"
+    env_base["LR0"] = "0.0001"
+    env_base["LRF"] = "0.01"
+    env_base["WEIGHT_DECAY"] = "0.05"
+    env_base["WARMUP_EPOCHS"] = "0"
+    env_base["BACKBONE_LR_MULTIPLIER"] = "0.1"
+    env_base["GRAD_CLIP_NORM"] = "0.01"
     env_base["CHECKPOINT"] = str(checkpoint)
     env_base["FREEZE"] = "1"
     env_base["LORA"] = "true"
@@ -1076,6 +1142,13 @@ def test_planet_full_pbs_builds_native_yolo_command(tmp_path: Path) -> None:
         assert train_map["data"] == str(dataset_dir / "data.yaml")
         assert train_map["time"] == "11"
         assert train_map["workers"] == "1"
+        assert train_map["optimizer"] == "AdamW"
+        assert train_map["lr0"] == "0.0001"
+        assert train_map["lrf"] == "0.01"
+        assert train_map["weight_decay"] == "0.05"
+        assert train_map["warmup_epochs"] == "0"
+        assert train_map["backbone_lr_multiplier"] == "0.1"
+        assert train_map["grad_clip_norm"] == "0.01"
         assert train_map["freeze"] == "1"
         assert train_map["lora"] == "true"
         assert train_map["lora_rank"] == "8"

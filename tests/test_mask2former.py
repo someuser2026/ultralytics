@@ -159,6 +159,63 @@ def test_mask2former_builds_from_segmentation_yaml_style_config():
 
 
 @pytest.mark.skipif(not TORCH_READY, reason="torch is required")
+def test_mask2former_optimizer_applies_backbone_lr_multiplier():
+    from ultralytics.models.mask2former.train import Mask2FormerTrainer
+
+    class TinyMask2Former(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.ModuleList([torch.nn.Linear(4, 4), torch.nn.Linear(4, 2)])
+
+    model = TinyMask2Former()
+    trainer = Mask2FormerTrainer.__new__(Mask2FormerTrainer)
+    trainer.args = types.SimpleNamespace(backbone_lr_multiplier=0.1)
+    optimizer = trainer.build_optimizer(model, name="AdamW", lr=1e-4, momentum=0.9, decay=0.05)
+
+    backbone_param_ids = {id(param) for param in model.model[0].parameters()}
+    head_param_ids = {id(param) for param in model.model[1].parameters()}
+    for group in optimizer.param_groups:
+        param_ids = {id(param) for param in group["params"]}
+        if param_ids <= backbone_param_ids:
+            assert group["lr"] == pytest.approx(1e-5)
+        elif param_ids <= head_param_ids:
+            assert group["lr"] == pytest.approx(1e-4)
+        else:
+            pytest.fail("optimizer group mixed backbone and head parameters")
+
+
+@pytest.mark.skipif(not TORCH_READY, reason="torch is required")
+def test_trainer_uses_configured_gradient_clip_norm(monkeypatch):
+    from ultralytics.models.mask2former.train import Mask2FormerTrainer
+
+    class DummyScaler:
+        def unscale_(self, optimizer):
+            pass
+
+        def step(self, optimizer):
+            optimizer.step()
+
+        def update(self):
+            pass
+
+    trainer = Mask2FormerTrainer.__new__(Mask2FormerTrainer)
+    trainer.args = types.SimpleNamespace(grad_clip_norm=0.01)
+    trainer.model = torch.nn.Linear(2, 1)
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.1)
+    trainer.scaler = DummyScaler()
+    trainer.ema = None
+    observed = {}
+
+    def capture_clip(parameters, max_norm):
+        observed["max_norm"] = max_norm
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", capture_clip)
+    trainer.optimizer_step()
+
+    assert observed["max_norm"] == pytest.approx(0.01)
+
+
+@pytest.mark.skipif(not TORCH_READY, reason="torch is required")
 def test_mask2former_reference_instance_postprocess_matches_expected_scores_and_boxes():
     from ultralytics.models.mask2former.postprocess import (
         finalize_mask2former_instances,
@@ -300,8 +357,12 @@ def test_timm_swin_dynamic_attention_masks_support_rectangular_inputs():
 @pytest.mark.skipif(not TORCH_READY or find_spec("timm") is None, reason="torch and timm are required")
 def test_mask2former_hrnet_w32_timm_config_builds_and_forwards():
     from ultralytics.nn.tasks import SegmentationModel
+    from ultralytics.utils import YAML
 
-    cfg = Path(__file__).parents[1] / "ultralytics/cfg/models/transformer/mask2former-hrnet-w32-timm-seg.yaml"
+    cfg_path = Path(__file__).parents[1] / "ultralytics/cfg/models/transformer/mask2former-hrnet-w32-timm-seg.yaml"
+    cfg = YAML.load(cfg_path)
+    assert cfg["backbone"][0][3][1] is True
+    cfg["backbone"][0][3][1] = False  # Avoid a network/cache dependency in this structural test.
     model = SegmentationModel(cfg, ch=3, nc=1, verbose=False).eval()
     backbone = model.model[0]
     head = model.model[-1]

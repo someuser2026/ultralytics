@@ -934,9 +934,8 @@ class BaseTrainer:
                     self.accumulate = max(1, int(np.interp(ni, xi, [1, self.args.nbs / self.batch_size]).round()))
                     for j, x in enumerate(self.optimizer.param_groups):
                         # Bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
-                        x["lr"] = np.interp(
-                            ni, xi, [self.args.warmup_bias_lr if j == 0 else 0.0, x["initial_lr"] * self.lf(epoch)]
-                        )
+                        warmup_start_lr = self.args.warmup_bias_lr if x.get("is_bias", j == 0) else 0.0
+                        x["lr"] = np.interp(ni, xi, [warmup_start_lr, x["initial_lr"] * self.lf(epoch)])
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
 
@@ -1217,7 +1216,9 @@ class BaseTrainer:
     def optimizer_step(self):
         """Perform a single step of the training optimizer with gradient clipping and EMA update."""
         self.scaler.unscale_(self.optimizer)  # unscale gradients
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)  # clip gradients
+        grad_clip_norm = float(getattr(self.args, "grad_clip_norm", 10.0))
+        if grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad()

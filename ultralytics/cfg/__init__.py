@@ -150,6 +150,8 @@ CLI_HELP_MSG = f"""
 CFG_FLOAT_KEYS = frozenset(
     {  # integer or float arguments, i.e. x=2 and x=2.0
         "warmup_epochs",
+        "backbone_lr_multiplier",
+        "grad_clip_norm",
         "box",
         "cls",
         "dfl",

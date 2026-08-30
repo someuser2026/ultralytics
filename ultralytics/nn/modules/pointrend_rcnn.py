@@ -12,7 +12,13 @@ from torch import Tensor, nn
 
 from ultralytics.utils.nms import TorchNMS
 
-from .pointrend import PointRendTrainConfig, paste_roi_probabilities, point_sample, roi_points_to_image_points
+from .pointrend import (
+    PointRendTrainConfig,
+    paste_roi_probabilities,
+    point_sample,
+    roi_points_to_image_points,
+    sample_point_features_by_image,
+)
 from .rcnn import (
     HorizontalBoxCoder,
     _AxisRCNNBase,
@@ -315,8 +321,7 @@ class _PointRendMaskBranch(nn.Module):
         """Sample direct P2 features at ROI-relative coordinates."""
 
         image_points = roi_points_to_image_points(point_coords, boxes, image_shape)
-        per_instance = p2.index_select(0, batch_indices.long())
-        return point_sample(per_instance, image_points)
+        return sample_point_features_by_image((p2,), batch_indices, image_points)
 
     def coarse_logits(
         self,

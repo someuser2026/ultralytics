@@ -198,6 +198,32 @@ def test_coarse_grid_uses_direct_p2_and_reference_regular_coordinates(monkeypatc
     assert torch.allclose(coords[0, -1, -1], torch.tensor([13.5 / 14, 13.5 / 14]))
 
 
+def test_p2_sampling_groups_images_and_matches_per_roi_reference():
+    from ultralytics.nn.modules.pointrend import point_sample, roi_points_to_image_points
+
+    torch.manual_seed(3)
+    branch = _tiny_head(nc=2).point_rend
+    p2 = torch.randn(3, 8, 16, 16)
+    boxes = torch.tensor(
+        [
+            [2.5, 4.0, 41.0, 53.0],
+            [6.0, 1.5, 50.0, 46.0],
+            [0.0, 3.0, 63.0, 60.0],
+            [9.5, 8.0, 35.0, 39.5],
+            [4.0, 5.0, 58.0, 55.0],
+        ]
+    )
+    batch_indices = torch.tensor([2, 0, 2, 1, 0])
+    point_coords = torch.rand(5, 11, 2)
+    image_points = roi_points_to_image_points(point_coords, boxes, (64, 64))
+    reference = point_sample(p2.index_select(0, batch_indices), image_points)
+
+    grouped = branch._sample_p2(p2, boxes, batch_indices, point_coords, (64, 64))
+
+    assert grouped.shape == (5, 8, 11)
+    assert torch.allclose(grouped, reference)
+
+
 def test_effective_schedule_dense_initialization_and_final_shape(monkeypatch):
     head = _tiny_head(nc=2)
     branch = head.point_rend
