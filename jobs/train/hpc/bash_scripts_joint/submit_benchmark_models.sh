@@ -47,8 +47,8 @@ GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-0.01}"
 
 # alias|task|job_name|config|freeze
 JOBS=(
-  "yolo11_obb|obb|b_y11_obb|ultralytics/cfg/models/timm/obb/final/augfpn/yolo/yolo11x/1cls/yolo11x-augfpn_512c-obb.yaml|0"
-  "yolo12_obb|obb|b_y12_obb|ultralytics/cfg/models/timm/obb/final/augfpn/yolo/yolo12x/1cls/yolo12x-augfpn_512c-obb.yaml|0"
+  "yolo11_obb|obb|b_y11_obb|ultralytics/cfg/models/11/yolo11x-obb-1cls.yaml|0"
+  "yolo12_obb|obb|b_y12_obb|ultralytics/cfg/models/12/yolo12x-obb-1cls.yaml|0"
   "dino_obb|obb|b_dino_obb|ultralytics/cfg/models/timm/obb/final/augfpn/transformer/dinov3_7_12_17_22/1cls/dinov3_7_12_17_22-augfpn_512c-obb.yaml|1"
   "mamba_yolo_obb|obb|b_mamba_yolo_o|ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-L-obb-demo.yaml|0"
   "mamba_hr_obb|obb|b_mamba_hr_o|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-obb.yaml|0"
@@ -58,10 +58,10 @@ JOBS=(
   "rfcos_r50|obb|b_rfcos_r50|ultralytics/cfg/models/fcos/rotated_fcos_r50_fpn_le90.yaml|0"
   "rfcos_leg|obb|b_rfcos_leg|ultralytics/cfg/models/legnet/legnet-small-fcos-smallobj.yaml|0"
   "rhino|obb|b_rhino_r50|ultralytics/cfg/models/rhino/rhino-r50-obb.yaml|0"
-  "yolo11_seg|segment|b_y11_seg|ultralytics/cfg/models/timm/segment/final/yolo_neck/yolo/yolo11x/1cls/yolo11x-yolo11x-segment.yaml|0"
+  "yolo11_seg|segment|b_y11_seg|ultralytics/cfg/models/timm/segment/final/yolo_neck/yolo/yolo11x/flat_no_p2/1cls/yolo11x-yolo11x-segment.yaml|0"
   "yolo12_seg|segment|b_y12_seg|ultralytics/cfg/models/timm/segment/final/yolo_neck/yolo/yolo12x/1cls/yolo12x-yolo12x-segment.yaml|0"
   "dino_seg|segment|b_dino_seg|ultralytics/cfg/models/timm/segment/final/yolo_neck/transformer/dinov3_7_12_17_22/1cls/dinov3_7_12_17_22-yolo11x-segment.yaml|1"
-  "mamba_yolo_seg|segment|b_mamba_yolo_s|ultralytics/cfg/models/mamba-yolo/yolo-mamba-seg.yaml|0"
+  "mamba_yolo_seg|segment|b_mamba_yolo_s|ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-L-seg.yaml|0"
   "mamba_hr_seg|segment|b_mamba_hr_s|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|0"
   "cascade|segment|b_cascade|ultralytics/cfg/models/rcnn/cascade_mask_rcnn_r50_fpn_smallobj.yaml|0"
   "mask_rcnn|segment|b_mask_rcnn|ultralytics/cfg/models/rcnn/mask_rcnn_r50_fpn_smallobj.yaml|0"
