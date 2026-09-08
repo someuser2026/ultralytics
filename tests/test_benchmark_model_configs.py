@@ -53,6 +53,24 @@ def test_benchmark_mamba_yolo_models_share_official_l_architecture() -> None:
         assert variant["head"][-1][2] == terminal
 
 
+def test_benchmark_resnet_rcnn_models_use_trainable_pretrained_timm_backbones() -> None:
+    """Benchmark ResNet RCNN variants should use pretrained timm backbones without configuration-level freezing."""
+    configs = (
+        MODEL_ROOT / "rcnn/rotated_faster_rcnn_r50_fpn_le90_smallobj.yaml",
+        MODEL_ROOT / "rcnn/cascade_mask_rcnn_r50_fpn_smallobj.yaml",
+        MODEL_ROOT / "rcnn/mask_rcnn_r50_fpn_smallobj.yaml",
+    )
+
+    for config_path in configs:
+        backbone_layer = _load(config_path)["backbone"][0]
+        assert backbone_layer[:3] == [-1, 1, "Timm"]
+        args = backbone_layer[3]
+        assert args[0] == "resnet50.tv2_in1k"
+        assert args[1] is True  # pretrained
+        assert args[8] is False  # freeze_stem
+        assert args[9] is False  # freeze
+
+
 def test_benchmark_submitter_uses_faithful_yolo_and_mamba_configs() -> None:
     """Both dataset launch paths share this submitter, so keep its canonical config references explicit."""
     submitter = BENCHMARK_SUBMITTER.read_text()

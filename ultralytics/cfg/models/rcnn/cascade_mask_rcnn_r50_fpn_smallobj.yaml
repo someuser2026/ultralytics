@@ -7,7 +7,8 @@ nc: 80
 stride: 32
 
 backbone:
-  - [-1, 1, ResNetBackbone, [resnet50, null, 1, true]] # 0 -> [C2, C3, C4, C5]
+  # Fully trainable timm ResNet-50 with torchvision ImageNet-1K V2 weights; stages 1-4 are C2-C5.
+  - [-1, 1, Timm, [resnet50.tv2_in1k, true, 3, true, [1, 2, 3, 4], 32, null, auto, false, false, false, false, 0.0, 0.0]] # 0 -> [C2, C3, C4, C5]
   - [0, 1, Index, [0]]
   - [0, 1, Index, [1]]
   - [0, 1, Index, [2]]

@@ -35,8 +35,7 @@ BATCH_RHINO="${BATCH_RHINO:-4}"
 BATCH_MASK2FORMER="${BATCH_MASK2FORMER:-4}"
 RUN_TAG="${RUN_TAG:-$(date +%m%d-%H%M%S)}"
 
-# Stable transformer-style optimization for the RHINO and standard Mamba-YOLO OBB models.
-# Mamba-HR OBB keeps the generic Ultralytics defaults because its existing run is stable.
+# Shared explicit optimization profile for every benchmark model.
 OPTIMIZER="${OPTIMIZER:-AdamW}"
 LR0="${LR0:-0.0001}"
 LRF="${LRF:-0.01}"
@@ -97,6 +96,9 @@ fi
 [[ "$EPOCHS" =~ ^[0-9]+$ && "$EPOCHS" -ge 1 ]] || { echo "EPOCHS must be an integer >= 1"; exit 1; }
 [[ "$SEED" =~ ^[0-9]+$ ]] || { echo "SEED must be a non-negative integer"; exit 1; }
 [[ "$DRY_RUN" =~ ^[01]$ ]] || { echo "DRY_RUN must be 0 or 1"; exit 1; }
+case "$OPTIMIZER" in
+  [Aa][Uu][Tt][Oo]) echo "OPTIMIZER must be explicit; optimizer=auto is not allowed for benchmark comparisons"; exit 1 ;;
+esac
 [[ -f "$PBS_SCRIPT" ]] || { echo "Missing PBS script: $PBS_SCRIPT"; exit 1; }
 
 selected() {
@@ -131,18 +133,11 @@ submit_job() {
   [[ "$alias" == "rhino" ]] && batch="$BATCH_RHINO"
   [[ "$alias" == "mask2former" || "$alias" == "mask2former_hrnet" ]] && batch="$BATCH_MASK2FORMER"
 
-  optimizer_args=""
-  if [[ "$alias" == "mamba_yolo_obb" || "$alias" == "rhino" ]]; then
-    optimizer_args=",OPTIMIZER=${OPTIMIZER},LR0=${LR0},LRF=${LRF},WEIGHT_DECAY=${WEIGHT_DECAY},WARMUP_EPOCHS=${WARMUP_EPOCHS},GRAD_CLIP_NORM=${GRAD_CLIP_NORM}"
-  fi
+  optimizer_args=",OPTIMIZER=${OPTIMIZER},LR0=${LR0},LRF=${LRF},WEIGHT_DECAY=${WEIGHT_DECAY},WARMUP_EPOCHS=${WARMUP_EPOCHS},BACKBONE_LR_MULTIPLIER=1.0,GRAD_CLIP_NORM=${GRAD_CLIP_NORM}"
 
   varlist="TASK=${task},IMGSZ=${imgsz},CHECKPOINT=null,TIME_FLOAT=null,EPOCHS=${EPOCHS},DEVICE=0,EXPERIMENT_MODE=${RUN_TAG}_${alias},OVERLAP=35,KEEP_FRAC=20,MULTISPECTRAL=${MULTISPECTRAL},BATCH=${batch},WORKERS=${WORKERS},CONFIG_YAML=${config},FREEZE=${freeze},SEED=${SEED},WANDB=true,PLOTS=false,PROJECT=${project}${task_args}${optimizer_args}${NO_AUG}"
 
-  if [[ -n "$optimizer_args" ]]; then
-    echo "Submitting ${alias}: task=${task}, imgsz=${imgsz}, batch=${batch}, config=${config}, optimizer=${OPTIMIZER}, lr0=${LR0}"
-  else
-    echo "Submitting ${alias}: task=${task}, imgsz=${imgsz}, batch=${batch}, config=${config}"
-  fi
+  echo "Submitting ${alias}: task=${task}, imgsz=${imgsz}, batch=${batch}, config=${config}, optimizer=${OPTIMIZER}, lr0=${LR0}"
   if [[ "$DRY_RUN" == "1" ]]; then
     printf 'DRY_RUN qsub -V -v %q -N %q %q\n' "$varlist" "$job_name" "$PBS_SCRIPT"
   else

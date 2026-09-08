@@ -239,8 +239,8 @@ def test_mask2former_rscmc1_submitter_uses_reference_style_optimization(tmp_path
         assert vars_map["GRAD_CLIP_NORM"] == "0.01"
 
 
-def test_benchmark_submitter_uses_mask2former_optimizer_for_unstable_obb_models(tmp_path: Path) -> None:
-    """RHINO and standard Mamba-YOLO OBB should use the stable profile without changing Mamba-HR OBB."""
+def test_benchmark_submitter_uses_explicit_optimizer_for_all_models(tmp_path: Path) -> None:
+    """Every benchmark model should receive the same explicit optimization profile."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     qsub_log = tmp_path / "qsub.log"
@@ -264,7 +264,7 @@ def test_benchmark_submitter_uses_mask2former_optimizer_for_unstable_obb_models(
         [
             "bash",
             "jobs/train/hpc/bash_scripts_joint/submit_benchmark_models.sh",
-            "mamba_yolo_obb,mamba_hr_obb,rhino",
+            "all",
             "8",
             "8",
             "5",
@@ -277,26 +277,42 @@ def test_benchmark_submitter_uses_mask2former_optimizer_for_unstable_obb_models(
     )
 
     calls = _parse_call_log(qsub_log)
-    assert len(calls) == 3
-    vars_by_config = {_parse_varlist(call)["CONFIG_YAML"]: _parse_varlist(call) for call in calls}
-    optimized_configs = {
-        "ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-L-obb-demo.yaml",
-        "ultralytics/cfg/models/rhino/rhino-r50-obb.yaml",
-    }
-
-    for config in optimized_configs:
-        vars_map = vars_by_config[config]
+    assert len(calls) == 21
+    for call in calls:
+        vars_map = _parse_varlist(call)
         assert vars_map["OPTIMIZER"] == "AdamW"
         assert vars_map["LR0"] == "0.0001"
         assert vars_map["LRF"] == "0.01"
         assert vars_map["WEIGHT_DECAY"] == "0.05"
         assert vars_map["WARMUP_EPOCHS"] == "0"
+        assert vars_map["BACKBONE_LR_MULTIPLIER"] == "1.0"
         assert vars_map["GRAD_CLIP_NORM"] == "0.01"
-        assert "BACKBONE_LR_MULTIPLIER" not in vars_map
 
-    mamba_hr_vars = vars_by_config["ultralytics/cfg/models/mamba-yolo/mamba-hrnet-obb.yaml"]
-    for key in ("OPTIMIZER", "LR0", "LRF", "WEIGHT_DECAY", "WARMUP_EPOCHS", "GRAD_CLIP_NORM"):
-        assert key not in mamba_hr_vars
+
+def test_benchmark_submitter_rejects_auto_optimizer() -> None:
+    """The comparison launcher must not permit an environment override back to optimizer=auto."""
+    env = os.environ.copy()
+    env["OPTIMIZER"] = "auto"
+    result = subprocess.run(
+        [
+            "bash",
+            "jobs/train/hpc/bash_scripts_joint/submit_benchmark_models.sh",
+            "yolo11_obb",
+            "8",
+            "8",
+            "5",
+            "0",
+            "1",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "optimizer=auto is not allowed" in result.stdout
 
 
 def test_joint_mamba_launcher_includes_edgevss_variants(tmp_path: Path) -> None:
