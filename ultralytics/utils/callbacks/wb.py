@@ -600,7 +600,8 @@ def _export_split_predictions(model, split_source, output_dir, run_name, subset,
     try:
         prediction_results = list(model.predict(split_source, True, **predict_kwargs))
         _save_predictions_json(prediction_results, output_dir, source_root=split_source)
-        return _log_predictions(output_dir, run_name, subset)
+        return True
+        # return _log_predictions(output_dir, run_name, subset)
     except Exception as e:
         LOGGER.warning(f"Failed to export {subset} predictions to wandb: {e}")
         LOGGER.debug(traceback.format_exc())
