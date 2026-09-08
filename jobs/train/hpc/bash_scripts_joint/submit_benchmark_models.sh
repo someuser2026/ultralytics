@@ -15,7 +15,7 @@ set -euo pipefail
 #   bash jobs/train/hpc/bash_scripts_joint/submit_benchmark_models.sh pointrend,mask2former,rhino 8 8 100 0 0
 #   bash jobs/train/hpc/bash_scripts_joint/submit_benchmark_models.sh --list
 #
-# Optional environment overrides: IMGSZ_OBB, IMGSZ_SEG, MULTISPECTRAL, PROJECT_OBB, PROJECT_SEG,
+# Optional environment overrides: IMGSZ_OBB, IMGSZ_SEG, MULTISPECTRAL, DATASET_NAME, PROJECT_OBB, PROJECT_SEG,
 # OPTIMIZER, LR0, LRF, WEIGHT_DECAY, WARMUP_EPOCHS, GRAD_CLIP_NORM
 
 PBS_SCRIPT="jobs/train/hpc/planet_full.pbs"
@@ -29,8 +29,7 @@ DRY_RUN="${6:-0}"
 IMGSZ_OBB="${IMGSZ_OBB:-448}"
 IMGSZ_SEG="${IMGSZ_SEG:-448}"
 MULTISPECTRAL="${MULTISPECTRAL:-21}"
-PROJECT_OBB="${PROJECT_OBB:-benchmark_obb}"
-PROJECT_SEG="${PROJECT_SEG:-benchmark_segment}"
+DATASET_NAME="${DATASET_NAME:-}"
 WORKERS="${WORKERS:-1}"
 BATCH_RHINO="${BATCH_RHINO:-4}"
 BATCH_MASK2FORMER="${BATCH_MASK2FORMER:-4}"
@@ -44,6 +43,20 @@ LRF="${LRF:-0.01}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
 WARMUP_EPOCHS="${WARMUP_EPOCHS:-0}"
 GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-0.01}"
+
+if [[ -z "$DATASET_NAME" ]]; then
+  case "$MULTISPECTRAL" in
+    0) DATASET_NAME="RSC" ;;
+    003) DATASET_NAME="RSCMC1" ;;
+    001) DATASET_NAME="RSCMC2" ;;
+    2) DATASET_NAME="PNSC" ;;
+    21) DATASET_NAME="PNSCMC1" ;;
+    *) DATASET_NAME="dataset_${MULTISPECTRAL}" ;;
+  esac
+fi
+DATASET_SLUG="$(printf '%s' "$DATASET_NAME" | tr '[:upper:]' '[:lower:]')"
+PROJECT_OBB="${PROJECT_OBB:-benchmark_${DATASET_SLUG}_imgsz${IMGSZ_OBB}_obb}"
+PROJECT_SEG="${PROJECT_SEG:-benchmark_${DATASET_SLUG}_imgsz${IMGSZ_SEG}_segment}"
 
 # alias|task|job_name|config|freeze
 JOBS=(

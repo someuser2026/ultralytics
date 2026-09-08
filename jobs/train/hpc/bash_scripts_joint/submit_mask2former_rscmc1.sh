@@ -17,7 +17,7 @@ PBS_SCRIPT="jobs/train/hpc/planet_full.pbs"
 IMGSZ="${IMGSZ:-448}"
 MULTISPECTRAL="${MULTISPECTRAL:-003}"
 WORKERS="${WORKERS:-1}"
-PROJECT="${PROJECT:-model_comparison_rscmc1_segment}"
+PROJECT="${PROJECT:-model_comparison_rscmc1_imgsz${IMGSZ}_segment}"
 RUN_TAG="${RUN_TAG:-$(date +%m%d-%H%M%S)-RSCMC1}"
 
 OPTIMIZER="${OPTIMIZER:-AdamW}"

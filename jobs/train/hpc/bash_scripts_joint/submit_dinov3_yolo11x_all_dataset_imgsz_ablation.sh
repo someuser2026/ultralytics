@@ -65,19 +65,20 @@ submit_job() {
   local multispectral="$3"
   local classes="$4"
   local imgsz="$5"
-  local batch project prefix config task_args varlist job_name
+  local batch project prefix config task_args varlist job_name dataset_slug
 
   config="$(config_for "$task" "$classes")"
   [[ -f "$config" ]] || { echo "Missing config: $config"; exit 1; }
+  dataset_slug="$(printf '%s' "$tag" | tr '[:upper:]' '[:lower:]')"
 
   if [[ "$task" == "obb" ]]; then
     batch="$BATCH_OBB"
-    project="dino_all_dataset_imgsz_ablation_obb"
+    project="dino_dataset_imgsz_ablation_${dataset_slug}_imgsz${imgsz}_obb"
     prefix="o"
     task_args=",ANGLE_MODE=le90"
   else
     batch="$BATCH_SEG"
-    project="dino_all_dataset_imgsz_ablation_segment"
+    project="dino_dataset_imgsz_ablation_${dataset_slug}_imgsz${imgsz}_segment"
     prefix="s"
     task_args=",USE_SOFT_IGNORE=false,SDICE=1"
   fi
