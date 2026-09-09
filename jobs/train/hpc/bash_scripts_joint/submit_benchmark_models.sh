@@ -61,7 +61,8 @@ PROJECT_SEG="${PROJECT_SEG:-benchmark_${DATASET_SLUG}_imgsz${IMGSZ_SEG}_segment}
 JOBS=(
   "yolo11_obb|obb|b_y11_obb|ultralytics/cfg/models/11/yolo11x-obb-1cls.yaml|0"
   "yolo12_obb|obb|b_y12_obb|ultralytics/cfg/models/12/yolo12x-obb-1cls.yaml|0"
-  "dino_obb|obb|b_dino_obb|ultralytics/cfg/models/timm/obb/final/augfpn/transformer/dinov3_7_12_17_22/1cls/dinov3_7_12_17_22-augfpn_512c-obb.yaml|1"
+  "yolo26_obb|obb|b_y26_obb|ultralytics/cfg/models/26/yolo26-obb.yaml|0"
+  "dino_obb|obb|b_dino_obb|ultralytics/cfg/models/timm/obb/final/yolo_neck/transformer/dinov3_7_12_17_22/1cls/dinov3_7_12_17_22-yolo11x-obb.yaml|1"
   "mamba_yolo_obb|obb|b_mamba_yolo_o|ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-L-obb-demo.yaml|0"
   "mamba_hr_obb|obb|b_mamba_hr_o|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-obb.yaml|0"
   "hr32_obb|obb|b_hr32_obb|ultralytics/cfg/models/timm/obb/final/augfpn/hrnet/hrnet_w32/1cls/hrnet_w32-augfpn_512c-obb.yaml|0"
@@ -72,6 +73,7 @@ JOBS=(
   "rhino|obb|b_rhino_r50|ultralytics/cfg/models/rhino/rhino-r50-obb.yaml|0"
   "yolo11_seg|segment|b_y11_seg|ultralytics/cfg/models/timm/segment/final/yolo_neck/yolo/yolo11x/flat_no_p2/1cls/yolo11x-yolo11x-segment.yaml|0"
   "yolo12_seg|segment|b_y12_seg|ultralytics/cfg/models/timm/segment/final/yolo_neck/yolo/yolo12x/1cls/yolo12x-yolo12x-segment.yaml|0"
+  "yolo26_seg|segment|b_y26_seg|ultralytics/cfg/models/26/yolo26-seg.yaml|0"
   "dino_seg|segment|b_dino_seg|ultralytics/cfg/models/timm/segment/final/yolo_neck/transformer/dinov3_7_12_17_22/1cls/dinov3_7_12_17_22-yolo11x-segment.yaml|1"
   "mamba_yolo_seg|segment|b_mamba_yolo_s|ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-L-seg.yaml|0"
   "mamba_hr_seg|segment|b_mamba_hr_s|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|0"
@@ -83,8 +85,8 @@ JOBS=(
 )
 
 if [[ "$MODELS" == "--list" ]]; then
-  echo "OBB: yolo11_obb yolo12_obb dino_obb mamba_yolo_obb mamba_hr_obb hr32_obb rfrcnn orcnn_leg rfcos_r50 rfcos_leg rhino"
-  echo "SEG: yolo11_seg yolo12_seg dino_seg mamba_yolo_seg mamba_hr_seg cascade mask_rcnn pointrend mask2former mask2former_hrnet"
+  echo "OBB: yolo11_obb yolo12_obb yolo26_obb dino_obb mamba_yolo_obb mamba_hr_obb hr32_obb rfrcnn orcnn_leg rfcos_r50 rfcos_leg rhino"
+  echo "SEG: yolo11_seg yolo12_seg yolo26_seg dino_seg mamba_yolo_seg mamba_hr_seg cascade mask_rcnn pointrend mask2former mask2former_hrnet"
   echo "UNAVAILABLE: roit_leg (listed in the manuscript but no native Ultralytics config exists)"
   exit 0
 fi

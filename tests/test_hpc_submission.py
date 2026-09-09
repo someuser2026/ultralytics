@@ -277,7 +277,7 @@ def test_benchmark_submitter_uses_explicit_optimizer_for_all_models(tmp_path: Pa
     )
 
     calls = _parse_call_log(qsub_log)
-    assert len(calls) == 21
+    assert len(calls) == 23
     for call in calls:
         vars_map = _parse_varlist(call)
         assert vars_map["OPTIMIZER"] == "AdamW"

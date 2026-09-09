@@ -77,6 +77,8 @@ def test_benchmark_submitter_uses_faithful_yolo_and_mamba_configs() -> None:
     expected = (
         "ultralytics/cfg/models/11/yolo11x-obb-1cls.yaml",
         "ultralytics/cfg/models/12/yolo12x-obb-1cls.yaml",
+        "ultralytics/cfg/models/26/yolo26-obb.yaml",
+        "ultralytics/cfg/models/26/yolo26-seg.yaml",
         "ultralytics/cfg/models/timm/segment/final/yolo_neck/yolo/yolo11x/flat_no_p2/1cls/"
         "yolo11x-yolo11x-segment.yaml",
         "ultralytics/cfg/models/timm/segment/final/yolo_neck/yolo/yolo12x/1cls/yolo12x-yolo12x-segment.yaml",
@@ -86,8 +88,38 @@ def test_benchmark_submitter_uses_faithful_yolo_and_mamba_configs() -> None:
     replaced = (
         "yolo11x-augfpn_512c-obb.yaml",
         "yolo12x-augfpn_512c-obb.yaml",
+        "ultralytics/cfg/models/26/yolo26-seg-pointrend.yaml",
         "ultralytics/cfg/models/mamba-yolo/yolo-mamba-seg.yaml",
     )
 
     assert all(path in submitter for path in expected)
     assert all(path not in submitter for path in replaced)
+
+
+def test_benchmark_dino_and_mamba_hr_task_pairs_share_necks() -> None:
+    """Each OBB/segment pair must have the same feature-building neck before its task-specific head."""
+    cases = (
+        (
+            MODEL_ROOT
+            / "timm/obb/final/yolo_neck/transformer/dinov3_7_12_17_22/1cls/"
+            "dinov3_7_12_17_22-yolo11x-obb.yaml",
+            MODEL_ROOT
+            / "timm/segment/final/yolo_neck/transformer/dinov3_7_12_17_22/1cls/"
+            "dinov3_7_12_17_22-yolo11x-segment.yaml",
+            [25, 28, 31],
+        ),
+        (
+            MODEL_ROOT / "mamba-yolo/mamba-hrnet-obb.yaml",
+            MODEL_ROOT / "mamba-yolo/mamba-hrnet-seg.yaml",
+            [70, 73, 76, 79],
+        ),
+    )
+
+    for obb_path, segment_path, expected_levels in cases:
+        obb = _load(obb_path)
+        segment = _load(segment_path)
+        assert obb["backbone"] == segment["backbone"]
+        assert obb["head"][:-1] == segment["head"][:-1]
+        assert obb["head"][-1][0] == segment["head"][-1][0] == expected_levels
+        assert obb["head"][-1][2] == "OBB"
+        assert segment["head"][-1][2] == "Segment"

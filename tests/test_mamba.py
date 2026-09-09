@@ -77,6 +77,7 @@ def test_mamba_model_construction_uses_build_only_cpu_fallback(model_name, task)
         torch.tensor([4.0, 8.0, 16.0, 32.0])
         if model_name
         in {
+            "mamba-hrnet-obb.yaml",
             "mamba-hrnet-seg.yaml",
             "mamba-hrnet-seg-dvss.yaml",
             "mamba-hrnet-seg-edgevss.yaml",
