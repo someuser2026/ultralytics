@@ -366,6 +366,8 @@ def test_dino_dataset_ablation_uses_yolo_neck_obb_and_explicit_optimizer(tmp_pat
         assert vars_map["WARMUP_EPOCHS"] == "0"
         assert vars_map["BACKBONE_LR_MULTIPLIER"] == "1.0"
         assert vars_map["GRAD_CLIP_NORM"] == "0.01"
+        assert vars_map["EXPERIMENT_MODE"].startswith("testrun_")
+        assert vars_map["EXPERIMENT_MODE"].endswith("_seed0")
         if vars_map["TASK"] == "obb":
             assert "/obb/final/yolo_neck/" in config
             assert "augfpn" not in config
