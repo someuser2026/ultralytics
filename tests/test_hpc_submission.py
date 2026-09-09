@@ -181,7 +181,7 @@ def test_pointrend_joint_segment_submitter(tmp_path: Path) -> None:
 
 
 def test_mask2former_rscmc1_submitter_uses_reference_style_optimization(tmp_path: Path) -> None:
-    """The dedicated Mask2Former wrapper should submit both pretrained backbones with stable optimizer settings."""
+    """The dedicated Mask2Former wrapper should submit both backbones with stable optimizer settings."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     qsub_log = tmp_path / "qsub.log"
@@ -260,6 +260,7 @@ def test_benchmark_submitter_uses_explicit_optimizer_for_all_models(tmp_path: Pa
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["QSUB_LOG"] = str(qsub_log)
+    env["RUN_TAG"] = "testrun"
     subprocess.run(
         [
             "bash",
@@ -268,7 +269,7 @@ def test_benchmark_submitter_uses_explicit_optimizer_for_all_models(tmp_path: Pa
             "8",
             "8",
             "5",
-            "0",
+            "7",
             "0",
         ],
         cwd=REPO_ROOT,
@@ -287,6 +288,12 @@ def test_benchmark_submitter_uses_explicit_optimizer_for_all_models(tmp_path: Pa
         assert vars_map["WARMUP_EPOCHS"] == "0"
         assert vars_map["BACKBONE_LR_MULTIPLIER"] == "1.0"
         assert vars_map["GRAD_CLIP_NORM"] == "0.01"
+        assert vars_map["CHECKPOINT"] == "null"
+        assert vars_map["SEED"] == "7"
+        assert vars_map["EXPERIMENT_MODE"].startswith("testrun_")
+        assert vars_map["EXPERIMENT_MODE"].endswith("_seed7")
+        is_dino = "dinov3" in vars_map["CONFIG_YAML"]
+        assert vars_map["FREEZE"] == ("1" if is_dino else "0")
 
 
 def test_benchmark_submitter_rejects_auto_optimizer() -> None:

@@ -6,7 +6,7 @@
 nc: 80
 
 backbone:
-  - [-1, 1, Timm, ["hrnet_w32.ms_in1k", True, 3, True, [1, 2, 3, 4], 32, null, "auto", False, False, False, False, 0.0]]
+  - [-1, 1, Timm, ["hrnet_w32", False, 3, True, [1, 2, 3, 4], 32, null, "auto", False, False, False, False, 0.0]]
 
 head:
   - [0, 1, Index, [0]]  # 1-P2/4, 128 channels

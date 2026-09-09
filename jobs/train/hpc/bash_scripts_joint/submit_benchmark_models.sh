@@ -61,9 +61,9 @@ PROJECT_SEG="${PROJECT_SEG:-benchmark_${DATASET_SLUG}_imgsz${IMGSZ_SEG}_segment}
 JOBS=(
   "yolo11_obb|obb|b_y11_obb|ultralytics/cfg/models/11/yolo11x-obb-1cls.yaml|0"
   "yolo12_obb|obb|b_y12_obb|ultralytics/cfg/models/12/yolo12x-obb-1cls.yaml|0"
-  "yolo26_obb|obb|b_y26_obb|ultralytics/cfg/models/26/yolo26-obb.yaml|0"
+  "yolo26_obb|obb|b_y26_obb|ultralytics/cfg/models/26/yolo26x-obb-1cls.yaml|0"
   "dino_obb|obb|b_dino_obb|ultralytics/cfg/models/timm/obb/final/yolo_neck/transformer/dinov3_7_12_17_22/1cls/dinov3_7_12_17_22-yolo11x-obb.yaml|1"
-  "mamba_yolo_obb|obb|b_mamba_yolo_o|ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-L-obb-demo.yaml|0"
+  "mamba_yolo_obb|obb|b_mamba_yolo_o|ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-B-obb.yaml|0"
   "mamba_hr_obb|obb|b_mamba_hr_o|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-obb.yaml|0"
   "hr32_obb|obb|b_hr32_obb|ultralytics/cfg/models/timm/obb/final/augfpn/hrnet/hrnet_w32/1cls/hrnet_w32-augfpn_512c-obb.yaml|0"
   "rfrcnn|obb|b_rfrcnn|ultralytics/cfg/models/rcnn/rotated_faster_rcnn_r50_fpn_le90_smallobj.yaml|0"
@@ -73,9 +73,9 @@ JOBS=(
   "rhino|obb|b_rhino_r50|ultralytics/cfg/models/rhino/rhino-r50-obb.yaml|0"
   "yolo11_seg|segment|b_y11_seg|ultralytics/cfg/models/timm/segment/final/yolo_neck/yolo/yolo11x/flat_no_p2/1cls/yolo11x-yolo11x-segment.yaml|0"
   "yolo12_seg|segment|b_y12_seg|ultralytics/cfg/models/timm/segment/final/yolo_neck/yolo/yolo12x/1cls/yolo12x-yolo12x-segment.yaml|0"
-  "yolo26_seg|segment|b_y26_seg|ultralytics/cfg/models/26/yolo26-seg.yaml|0"
+  "yolo26_seg|segment|b_y26_seg|ultralytics/cfg/models/26/yolo26x-seg-1cls.yaml|0"
   "dino_seg|segment|b_dino_seg|ultralytics/cfg/models/timm/segment/final/yolo_neck/transformer/dinov3_7_12_17_22/1cls/dinov3_7_12_17_22-yolo11x-segment.yaml|1"
-  "mamba_yolo_seg|segment|b_mamba_yolo_s|ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-L-seg.yaml|0"
+  "mamba_yolo_seg|segment|b_mamba_yolo_s|ultralytics/cfg/models/mamba-yolo/Mamba-YOLO-B-seg.yaml|0"
   "mamba_hr_seg|segment|b_mamba_hr_s|ultralytics/cfg/models/mamba-yolo/mamba-hrnet-seg.yaml|0"
   "cascade|segment|b_cascade|ultralytics/cfg/models/rcnn/cascade_mask_rcnn_r50_fpn_smallobj.yaml|0"
   "mask_rcnn|segment|b_mask_rcnn|ultralytics/cfg/models/rcnn/mask_rcnn_r50_fpn_smallobj.yaml|0"
@@ -137,7 +137,7 @@ submit_job() {
 
   optimizer_args=",OPTIMIZER=${OPTIMIZER},LR0=${LR0},LRF=${LRF},WEIGHT_DECAY=${WEIGHT_DECAY},WARMUP_EPOCHS=${WARMUP_EPOCHS},BACKBONE_LR_MULTIPLIER=1.0,GRAD_CLIP_NORM=${GRAD_CLIP_NORM}"
 
-  varlist="TASK=${task},IMGSZ=${imgsz},CHECKPOINT=null,TIME_FLOAT=null,EPOCHS=${EPOCHS},DEVICE=0,EXPERIMENT_MODE=${RUN_TAG}_${alias},OVERLAP=35,KEEP_FRAC=20,MULTISPECTRAL=${MULTISPECTRAL},BATCH=${batch},WORKERS=${WORKERS},CONFIG_YAML=${config},FREEZE=${freeze},SEED=${SEED},WANDB=true,PLOTS=false,PROJECT=${project}${task_args}${optimizer_args}${NO_AUG}"
+  varlist="TASK=${task},IMGSZ=${imgsz},CHECKPOINT=null,TIME_FLOAT=null,EPOCHS=${EPOCHS},DEVICE=0,EXPERIMENT_MODE=${RUN_TAG}_${alias}_seed${SEED},OVERLAP=35,KEEP_FRAC=20,MULTISPECTRAL=${MULTISPECTRAL},BATCH=${batch},WORKERS=${WORKERS},CONFIG_YAML=${config},FREEZE=${freeze},SEED=${SEED},WANDB=true,PLOTS=false,PROJECT=${project}${task_args}${optimizer_args}${NO_AUG}"
 
   echo "Submitting ${alias}: task=${task}, imgsz=${imgsz}, batch=${batch}, config=${config}, optimizer=${OPTIMIZER}, lr0=${LR0}"
   if [[ "$DRY_RUN" == "1" ]]; then
