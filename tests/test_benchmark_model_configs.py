@@ -109,6 +109,15 @@ def test_benchmark_dino_and_mamba_hr_task_pairs_share_necks() -> None:
             [25, 28, 31],
         ),
         (
+            MODEL_ROOT
+            / "timm/obb/final/yolo_neck/transformer/dinov3_7_12_17_22/2cls/"
+            "dinov3_7_12_17_22-yolo11x-obb.yaml",
+            MODEL_ROOT
+            / "timm/segment/final/yolo_neck/transformer/dinov3_7_12_17_22/2cls/"
+            "dinov3_7_12_17_22-yolo11x-segment.yaml",
+            [25, 28, 31],
+        ),
+        (
             MODEL_ROOT / "mamba-yolo/mamba-hrnet-obb.yaml",
             MODEL_ROOT / "mamba-yolo/mamba-hrnet-seg.yaml",
             [70, 73, 76, 79],
@@ -118,6 +127,7 @@ def test_benchmark_dino_and_mamba_hr_task_pairs_share_necks() -> None:
     for obb_path, segment_path, expected_levels in cases:
         obb = _load(obb_path)
         segment = _load(segment_path)
+        assert obb["nc"] == segment["nc"]
         assert obb["backbone"] == segment["backbone"]
         assert obb["head"][:-1] == segment["head"][:-1]
         assert obb["head"][-1][0] == segment["head"][-1][0] == expected_levels

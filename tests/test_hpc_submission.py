@@ -315,6 +315,68 @@ def test_benchmark_submitter_rejects_auto_optimizer() -> None:
     assert "optimizer=auto is not allowed" in result.stdout
 
 
+def test_dino_dataset_ablation_uses_yolo_neck_obb_and_explicit_optimizer(tmp_path: Path) -> None:
+    """All DINO dataset/image-size ablations should use paired YOLO-neck configs and explicit optimization."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{\n"
+        "  echo CALL\n"
+        "  for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done\n"
+        "  echo END\n"
+        "} >> \"$QSUB_LOG\"\n",
+    )
+    _write_stub(bin_dir / "sleep", "#!/usr/bin/env bash\nexit 0\n")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["QSUB_LOG"] = str(qsub_log)
+    env["RUN_TAG"] = "testrun"
+    subprocess.run(
+        ["bash", "jobs/train/hpc/bash_scripts_joint/submit_dinov3_yolo11x_all_dataset_imgsz_ablation.sh"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == 30  # 5 datasets x 3 image sizes x 2 tasks
+    for call in calls:
+        vars_map = _parse_varlist(call)
+        config = vars_map["CONFIG_YAML"]
+        expected_classes = 2 if vars_map["MULTISPECTRAL"] == "001" else 1
+        assert Path(REPO_ROOT / config).is_file()
+        assert f"/{expected_classes}cls/" in config
+        assert vars_map["OPTIMIZER"] == "AdamW"
+        assert vars_map["LR0"] == "0.0001"
+        assert vars_map["LRF"] == "0.01"
+        assert vars_map["WEIGHT_DECAY"] == "0.05"
+        assert vars_map["WARMUP_EPOCHS"] == "0"
+        assert vars_map["BACKBONE_LR_MULTIPLIER"] == "1.0"
+        assert vars_map["GRAD_CLIP_NORM"] == "0.01"
+        if vars_map["TASK"] == "obb":
+            assert "/obb/final/yolo_neck/" in config
+            assert "augfpn" not in config
+
+    auto_env = env.copy()
+    auto_env["OPTIMIZER"] = "auto"
+    result = subprocess.run(
+        ["bash", "jobs/train/hpc/bash_scripts_joint/submit_dinov3_yolo11x_all_dataset_imgsz_ablation.sh"],
+        cwd=REPO_ROOT,
+        env=auto_env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "optimizer=auto is not allowed" in result.stdout
+
+
 def test_joint_mamba_launcher_includes_edgevss_variants(tmp_path: Path) -> None:
     """Smoke-test the joint Mamba launcher after adding EdgeVSS variants."""
     bin_dir = tmp_path / "bin"

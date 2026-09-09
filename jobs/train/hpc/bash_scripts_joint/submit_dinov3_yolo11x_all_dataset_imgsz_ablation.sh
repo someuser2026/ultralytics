@@ -25,6 +25,14 @@ DRY_RUN="${DRY_RUN:-0}"
 WORKERS="${WORKERS:-1}"
 RUN_TAG="${RUN_TAG:-$(date +%m%d-%H%M%S)}"
 
+# Match the explicit optimizer profile used by the model-comparison benchmark.
+OPTIMIZER="${OPTIMIZER:-AdamW}"
+LR0="${LR0:-0.0001}"
+LRF="${LRF:-0.01}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
+WARMUP_EPOCHS="${WARMUP_EPOCHS:-0}"
+GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-0.01}"
+
 PBS_SCRIPT="jobs/train/hpc/planet_full.pbs"
 IMGSIZES=(224 448 896)
 
@@ -45,13 +53,16 @@ case "$IMGSZ_SET" in all|224|448|896) ;; *) echo "IMGSZ must be all, 224, 448, o
 [[ "$EPOCHS" =~ ^[0-9]+$ && "$EPOCHS" -ge 1 ]] || { echo "EPOCHS must be an integer >= 1"; exit 1; }
 [[ "$SEED" =~ ^[0-9]+$ ]] || { echo "SEED must be a non-negative integer"; exit 1; }
 [[ "$DRY_RUN" =~ ^[01]$ ]] || { echo "DRY_RUN must be 0 or 1"; exit 1; }
+case "$OPTIMIZER" in
+  [Aa][Uu][Tt][Oo]) echo "OPTIMIZER must be explicit; optimizer=auto is not allowed for dataset ablations"; exit 1 ;;
+esac
 [[ -f "$PBS_SCRIPT" ]] || { echo "Missing PBS script: $PBS_SCRIPT"; exit 1; }
 
 config_for() {
   local task="$1"
   local classes="$2"
   if [[ "$task" == "obb" ]]; then
-    echo "ultralytics/cfg/models/timm/obb/final/augfpn/transformer/dinov3_7_12_17_22/${classes}cls/dinov3_7_12_17_22-augfpn_512c-obb.yaml"
+    echo "ultralytics/cfg/models/timm/obb/final/yolo_neck/transformer/dinov3_7_12_17_22/${classes}cls/dinov3_7_12_17_22-yolo11x-obb.yaml"
   else
     echo "ultralytics/cfg/models/timm/segment/final/yolo_neck/transformer/dinov3_7_12_17_22/${classes}cls/dinov3_7_12_17_22-yolo11x-segment.yaml"
   fi
@@ -65,7 +76,7 @@ submit_job() {
   local multispectral="$3"
   local classes="$4"
   local imgsz="$5"
-  local batch project prefix config task_args varlist job_name dataset_slug
+  local batch project prefix config task_args optimizer_args varlist job_name dataset_slug
 
   config="$(config_for "$task" "$classes")"
   [[ -f "$config" ]] || { echo "Missing config: $config"; exit 1; }
@@ -84,7 +95,8 @@ submit_job() {
   fi
 
   job_name="ab_dino_${prefix}_${tag}_c${imgsz}"
-  varlist="TASK=${task},IMGSZ=${imgsz},CHECKPOINT=null,TIME_FLOAT=null,EPOCHS=${EPOCHS},DEVICE=0,EXPERIMENT_MODE=${RUN_TAG}_${job_name},OVERLAP=35,KEEP_FRAC=20,MULTISPECTRAL=${multispectral},BATCH=${batch},WORKERS=${WORKERS},CONFIG_YAML=${config},FREEZE=1,SEED=${SEED},WANDB=true,PLOTS=false,PROJECT=${project}${task_args}${NO_AUG}"
+  optimizer_args=",OPTIMIZER=${OPTIMIZER},LR0=${LR0},LRF=${LRF},WEIGHT_DECAY=${WEIGHT_DECAY},WARMUP_EPOCHS=${WARMUP_EPOCHS},BACKBONE_LR_MULTIPLIER=1.0,GRAD_CLIP_NORM=${GRAD_CLIP_NORM}"
+  varlist="TASK=${task},IMGSZ=${imgsz},CHECKPOINT=null,TIME_FLOAT=null,EPOCHS=${EPOCHS},DEVICE=0,EXPERIMENT_MODE=${RUN_TAG}_${job_name},OVERLAP=35,KEEP_FRAC=20,MULTISPECTRAL=${multispectral},BATCH=${batch},WORKERS=${WORKERS},CONFIG_YAML=${config},FREEZE=1,SEED=${SEED},WANDB=true,PLOTS=false,PROJECT=${project}${task_args}${optimizer_args}${NO_AUG}"
 
   echo "Submitting ${job_name}: task=${task}, dataset=${tag}, imgsz=${imgsz}"
   if [[ "$DRY_RUN" == "1" ]]; then
