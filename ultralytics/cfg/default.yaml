@@ -114,20 +114,42 @@ dnn: False # (bool) use OpenCV DNN for ONNX inference
 plots: True # (bool) save plots and images during train/val
 # comparision_metric: fitness # (str) metric to use for comparison, choices=[fitness, f1, f2, custom]
 
+# Detection fallback. OBB and segmentation use their task-specific profiles below.
 fitness_weights:
-  precision: 0.10      # (float) weight for precision
-  recall: 0.30         # (float) weight for recall  
-  mAP50: 0.30          # (float) weight for mAP@0.5
-  mAP50_95: 0.20       # (float) weight for mAP@0.5:0.95
-  mask_precision: 0.0  # (float) weight for mask precision
-  mask_recall: 0.0     # (float) weight for mask recall
-  mask_mAP50: 0.05     # (float) weight for mask mAP@0.5
-  mask_mAP50_95: 0.0   # (float) weight for mask mAP@0.5:0.95
-  f1: 0.0              # (float) weight for F1 score
-  f2: 0.05             # (float) weight for F2 score
-  dice: 0.0            # (float) weight for Dice coefficient
-  miou: 0.0            # (float) weight for mean IoU
-  boundary_f1: 0.0     # (float) weight for boundary F1 score
+  precision: 0.0
+  recall: 0.0
+  mAP50: 0.0
+  mAP50_95: 1.0
+  f1: 0.0
+  f2: 0.0
+
+# Recall-oriented OBB checkpoint selection with a localization-quality guard.
+obb_fitness_weights:
+  precision: 0.0
+  recall: 0.05
+  mAP50: 0.0
+  mAP50_95: 0.25
+  f1: 0.0
+  f2: 0.70
+
+# Recall-oriented mask checkpoint selection; box metrics deliberately have zero weight.
+segment_fitness_weights:
+  precision: 0.0
+  recall: 0.0
+  mAP50: 0.0
+  mAP50_95: 0.0
+  f1: 0.0
+  f2: 0.0
+  mask_precision: 0.0
+  mask_recall: 0.05
+  mask_mAP50: 0.0
+  mask_mAP50_95: 0.20
+  mask_f1: 0.0
+  mask_f2: 0.65
+  dice: 0.10
+  miou: 0.0
+  boundary_f1: 0.0
+  boundary_iou: 0.0
 
 # Additional segmentation metric settings ------------------------------------------------------------------------------
 boundary_tolerance: 2 # (int) pixel tolerance for boundary-F1 (segmentation metrics)

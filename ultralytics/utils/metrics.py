@@ -1206,7 +1206,7 @@ def ap_per_class(
         plot_mc_curve(x, p_curve, save_dir / f"{prefix}P_curve.png", names, ylabel="Precision", on_plot=on_plot)
         plot_mc_curve(x, r_curve, save_dir / f"{prefix}R_curve.png", names, ylabel="Recall", on_plot=on_plot)
 
-    i = smooth(f1_curve.mean(0), 0.1).argmax()
+    i = smooth(f2_curve.mean(0), 0.1).argmax()
     p, r, f1, f2 = p_curve[:, i], r_curve[:, i], f1_curve[:, i], f2_curve[:, i]
     tp = (r * nt).round()
     fp = (tp / (p + eps) - tp).round()

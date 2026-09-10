@@ -51,11 +51,8 @@ class SegmentationValidator(DetectionValidator):
         super().__init__(dataloader, save_dir, args, _callbacks)
         self.process = None
         self.args.task = "segment"
-        # print("-"*50)
-        # print("Inside segment/val.py 54")
-        # print(self.args.fitness_weights)
-        # print("-"*50)
-        self.metrics = SegmentMetrics(fitness_weights = self.args.fitness_weights)
+        fitness_weights = getattr(self.args, "segment_fitness_weights", None) or self.args.fitness_weights
+        self.metrics = SegmentMetrics(fitness_weights=fitness_weights)
     
     def __call__(self, trainer=None, model=None):
         """Run validation."""
