@@ -1481,6 +1481,135 @@ def test_submit_resume_training_rejects_invalid_inputs(tmp_path: Path) -> None:
         assert result.returncode != 0
 
 
+def _make_fake_training_run(run_dir: Path, epochs: int) -> Path:
+    """Create the files used by the grouped resume selectors."""
+    checkpoint = run_dir / "weights" / "last.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_bytes(b"resumable")
+    rows = "".join(f"{epoch},0.0\n" for epoch in range(1, epochs + 1))
+    (run_dir / "results.csv").write_text(f"epoch,time\n{rows}", encoding="utf-8")
+    return checkpoint
+
+
+def test_dataset_imgsz_resume_submits_only_incomplete_run(tmp_path: Path) -> None:
+    """Dataset/image-size resume should discover its run and skip it once 100 epochs are recorded."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{ echo CALL; for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done; echo END; } >> \"$QSUB_LOG\"\n",
+    )
+
+    runs_root = tmp_path / "runs" / "cuda"
+    run_dir = (
+        runs_root
+        / "obb"
+        / "imgsz_448"
+        / "yolo"
+        / "dino_dataset_imgsz_ablation_obb"
+        / "0914-010101_ab_dino_o_RSCMC1_c448_seed0"
+    )
+    checkpoint = _make_fake_training_run(run_dir, 67)
+    env = os.environ.copy()
+    env.update({"PATH": f"{bin_dir}:{env['PATH']}", "QSUB_LOG": str(qsub_log), "RUNS_ROOT": str(runs_root)})
+    script = "jobs/train/hpc/bash_scripts_joint/resume_dinov3_yolo11x_all_dataset_imgsz_ablation.sh"
+
+    result = subprocess.run(
+        ["bash", script, "obb", "RSCMC1", "448", "0"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "RESUME 67/100" in result.stdout
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == 1
+    assert calls[0][-1] == "jobs/train/hpc/planet_full.pbs"
+    assert _parse_varlist(calls[0]) == {"RESUME": "true", "CHECKPOINT": str(checkpoint), "WANDB": "true"}
+
+    dry_result = subprocess.run(
+        ["bash", script, "obb", "RSCMC1", "448", "1"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "DRY_RUN qsub" in dry_result.stdout
+    assert len(_parse_call_log(qsub_log)) == 1
+
+    _make_fake_training_run(run_dir, 100)
+    complete_result = subprocess.run(
+        ["bash", script, "obb", "RSCMC1", "448", "0"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "COMPLETE 100/100" in complete_result.stdout
+    assert "No incomplete runs to submit" in complete_result.stdout
+    assert len(_parse_call_log(qsub_log)) == 1
+
+
+def test_benchmark_resume_wrappers_submit_incomplete_and_skip_complete_runs(tmp_path: Path) -> None:
+    """Both dataset wrappers should select incomplete benchmark runs by alias and task."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    qsub_log = tmp_path / "qsub.log"
+    _write_stub(
+        bin_dir / "qsub",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "{ echo CALL; for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done; echo END; } >> \"$QSUB_LOG\"\n",
+    )
+
+    runs_root = tmp_path / "runs" / "cuda"
+    expected = set()
+    for dataset in ("rscmc1", "pnscmc1"):
+        obb_project = f"model_comparison_{dataset}_imgsz448_obb"
+        seg_project = f"model_comparison_{dataset}_imgsz448_segment"
+        expected.add(
+            _make_fake_training_run(
+                runs_root / "obb" / "imgsz_448" / "yolo" / obb_project / f"0914-{dataset}_yolo11_obb_seed0",
+                61,
+            )
+        )
+        _make_fake_training_run(
+            runs_root / "obb" / "imgsz_448" / "yolo" / obb_project / f"0914-{dataset}_yolo12_obb_seed0",
+            100,
+        )
+        expected.add(
+            _make_fake_training_run(
+                runs_root / "segment" / "imgsz_448" / "yolo" / seg_project / f"0914-{dataset}_pointrend_seed0",
+                42,
+            )
+        )
+
+    env = os.environ.copy()
+    env.update({"PATH": f"{bin_dir}:{env['PATH']}", "QSUB_LOG": str(qsub_log), "RUNS_ROOT": str(runs_root)})
+    for dataset in ("rscmc1", "pnscmc1"):
+        script = f"jobs/train/hpc/bash_scripts_joint/resume_model_comparison_{dataset}.sh"
+        result = subprocess.run(
+            ["bash", script, "yolo11_obb,yolo12_obb,pointrend", "0"],
+            cwd=REPO_ROOT,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert "2 incomplete, 1 complete" in result.stdout
+
+    calls = _parse_call_log(qsub_log)
+    assert len(calls) == 4
+    assert {Path(_parse_varlist(call)["CHECKPOINT"]) for call in calls} == expected
+    assert all(call[-1] == "jobs/train/hpc/planet_full.pbs" for call in calls)
+
+
 def test_site_prediction_submitter_passes_site_and_img_dir(tmp_path: Path) -> None:
     """Smoke-test the site prediction submitter with live and dry-run flows."""
     bin_dir = tmp_path / "bin"
