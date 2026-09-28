@@ -5,6 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 PBS_SCRIPT="jobs/infer/hpc/yolo_site_predict_json.pbs"
+COMBINE_PBS_SCRIPT="jobs/infer/hpc/combine_yolo_site_predict_json_batches.pbs"
 
 usage() {
   cat <<'EOF'
@@ -37,6 +38,8 @@ Optional environment overrides:
   PREDICT_MODE Either `per-image` or `directory` (default: per-image)
   WANDB       Whether to upload the prediction directory to W&B (default: true)
   WANDB_RUN_ID Optional W&B run ID to resume instead of creating a sibling inference run
+  COMBINE_BATCHES
+              Submit a CPU combine job after all batches succeed (0/1, default: 0)
 EOF
 }
 
@@ -60,6 +63,7 @@ JOB_BATCH_SIZE="${JOB_BATCH_SIZE:-5000}"
 PREDICT_MODE="${PREDICT_MODE:-per-image}"
 WANDB="${WANDB:-true}"
 WANDB_RUN_ID="${WANDB_RUN_ID:-}"
+COMBINE_BATCHES="${COMBINE_BATCHES:-0}"
 
 [[ -n "${CHECKPOINT_INPUT}" ]] || { echo "CHECKPOINT is required"; usage; exit 1; }
 [[ -n "${SITE_NAME}" ]] || { echo "SITE_NAME is required"; usage; exit 1; }
@@ -70,6 +74,11 @@ WANDB_RUN_ID="${WANDB_RUN_ID:-}"
 [[ -n "${DEVICE}" ]] || { echo "DEVICE must not be empty"; exit 1; }
 [[ "${DRY_RUN}" =~ ^[01]$ ]] || { echo "DRY_RUN must be 0 or 1"; exit 1; }
 [[ "${JOB_BATCHING}" =~ ^[01]$ ]] || { echo "JOB_BATCHING must be 0 or 1"; exit 1; }
+[[ "${COMBINE_BATCHES}" =~ ^[01]$ ]] || { echo "COMBINE_BATCHES must be 0 or 1"; exit 1; }
+if [[ "${COMBINE_BATCHES}" == "1" && ( "${JOB_BATCHING}" == "0" || "${JOB_BATCH_SIZE}" == "0" ) ]]; then
+  echo "COMBINE_BATCHES=1 requires batching with JOB_BATCH_SIZE > 0"
+  exit 1
+fi
 [[ -z "${MAX_DET}" || "${MAX_DET}" =~ ^[0-9]+$ ]] || { echo "MAX_DET must be empty or a non-negative integer"; exit 1; }
 [[ -z "${BATCH}" || "${BATCH}" =~ ^[0-9]+$ ]] || { echo "BATCH must be empty or a non-negative integer"; exit 1; }
 [[ "${JOB_BATCH_SIZE}" =~ ^[0-9]+$ ]] || { echo "JOB_BATCH_SIZE must be a non-negative integer"; exit 1; }
@@ -131,14 +140,24 @@ submit_cmd() {
   shift
   local varlist
   varlist="$(join_by_comma "$@")"
-  local cmd=(qsub -V -v "${varlist}" -N "${job_name}" "${PBS_SCRIPT}")
+  local cmd=(qsub -V -v "${varlist}" -N "${job_name}" -d "${REPO_ROOT}" "${PBS_SCRIPT}")
   if [[ "${DRY_RUN}" == "1" ]]; then
     printf '[DRY RUN] '
     printf '%q ' "${cmd[@]}"
     printf '\n'
+    LAST_JOB_ID="${batch_index:-1}.dryrun"
     return 0
   fi
-  "${cmd[@]}"
+  if [[ "${COMBINE_BATCHES}" == "1" ]]; then
+    LAST_JOB_ID="$("${cmd[@]}")"
+    echo "${LAST_JOB_ID}"
+    [[ "${LAST_JOB_ID}" =~ ^[0-9]+(\.[A-Za-z0-9_.-]+)?$ ]] || {
+      echo "Unexpected qsub job ID: ${LAST_JOB_ID}; cannot submit dependency job" >&2
+      return 1
+    }
+  else
+    "${cmd[@]}"
+  fi
 }
 
 infer_run_name() {
@@ -156,6 +175,11 @@ infer_run_name() {
 CHECKPOINT="$(resolve_path "${CHECKPOINT_INPUT}")"
 [[ -f "${CHECKPOINT}" ]] || { echo "Checkpoint not found: ${CHECKPOINT}"; exit 1; }
 [[ -f "${REPO_ROOT}/${PBS_SCRIPT}" ]] || { echo "PBS script not found: ${REPO_ROOT}/${PBS_SCRIPT}"; exit 1; }
+if [[ "${COMBINE_BATCHES}" == "1" ]]; then
+  [[ -f "${REPO_ROOT}/${COMBINE_PBS_SCRIPT}" ]] || { echo "PBS script not found: ${COMBINE_PBS_SCRIPT}"; exit 1; }
+fi
+
+cd "${REPO_ROOT}"
 
 RUN_NAME="$(infer_run_name "${CHECKPOINT}")"
 JOB_LABEL="${JOB_LABEL:-$(sanitize_label "${RUN_NAME}_${SITE_NAME}")}"
@@ -220,6 +244,7 @@ TOTAL_BATCHES=$(( (TOTAL_IMAGES + JOB_BATCH_SIZE - 1) / JOB_BATCH_SIZE ))
 echo "Resolved image root: ${IMAGE_ROOT}"
 echo "Found PNG images: ${TOTAL_IMAGES}"
 echo "Submitting PBS batches: ${TOTAL_BATCHES}"
+BATCH_JOB_IDS=()
 
 for ((batch_index=1; batch_index<=TOTAL_BATCHES; batch_index++)); do
   batch_start=$(( (batch_index - 1) * JOB_BATCH_SIZE ))
@@ -238,4 +263,24 @@ for ((batch_index=1; batch_index<=TOTAL_BATCHES; batch_index++)); do
     "JOB_BATCH_END=${batch_end}"
   )
   submit_cmd "${batch_job_label}" "${VARS[@]}"
+  if [[ "${COMBINE_BATCHES}" == "1" ]]; then
+    BATCH_JOB_IDS+=("${LAST_JOB_ID}")
+  fi
 done
+
+if [[ "${COMBINE_BATCHES}" == "1" ]]; then
+  dependency="$(IFS=:; printf '%s' "${BATCH_JOB_IDS[*]}")"
+  combine_vars="$(join_by_comma \
+    "CHECKPOINT=${CHECKPOINT}" "SITE_NAME=${SITE_NAME}" "IMG_DIR=${IMG_DIR}" \
+    "EXPECTED_BATCHES=${TOTAL_BATCHES}" "EXPECTED_COUNT=${TOTAL_IMAGES}")"
+  cmd=(qsub -V -v "${combine_vars}" -N "${JOB_LABEL}_combine" -d "${REPO_ROOT}" \
+    -W "depend=afterok:${dependency}" "${COMBINE_PBS_SCRIPT}")
+  echo "Submitting combination job after successful batches: ${dependency}"
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    printf '[DRY RUN] '
+    printf '%q ' "${cmd[@]}"
+    printf '\n'
+  else
+    "${cmd[@]}"
+  fi
+fi

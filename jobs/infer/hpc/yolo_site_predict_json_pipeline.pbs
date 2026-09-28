@@ -1,0 +1,22 @@
+#!/bin/bash
+
+#PBS -l select=1:ncpus=1:mem=1gb
+#PBS -l walltime=00:15:00
+#PBS -m ae
+
+# Submit from the repository root:
+# qsub -V -v CHECKPOINT=/srv/scratch/.../weights/best.pt,SITE_NAME=Treachery,IMG_DIR=visual/pngs_c448_ov35_kf20 jobs/infer/hpc/yolo_site_predict_json_pipeline.pbs
+# For a local submission preview, use the same environment with DRY_RUN=1 bash <this file>.
+# The launcher finishes after submitting the GPU batches and their dependent CPU combine job.
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR:-$(pwd)}"
+: "${CHECKPOINT:?CHECKPOINT is required}"
+: "${SITE_NAME:?SITE_NAME is required}"
+: "${IMG_DIR:?IMG_DIR is required}"
+: "${SCRATCH:?SCRATCH is required}"
+
+export COMBINE_BATCHES=1
+bash jobs/infer/hpc/submit_yolo_site_predict_json.sh \
+    "${CHECKPOINT}" "${SITE_NAME}" "${IMG_DIR}" \
+    "${IMGSZ:-448}" "${CONF:-0.01}" "${DEVICE:-0}" "${DRY_RUN:-0}" 1

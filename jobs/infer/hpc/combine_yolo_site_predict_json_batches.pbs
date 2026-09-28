@@ -1,0 +1,24 @@
+#!/bin/bash
+
+#PBS -l select=1:ncpus=1:mem=32gb
+#PBS -l walltime=01:00:00
+#PBS -m ae
+
+# Submitted with depend=afterok:<batch job IDs> by the site prediction submitter.
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR:-$(pwd)}"
+: "${CHECKPOINT:?CHECKPOINT is required}"
+: "${SITE_NAME:?SITE_NAME is required}"
+: "${IMG_DIR:?IMG_DIR is required}"
+: "${SCRATCH:?SCRATCH is required}"
+: "${EXPECTED_BATCHES:?EXPECTED_BATCHES is required}"
+: "${EXPECTED_COUNT:?EXPECTED_COUNT is required}"
+
+export MAMBA_EXE="${MAMBA_EXE:-/srv/scratch/z5428587/mamba/bin/micromamba}"
+export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-/srv/scratch/z5428587/mamba}"
+
+echo "Combining ${EXPECTED_BATCHES} batches for ${SITE_NAME}; job ${PBS_JOBID:-local}"
+"${MAMBA_EXE}" run -n ultralytics_contrib python3 jobs/infer/combine_yolo_site_predict_json_batches.py \
+    --ckpt "${CHECKPOINT}" --site-name "${SITE_NAME}" --img-dir "${IMG_DIR}" \
+    --expected-batches "${EXPECTED_BATCHES}" --expected-count "${EXPECTED_COUNT}"
