@@ -29,6 +29,8 @@ def pipeline_env(tmp_path):
     qsub.write_text(
         f"#!{sys.executable}\n"
         "import json, os, pathlib, sys\n"
+        "if '-d' in sys.argv[1:]: sys.exit('qsub: invalid option -- d')\n"
+        "assert pathlib.Path.cwd() == pathlib.Path(os.environ['EXPECTED_QSUB_CWD'])\n"
         "log = pathlib.Path(os.environ['QSUB_LOG'])\n"
         "lines = log.read_text().splitlines() if log.exists() else []\n"
         "with log.open('a') as handle: handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
@@ -47,6 +49,7 @@ def pipeline_env(tmp_path):
         "JOB_BATCH_SIZE": "2",
         "PBS_O_WORKDIR": str(REPO_ROOT),
         "QSUB_LOG": str(tmp_path / "qsub.jsonl"),
+        "EXPECTED_QSUB_CWD": str(REPO_ROOT),
         "DRY_RUN": "0",
     }
 
@@ -59,17 +62,34 @@ def read_calls(env):
     return [json.loads(line) for line in Path(env["QSUB_LOG"]).read_text().splitlines()]
 
 
-def test_pipeline_waits_for_all_successful_batches(pipeline_env):
-    result = run_pipeline(pipeline_env)
+@pytest.mark.parametrize("batch_size,batch_count", [(2, 3), (5000, 1)])
+def test_pipeline_waits_for_all_successful_batches(pipeline_env, batch_size, batch_count):
+    result = run_pipeline({**pipeline_env, "JOB_BATCH_SIZE": str(batch_size)})
     assert result.returncode == 0, result.stderr
     calls = read_calls(pipeline_env)
-    assert len(calls) == 4
-    assert all(call[-1].endswith("/yolo_site_predict_json.pbs") for call in calls[:3])
+    assert len(calls) == batch_count + 1
+    assert all(call[-1].endswith("/yolo_site_predict_json.pbs") for call in calls[:-1])
     combine = calls[-1]
     assert combine[-1].endswith("/combine_yolo_site_predict_json_batches.pbs")
-    assert combine[combine.index("-W") + 1] == "depend=afterok:1.server:2.server:3.server"
-    assert "EXPECTED_BATCHES=3" in combine[combine.index("-v") + 1]
+    dependency = ":".join(f"{index}.server" for index in range(1, batch_count + 1))
+    assert combine[combine.index("-W") + 1] == f"depend=afterok:{dependency}"
+    assert f"EXPECTED_BATCHES={batch_count}" in combine[combine.index("-v") + 1]
     assert "EXPECTED_COUNT=5" in combine[combine.index("-v") + 1]
+
+
+def test_submitter_uses_repo_directory_when_called_elsewhere(pipeline_env, tmp_path):
+    result = subprocess.run(
+        [
+            "bash", str(REPO_ROOT / "jobs/infer/hpc/submit_yolo_site_predict_json.sh"),
+            pipeline_env["CHECKPOINT"], pipeline_env["SITE_NAME"], pipeline_env["IMG_DIR"],
+        ],
+        cwd=tmp_path,
+        env={**pipeline_env, "COMBINE_BATCHES": "1"},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert len(read_calls(pipeline_env)) == 4
 
 
 def test_pipeline_dry_run_does_not_submit(pipeline_env):

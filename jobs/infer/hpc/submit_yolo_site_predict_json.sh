@@ -140,7 +140,7 @@ submit_cmd() {
   shift
   local varlist
   varlist="$(join_by_comma "$@")"
-  local cmd=(qsub -V -v "${varlist}" -N "${job_name}" -d "${REPO_ROOT}" "${PBS_SCRIPT}")
+  local cmd=(qsub -V -v "${varlist}" -N "${job_name}" "${PBS_SCRIPT}")
   if [[ "${DRY_RUN}" == "1" ]]; then
     printf '[DRY RUN] '
     printf '%q ' "${cmd[@]}"
@@ -179,6 +179,7 @@ if [[ "${COMBINE_BATCHES}" == "1" ]]; then
   [[ -f "${REPO_ROOT}/${COMBINE_PBS_SCRIPT}" ]] || { echo "PBS script not found: ${COMBINE_PBS_SCRIPT}"; exit 1; }
 fi
 
+# qsub records this directory as PBS_O_WORKDIR for the inference and combine jobs.
 cd "${REPO_ROOT}"
 
 RUN_NAME="$(infer_run_name "${CHECKPOINT}")"
@@ -273,7 +274,7 @@ if [[ "${COMBINE_BATCHES}" == "1" ]]; then
   combine_vars="$(join_by_comma \
     "CHECKPOINT=${CHECKPOINT}" "SITE_NAME=${SITE_NAME}" "IMG_DIR=${IMG_DIR}" \
     "EXPECTED_BATCHES=${TOTAL_BATCHES}" "EXPECTED_COUNT=${TOTAL_IMAGES}")"
-  cmd=(qsub -V -v "${combine_vars}" -N "${JOB_LABEL}_combine" -d "${REPO_ROOT}" \
+  cmd=(qsub -V -v "${combine_vars}" -N "${JOB_LABEL}_combine" \
     -W "depend=afterok:${dependency}" "${COMBINE_PBS_SCRIPT}")
   echo "Submitting combination job after successful batches: ${dependency}"
   if [[ "${DRY_RUN}" == "1" ]]; then
