@@ -40,6 +40,9 @@ Optional environment overrides:
   WANDB_RUN_ID Optional W&B run ID to resume instead of creating a sibling inference run
   COMBINE_BATCHES
               Submit a CPU combine job after all batches succeed (0/1, default: 0)
+  SITE_PREDICT_CONTROL
+              Optional durable control directory for the single-site runner.
+              Requires SITE_PREDICT_SETTINGS and SITE_PREDICT_PYTHON.
 EOF
 }
 
@@ -181,6 +184,22 @@ fi
 
 # qsub records this directory as PBS_O_WORKDIR for the inference and combine jobs.
 cd "${REPO_ROOT}"
+
+if [[ -n "${SITE_PREDICT_CONTROL:-}" && "${DRY_RUN}" == "0" ]]; then
+  [[ "${COMBINE_BATCHES}" == "1" && "${JOB_BATCHING}" == "1" && "${JOB_BATCH_SIZE}" -gt 0 ]] || {
+    echo 'Managed prediction requires batching and COMBINE_BATCHES=1' >&2; exit 1;
+  }
+  : "${SITE_PREDICT_SETTINGS:?Managed scheduler settings are required}"
+  : "${SITE_PREDICT_PYTHON:?Managed Python executable is required}"
+  [[ -z "${MAX_DET}" && -z "${BATCH}" && -z "${WANDB_RUN_ID}" ]] || {
+    echo 'Managed mode currently requires default MAX_DET/BATCH and no WANDB_RUN_ID' >&2; exit 1;
+  }
+  exec "${SITE_PREDICT_PYTHON}" jobs/infer/site_predict_job_control.py submit \
+    --control "${SITE_PREDICT_CONTROL}" --scheduler-settings "${SITE_PREDICT_SETTINGS}" \
+    --ckpt "${CHECKPOINT}" --site-name "${SITE_NAME}" --img-dir "${IMG_DIR}" \
+    --imgsz "${IMGSZ}" --conf "${CONF}" --iou "${IOU}" --device "${DEVICE}" \
+    --predict-mode "${PREDICT_MODE}" --job-batch-size "${JOB_BATCH_SIZE}"
+fi
 
 RUN_NAME="$(infer_run_name "${CHECKPOINT}")"
 JOB_LABEL="${JOB_LABEL:-$(sanitize_label "${RUN_NAME}_${SITE_NAME}")}"

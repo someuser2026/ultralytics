@@ -7,6 +7,10 @@
 
 set -euo pipefail
 
+if [[ -n "${SITE_PREDICT_CONTROL:-}" && -n "${SITE_PREDICT_ENV_SETUP:-}" ]]; then
+    source "${SITE_PREDICT_ENV_SETUP}"
+fi
+
 if [[ "${SOURCE_USER_SHELL_RC:-0}" == "1" ]]; then
     source ~/.bashrc 2>/dev/null || true
     source ~/.profile 2>/dev/null || true
@@ -95,8 +99,9 @@ if [ ! -f "${script_path}" ]; then
     exit 1
 fi
 
-echo "Activating ultralytics_contrib environment..."
-if micromamba activate ultralytics_contrib; then
+prediction_environment="${SITE_PREDICT_ENVIRONMENT:-ultralytics_contrib}"
+echo "Activating ${prediction_environment} environment..."
+if micromamba activate "${prediction_environment}"; then
     echo "Environment activated successfully"
 else
     echo "Failed to activate ultralytics_contrib"
@@ -142,4 +147,10 @@ done
 printf '\n'
 echo "========================================="
 
-python3 "${script_path}" "${cmd_args[@]}"
+if [[ -n "${SITE_PREDICT_CONTROL:-}" ]]; then
+    "${SITE_PREDICT_PYTHON:?}" jobs/infer/site_predict_job_control.py run-worker \
+        "${SITE_PREDICT_CONTROL}" "${SITE_PREDICT_NODE:?}" "${SITE_PREDICT_ATTEMPT:?}" \
+        -- "${SITE_PREDICT_PYTHON}" "${script_path}" "${cmd_args[@]}"
+else
+    python3 "${script_path}" "${cmd_args[@]}"
+fi
