@@ -500,7 +500,14 @@ def run_with_receipt(control, node, attempt, command):
         if node != 'combine':
             batch = next(b for b in request['batches'] if b['node'] == node)
             verify_images(request, request['images'][batch['start']:batch['end']])
-        code = subprocess.run(command, cwd=ROOT).returncode
+        # Activation hooks / PBS startup may replace SCRATCH after submission.
+        # The frozen request owns both input and output paths for every worker,
+        # including the combiner. Restore it at the child-process boundary.
+        worker_env = os.environ.copy()
+        worker_env['SCRATCH'] = request['scratch']
+        print(f"Prediction {node}: SCRATCH={request['scratch']} "
+              f"(inherited {os.environ.get('SCRATCH', '<unset>')})", flush=True)
+        code = subprocess.run(command, cwd=ROOT, env=worker_env).returncode
         if code == 0 and node != 'combine':
             code = 1
             validation = validate_batch_output(request, node)
