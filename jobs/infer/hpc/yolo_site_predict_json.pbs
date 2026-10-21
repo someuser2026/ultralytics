@@ -7,8 +7,17 @@
 
 set -euo pipefail
 
+if [[ -n "${SITE_PREDICT_CONTROL:-}" && -n "${SITE_PIPELINE_JOB_LOGGING:-}" ]]; then
+    export SITE_PIPELINE_EXECUTION_LOGS="${SITE_PREDICT_CONTROL}/logs/executions/${SITE_PREDICT_NODE:?}"
+    source "${SITE_PIPELINE_JOB_LOGGING}"
+fi
+
 if [[ -n "${SITE_PREDICT_CONTROL:-}" && -n "${SITE_PREDICT_ENV_SETUP:-}" ]]; then
-    source "${SITE_PREDICT_ENV_SETUP}"
+    if [[ -n "${SITE_PIPELINE_JOB_LOGGING:-}" ]]; then
+        site_pipeline_source "${SITE_PREDICT_ENV_SETUP}"
+    else
+        source "${SITE_PREDICT_ENV_SETUP}"
+    fi
 fi
 
 if [[ "${SOURCE_USER_SHELL_RC:-0}" == "1" ]]; then

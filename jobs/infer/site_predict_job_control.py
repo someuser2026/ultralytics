@@ -119,6 +119,9 @@ def build_submission_plan(args):
     scripts = ROOT / 'jobs/infer'
     source_names = ['site_predict_job_control.py', 'yolo_site_predict_json.py', 'combine_yolo_site_predict_json_batches.py',
                     'hpc/submit_yolo_site_predict_json.sh', 'hpc/yolo_site_predict_json.pbs', 'hpc/combine_yolo_site_predict_json_batches.pbs']
+    login_combine = getattr(args, 'combine_execution', 'pbs') == 'login'
+    if login_combine:
+        source_names.remove('hpc/combine_yolo_site_predict_json_batches.pbs')
     request = {'schema': SCHEMA, 'control': str(control), 'checkpoint': str(checkpoint),
                'checkpoint_sha256': file_hash(checkpoint), 'scratch': str(scratch), 'site': args.site_name,
                'img_dir': str(img_dir), 'image_root': str(image_root), 'images': images, 'output': str(output),
@@ -131,6 +134,8 @@ def build_submission_plan(args):
     # This is a quota guard, not a second scheduler. Normal sites use fewer than 50 jobs.
     if len(request['batches']) + 1 > 550:
         raise ValueError('Prediction graph exceeds the single-site quota; increase job batch size')
+    if login_combine:
+        request.update(combine_execution='login', max_attempts=1)
     request['hash'] = digest(request)
     return request
 
@@ -221,6 +226,7 @@ def command_for(request, job, state):
               'SITE_PREDICT_PYTHON': settings.get('python', sys.executable),
               'SITE_PREDICT_ENVIRONMENT': settings.get('environment_name', 'ultralytics_contrib'),
               'SITE_PREDICT_ENV_SETUP': settings.get('environment_setup') or '',
+              'SITE_PIPELINE_JOB_LOGGING': settings.get('site_pipeline_job_logging') or '',
               'MAMBA_EXE': settings.get('micromamba') or '', 'MAMBA_ROOT_PREFIX': settings.get('mamba_root_prefix') or ''}
     for key, value in options.items():
         if key != 'job_batch_size':
@@ -334,11 +340,13 @@ def submit_or_resume(args):
             atomic(control / 'request.json', request)
         if not (control / 'state.json').exists():
             state = {'jobs': {name: [new_attempt(request, name, 1)] for name in
-                             [b['node'] for b in request['batches']] + ['combine']}, 'combine_fallback': False}
+                             [b['node'] for b in request['batches']] + ([] if request.get('combine_execution') == 'login' else ['combine'])}, 'combine_fallback': False}
             atomic(control / 'state.json', state)
         state = read(control / 'state.json')
         for batch in request['batches']:
             submit_job(request, state, state['jobs'][batch['node']][-1])
+        if request.get('combine_execution') == 'login':
+            return {'control': str(control), 'batches': len(request['batches']), 'combine_execution': 'login'}
         combine = state['jobs']['combine'][-1]
         if not state['combine_fallback'] and not combine['job_id'] and combine['status'] == 'pending':
             jobs = query(request)
@@ -362,6 +370,12 @@ def status(control):
         for attempts in state['jobs'].values():
             for job in attempts:
                 if job['job_id']:
+                    history = jobs.get(job['job_id'])
+                    if request.get('combine_execution') == 'login' and history:
+                        if matching(request, job, jobs) != [job['job_id']]:
+                            raise ValueError('Prediction PBS ownership mismatch')
+                        if int(history.get('run_count', 0) or 0) > 1 or (history.get('job_state') == 'H' and 's' in str(history.get('Hold_Types', ''))):
+                            job['execution_failure'] = {'reason': 'PBS reexecution or system hold', 'scheduler': history}
                     result = observe(request, job, jobs)
                     if result is not None:
                         job['terminal'] = result
@@ -394,6 +408,8 @@ def abandon_combine(control):
 def retry_batch(control, node):
     with lock(control):
         request, state = load_request(control), read(Path(control) / 'state.json')
+        if request.get('max_attempts') == 1:
+            raise ValueError('Single-attempt managed prediction cannot be retried')
         if node not in {b['node'] for b in request['batches']}:
             raise ValueError('Only prediction batches can be retried')
         attempts = state['jobs'][node]
@@ -491,6 +507,7 @@ def run_with_receipt(control, node, attempt, command):
         raise ValueError('Prediction worker identity mismatch')
     path = Path(control) / 'receipts' / (job['token'] + '.json')
     if path.exists():
+        print('Duplicate execution rejected; preserving existing receipt: ' + str(path), file=sys.stderr, flush=True)
         raise RuntimeError('This prediction attempt already started')
     record = {**identity(request, job), 'state': 'started', 'started_at': now()}
     atomic(path, record)
@@ -515,6 +532,8 @@ def run_with_receipt(control, node, attempt, command):
         return code
     except BaseException as exc:
         code, error = 1, str(exc)
+        import traceback
+        record['traceback'] = traceback.format_exc()
         raise
     finally:
         atomic(path, {**record, 'state': 'finished', 'exit_status': code,
@@ -548,6 +567,7 @@ def main(argv=None):
         submit.add_argument('--' + name, required=True)
     for name, default, kind in (('imgsz', 448, int), ('conf', .01, float), ('iou', .45, float), ('job-batch-size', 5000, int)):
         submit.add_argument('--' + name, type=kind, default=default)
+    submit.add_argument('--combine-execution', choices=['pbs', 'login'], default='pbs')
     submit.add_argument('--device', default='0')
     submit.add_argument('--predict-mode', default='per-image', choices=['per-image', 'directory'])
     for name in ('status', 'abandon-combine', 'retry', 'run-worker', 'reconcile'):

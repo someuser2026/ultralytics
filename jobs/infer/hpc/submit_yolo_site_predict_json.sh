@@ -178,7 +178,7 @@ infer_run_name() {
 CHECKPOINT="$(resolve_path "${CHECKPOINT_INPUT}")"
 [[ -f "${CHECKPOINT}" ]] || { echo "Checkpoint not found: ${CHECKPOINT}"; exit 1; }
 [[ -f "${REPO_ROOT}/${PBS_SCRIPT}" ]] || { echo "PBS script not found: ${REPO_ROOT}/${PBS_SCRIPT}"; exit 1; }
-if [[ "${COMBINE_BATCHES}" == "1" ]]; then
+if [[ "${COMBINE_BATCHES}" == "1" && "${SITE_PREDICT_COMBINE_EXECUTION:-pbs}" != "login" ]]; then
   [[ -f "${REPO_ROOT}/${COMBINE_PBS_SCRIPT}" ]] || { echo "PBS script not found: ${COMBINE_PBS_SCRIPT}"; exit 1; }
 fi
 
@@ -195,6 +195,7 @@ if [[ -n "${SITE_PREDICT_CONTROL:-}" && "${DRY_RUN}" == "0" ]]; then
     echo 'Managed mode currently requires default MAX_DET/BATCH and no WANDB_RUN_ID' >&2; exit 1;
   }
   exec "${SITE_PREDICT_PYTHON}" jobs/infer/site_predict_job_control.py submit \
+    --combine-execution "${SITE_PREDICT_COMBINE_EXECUTION:-pbs}" \
     --control "${SITE_PREDICT_CONTROL}" --scheduler-settings "${SITE_PREDICT_SETTINGS}" \
     --ckpt "${CHECKPOINT}" --site-name "${SITE_NAME}" --img-dir "${IMG_DIR}" \
     --imgsz "${IMGSZ}" --conf "${CONF}" --iou "${IOU}" --device "${DEVICE}" \
