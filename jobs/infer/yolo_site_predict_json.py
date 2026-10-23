@@ -8,11 +8,16 @@ import gc
 import json
 import os
 import shutil
+import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import torch
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from segmentation_filter_bridge import load_segmentation_filter
 
 from ultralytics import YOLO
 from ultralytics.utils.callbacks.wb import _prediction_json_payload, _prediction_result_key
@@ -286,6 +291,9 @@ class PredictionJsonWriter:
     """Stream prediction records to disk so large folder runs do not accumulate Results in RAM."""
 
     def __init__(self, output_dir: str | Path, source_root=None):
+        policy_path = os.environ.get("SITE_PREDICT_SEGMENT_FILTER")
+        self.segmentation_filter = load_segmentation_filter(policy_path) if policy_path else None
+        self.filter_counts = Counter()
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.source_root = resolve_source_root(source_root)
@@ -300,6 +308,10 @@ class PredictionJsonWriter:
         """Serialize one prediction result directly to the temp entries file."""
         key = _prediction_result_key(result, self.source_root, self.count, self.used_keys)
         payload = _prediction_json_payload(result)
+        if self.segmentation_filter is not None and payload.get("task") == "segment":
+            payload, counts = self.segmentation_filter.filter_segmentation_record(
+                payload, coordinate_space="normalized")
+            self.filter_counts.update(counts)
         if not self.first:
             self._entries_handle.write(",\n")
         self._entries_handle.write(json.dumps(key))
@@ -328,6 +340,11 @@ class PredictionJsonWriter:
 
         self.entries_tmp_path.unlink(missing_ok=True)
         self._closed = True
+        if self.segmentation_filter is not None:
+            print("Segmentation filter: " + json.dumps({
+                "policy": self.segmentation_filter.SEGMENT_FILTER_VERSION,
+                "minimum_area_px2": self.segmentation_filter.MIN_SEGMENT_AREA_PX2,
+                **self.filter_counts}, sort_keys=True), flush=True)
         return final_path
 
     def abort(self) -> None:
@@ -469,6 +486,9 @@ def main(argv: list[str] | None = None) -> Path:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    policy_path = os.environ.get("SITE_PREDICT_SEGMENT_FILTER")
+    if policy_path:
+        load_segmentation_filter(policy_path)
     model = YOLO(str(ckpt))
     use_half = False
     batch = args.batch if args.batch is not None else (2 if args.predict_mode == "directory" else 1)

@@ -490,3 +490,69 @@ def test_main_rejects_invalid_job_batch_slice(inference_module, tmp_path: Path, 
                 "--no-wandb",
             ]
         )
+
+
+@pytest.fixture
+def shared_segmentation_filter(monkeypatch):
+    import os
+    policy = Path(os.environ.get('SITE_PIPELINE_SEGMENT_FILTER_TEST_PATH',
+        REPO_ROOT.parents[1] / 'rip-detection/Code/notebooks/model_evaluation/lib/fiftyone_eval_core_v2/segmentation_filter.py'))
+    if not policy.is_file():
+        pytest.skip('Set SITE_PIPELINE_SEGMENT_FILTER_TEST_PATH to the shared policy')
+    monkeypatch.setenv('SITE_PREDICT_SEGMENT_FILTER', str(policy))
+    return policy
+
+
+def segment_result(path, predictions):
+    from types import SimpleNamespace
+    result = SimpleNamespace(path=str(path), orig_shape=(50, 100), masks=object(), obb=None,
+                             probs=None, keypoints=None, speed={})
+    result.summary = lambda normalize: predictions
+    result.cpu = lambda: result
+    return result
+
+
+@pytest.mark.parametrize('mode', ['per-image', 'directory'])
+def test_shared_filter_runs_in_both_inference_modes(inference_module, shared_segmentation_filter,
+                                                  tmp_path, mode, capsys):
+    def det(xs, ys):
+        return {'class': 0, 'confidence': .01, 'segments': {'x': xs, 'y': ys}}
+    valid = det([0, .02, .02, 0], [0, 0, .02, .02])  # 2 px² on a 100 x 50 image
+    collapsed = det([0, .01], [0, .01])
+    tiny = det([0, .005, .005, 0], [0, 0, .005, .005])
+    images = [tmp_path / 'a.png', tmp_path / 'b.png']
+    results = [segment_result(images[0], [collapsed, tiny, valid]), segment_result(images[1], [collapsed])]
+    class Model:
+        def predict(self, source, **kwargs):
+            return results if isinstance(source, list) else [results[images.index(Path(source))]]
+    writer = inference_module.PredictionJsonWriter(tmp_path / 'output')
+    if mode == 'directory':
+        inference_module.run_directory_predictions(Model(), images, writer, {})
+    else:
+        assert inference_module.run_per_image_predictions(Model(), images, writer, {}) == []
+    payload = json.loads(writer.close().read_text())
+    assert payload['count'] == 2
+    records = list(payload['predictions'].values())
+    assert records[0]['predictions'] == [valid]
+    assert records[1]['predictions'] == []
+    assert records[0]['orig_shape'] == {'width': 100, 'height': 50}
+    assert records[0]['coordinate_space'] == 'normalized'
+    assert writer.filter_counts['removed'] == 3
+    assert 'minimum_area_px2' in capsys.readouterr().out
+
+
+def test_configured_filter_is_required_before_output_is_opened(inference_module, tmp_path, monkeypatch):
+    monkeypatch.setenv('SITE_PREDICT_SEGMENT_FILTER', str(tmp_path / 'missing.py'))
+    with pytest.raises(ValueError, match='missing'):
+        inference_module.PredictionJsonWriter(tmp_path / 'output')
+    assert not (tmp_path / 'output').exists()
+
+
+def test_shared_filter_does_not_change_obb_export(inference_module, shared_segmentation_filter, tmp_path):
+    result = make_obb_result(tmp_path / 'tile.png')
+    expected = inference_module._prediction_json_payload(result)
+    writer = inference_module.PredictionJsonWriter(tmp_path / 'output')
+    writer.add_result(result)
+    payload = json.loads(writer.close().read_text())
+    assert list(payload['predictions'].values()) == [expected]
+    assert not writer.filter_counts

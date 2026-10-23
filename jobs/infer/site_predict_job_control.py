@@ -23,6 +23,9 @@ import struct
 import sys
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from segmentation_filter_bridge import load_segmentation_filter
+
 SCHEMA = 'site-predict-control-v1'
 ROOT = Path(__file__).resolve().parents[2]
 JOB_ID = re.compile(r'^\d+(?:\.[A-Za-z0-9_.-]+)?(?:@[A-Za-z0-9_.-]+)?$')
@@ -117,7 +120,7 @@ def build_submission_plan(args):
     output = scratch / 'data_processed' / args.site_name / 'predictions/segment' / (
         checkpoint.parent.parent.name + '__' + '__'.join(img_dir.parts))
     scripts = ROOT / 'jobs/infer'
-    source_names = ['site_predict_job_control.py', 'yolo_site_predict_json.py', 'combine_yolo_site_predict_json_batches.py',
+    source_names = ['site_predict_job_control.py', 'yolo_site_predict_json.py', 'segmentation_filter_bridge.py', 'combine_yolo_site_predict_json_batches.py',
                     'hpc/submit_yolo_site_predict_json.sh', 'hpc/yolo_site_predict_json.pbs', 'hpc/combine_yolo_site_predict_json_batches.pbs']
     login_combine = getattr(args, 'combine_execution', 'pbs') == 'login'
     if login_combine:
@@ -131,6 +134,12 @@ def build_submission_plan(args):
                'batches': [{'node': f'batch_{i // args.job_batch_size + 1}', 'start': i,
                             'end': min(i + args.job_batch_size, len(images)), 'index': i // args.job_batch_size + 1}
                            for i in range(0, len(images), args.job_batch_size)]}
+    filter_path = request['settings'].get('segmentation_filter_path')
+    if filter_path:
+        filter_path = str(Path(filter_path).resolve())
+        load_segmentation_filter(filter_path)  # fail before submitting any GPU jobs
+        request['segmentation_filter_path'] = filter_path
+        request['sources'][filter_path] = file_hash(filter_path)
     # This is a quota guard, not a second scheduler. Normal sites use fewer than 50 jobs.
     if len(request['batches']) + 1 > 550:
         raise ValueError('Prediction graph exceeds the single-site quota; increase job batch size')
@@ -451,6 +460,7 @@ def unique_json(path):
 
 
 def validate_batch_output(request, node):
+    policy = load_segmentation_filter(request['segmentation_filter_path']) if request.get('segmentation_filter_path') else None
     batch = next(b for b in request['batches'] if b['node'] == node)
     expected = request['images'][batch['start']:batch['end']]
     verify_images(request, expected)
@@ -496,6 +506,11 @@ def validate_batch_output(request, node):
                     raise ValueError('Invalid polygon values')
             except (KeyError, TypeError, ValueError, OverflowError) as exc:
                 raise ValueError('Invalid segmentation detection: ' + stem) from exc
+        # Geometry filtering belongs in export; validators must never rewrite results.
+        if policy is not None:
+            _, counts = policy.filter_segmentation_record(record)
+            if counts['removed']:
+                raise ValueError('Unfiltered degenerate segmentation predictions: ' + stem)
     return {'count': len(records), 'sha256': file_hash(Path(request['output']) / node / 'predictions.json')}
 
 
@@ -522,6 +537,9 @@ def run_with_receipt(control, node, attempt, command):
         # including the combiner. Restore it at the child-process boundary.
         worker_env = os.environ.copy()
         worker_env['SCRATCH'] = request['scratch']
+        worker_env.pop('SITE_PREDICT_SEGMENT_FILTER', None)
+        if request.get('segmentation_filter_path'):
+            worker_env['SITE_PREDICT_SEGMENT_FILTER'] = request['segmentation_filter_path']
         print(f"Prediction {node}: SCRATCH={request['scratch']} "
               f"(inherited {os.environ.get('SCRATCH', '<unset>')})", flush=True)
         code = subprocess.run(command, cwd=ROOT, env=worker_env).returncode
