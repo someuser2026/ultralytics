@@ -102,6 +102,23 @@ def verify_images(request, images=None):
             raise ValueError('Prediction tile changed: ' + record['path'])
 
 
+def validate_combine_resources(resource):
+    """Validate independently of the outer pipeline before any GPU submission."""
+    if not isinstance(resource, dict) or type(resource.get('cpus')) is not int or resource['cpus'] < 1:
+        raise ValueError('Combination resources require positive cpus')
+    values = resource.get('pbs')
+    if not isinstance(values, list) or not all(isinstance(v, str) and '\n' not in v and '\r' not in v for v in values):
+        raise ValueError('Combination pbs resources must be a string list')
+    if any('gpu' in value.lower() for value in values):
+        raise ValueError('Combination resources must be CPU-only')
+    selections = [v for v in values if v.startswith('select=')]
+    if len(selections) != 1 or '+' in selections[0] or not any(v.startswith('walltime=') for v in values):
+        raise ValueError('Combination resources require one node and explicit walltime')
+    fields = dict(part.split('=', 1) for part in selections[0].split(':'))
+    if fields.get('select') != '1' or fields.get('ncpus') != str(resource['cpus']) or not fields.get('mem'):
+        raise ValueError('Combination resource select/ncpus/mem mismatch')
+
+
 def build_submission_plan(args):
     control, checkpoint = Path(args.control).resolve(), Path(args.ckpt).resolve()
     scratch = Path(os.environ['SCRATCH']).resolve()
@@ -122,7 +139,8 @@ def build_submission_plan(args):
     scripts = ROOT / 'jobs/infer'
     source_names = ['site_predict_job_control.py', 'yolo_site_predict_json.py', 'segmentation_filter_bridge.py', 'combine_yolo_site_predict_json_batches.py',
                     'hpc/submit_yolo_site_predict_json.sh', 'hpc/yolo_site_predict_json.pbs', 'hpc/combine_yolo_site_predict_json_batches.pbs']
-    login_combine = getattr(args, 'combine_execution', 'pbs') == 'login'
+    execution = getattr(args, 'combine_execution', 'pbs')
+    login_combine = execution == 'login'
     if login_combine:
         source_names.remove('hpc/combine_yolo_site_predict_json_batches.pbs')
     request = {'schema': SCHEMA, 'control': str(control), 'checkpoint': str(checkpoint),
@@ -143,8 +161,10 @@ def build_submission_plan(args):
     # This is a quota guard, not a second scheduler. Normal sites use fewer than 50 jobs.
     if len(request['batches']) + 1 > 550:
         raise ValueError('Prediction graph exceeds the single-site quota; increase job batch size')
-    if login_combine:
-        request.update(combine_execution='login', max_attempts=1)
+    if execution in {'login', 'pbs-deferred'}:
+        request.update(combine_execution=execution, max_attempts=1)
+    if execution == 'pbs-deferred':
+        validate_combine_resources(request['settings'].get('combine_resources'))
     request['hash'] = digest(request)
     return request
 
@@ -210,6 +230,20 @@ def observe(request, job, jobs):
     receipt = read(path) if path.exists() else None
     if receipt and any(receipt.get(k) != v for k, v in identity(request, job).items()):
         raise ValueError('Prediction receipt identity mismatch')
+    if request.get('combine_execution') == 'pbs-deferred':
+        # A cached success or scheduler success must never hide a failed worker.
+        prior = job.get('terminal') or {}
+        codes = []
+        if history is not None and history.get('Exit_status') is not None:
+            codes.append(int(history['Exit_status']))
+        if receipt and receipt.get('state') == 'finished' and type(receipt.get('exit_status')) is int:
+            codes.append(receipt['exit_status'])
+        if type(prior.get('exit_status')) is int:
+            codes.append(prior['exit_status'])
+        if codes:
+            return {'exit_status': next((code for code in codes if code != 0), codes[0]),
+                    'receipt': receipt if receipt is not None else prior.get('receipt'),
+                    'scheduler': history if history is not None else prior.get('scheduler'), 'at': now()}
     if job.get('terminal'):
         return job['terminal']
     if history is not None and history.get('Exit_status') is not None:
@@ -244,6 +278,8 @@ def command_for(request, job, state):
     combine = job['node'] == 'combine'
     if combine:
         values.update(EXPECTED_BATCHES=str(len(request['batches'])), EXPECTED_COUNT=str(len(request['images'])))
+        if request.get('combine_execution') == 'pbs-deferred':
+            values['SITE_PREDICT_OUTPUT_DIR'] = request['output']
     else:
         batch = next(b for b in request['batches'] if b['node'] == job['node'])
         values.update(JOB_BATCH_INDEX=str(batch['index']), JOB_BATCH_START=str(batch['start']), JOB_BATCH_END=str(batch['end']))
@@ -255,8 +291,13 @@ def command_for(request, job, state):
     command = [settings.get('qsub', 'qsub'), '-h', '-r', 'n', '-N', job['job_name'],
                '-o', str(prefix) + '.out', '-e', str(prefix) + '.err', '-v', ','.join(k + '=' + v for k, v in values.items())]
     if combine:
-        parents = [state['jobs'][b['node']][-1]['job_id'] for b in request['batches']]
-        command += ['-W', 'depend=afterok:' + ':'.join(parents)]
+        if request.get('combine_execution') == 'pbs-deferred':
+            validate_combine_resources(settings.get('combine_resources'))
+            for resource in settings['combine_resources']['pbs']:
+                command += ['-l', resource]
+        else:
+            parents = [state['jobs'][b['node']][-1]['job_id'] for b in request['batches']]
+            command += ['-W', 'depend=afterok:' + ':'.join(parents)]
     if settings.get('queue'):
         command += ['-q', settings['queue']]
     if settings.get('account'):
@@ -288,7 +329,8 @@ def submit_job(request, state, job):
             raise
         job['qsub_result'] = {'code': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}
         identifier = result.stdout.strip()
-        if (job['node'] == 'combine' and result.returncode and not identifier
+        if (job['node'] == 'combine' and request.get('combine_execution', 'pbs') == 'pbs'
+                and result.returncode and not identifier
                 and re.fullmatch(r'qsub: Unknown Job Id(?: Error)?[^\n]*', result.stderr.strip(), re.IGNORECASE)):
             # A specific server rejection can race with expiration after our pre-submit
             # query. Unknown acknowledgements and other errors still require reconciliation.
@@ -354,8 +396,9 @@ def submit_or_resume(args):
         state = read(control / 'state.json')
         for batch in request['batches']:
             submit_job(request, state, state['jobs'][batch['node']][-1])
-        if request.get('combine_execution') == 'login':
-            return {'control': str(control), 'batches': len(request['batches']), 'combine_execution': 'login'}
+        if request.get('combine_execution') in {'login', 'pbs-deferred'}:
+            return {'control': str(control), 'batches': len(request['batches']),
+                    'combine_execution': request['combine_execution']}
         combine = state['jobs']['combine'][-1]
         if not state['combine_fallback'] and not combine['job_id'] and combine['status'] == 'pending':
             jobs = query(request)
@@ -372,6 +415,55 @@ def submit_or_resume(args):
     return {'control': str(control), 'batches': len(request['batches'])}
 
 
+def observe_attempt(request, job, jobs):
+    history = jobs.get(job['job_id'])
+    if request.get('max_attempts') == 1 and history:
+        if matching(request, job, jobs) != [job['job_id']]:
+            raise ValueError('Prediction PBS ownership mismatch')
+        if int(history.get('run_count', 0) or 0) > 1 or (history.get('job_state') == 'H' and 's' in str(history.get('Hold_Types', ''))):
+            job['execution_failure'] = {'reason': 'PBS reexecution or system hold', 'scheduler': history}
+    result = observe(request, job, jobs)
+    if result is not None:
+        job['terminal'] = result
+    elif request.get('combine_execution') == 'pbs-deferred':
+        job.pop('terminal', None)  # Fresh active/held evidence outranks cached completion.
+    return result
+
+
+def submit_combine(control):
+    """Submit one deferred attempt, or recover its durable submission."""
+    with lock(control):
+        request, state = load_request(control), read(Path(control) / 'state.json')
+        if request.get('combine_execution') != 'pbs-deferred':
+            raise ValueError('submit-combine requires pbs-deferred mode')
+        verify_sources(request)
+        combine = state['jobs']['combine'][-1]
+        if combine['job_id'] or combine['status'] in {'submitting', 'ambiguous'}:
+            submit_job(request, state, combine)
+            return state
+        if combine['status'] != 'pending' or combine['attempt'] != 1 or len(state['jobs']['combine']) != 1:
+            raise ValueError('Deferred combination requires its original pending attempt')
+        jobs = query(request)
+        ready = True
+        try:
+            for batch in request['batches']:
+                job = state['jobs'][batch['node']][-1]
+                if not job['job_id']:
+                    raise RuntimeError('Prediction batch submission is incomplete: ' + job['node'])
+                terminal = observe_attempt(request, job, jobs)
+                if job.get('execution_failure') or (terminal is not None and terminal['exit_status'] != 0):
+                    raise RuntimeError('Prediction batch failed: ' + job['node'])
+                ready = ready and terminal is not None
+        finally:
+            atomic(Path(control) / 'state.json', state)
+        if not ready:
+            return state
+        for batch in request['batches']:
+            validate_batch_output(request, batch['node'])
+        submit_job(request, state, combine)
+        return state
+
+
 def status(control):
     with lock(control):
         request, state = load_request(control), read(Path(control) / 'state.json')
@@ -379,15 +471,7 @@ def status(control):
         for attempts in state['jobs'].values():
             for job in attempts:
                 if job['job_id']:
-                    history = jobs.get(job['job_id'])
-                    if request.get('combine_execution') == 'login' and history:
-                        if matching(request, job, jobs) != [job['job_id']]:
-                            raise ValueError('Prediction PBS ownership mismatch')
-                        if int(history.get('run_count', 0) or 0) > 1 or (history.get('job_state') == 'H' and 's' in str(history.get('Hold_Types', ''))):
-                            job['execution_failure'] = {'reason': 'PBS reexecution or system hold', 'scheduler': history}
-                    result = observe(request, job, jobs)
-                    if result is not None:
-                        job['terminal'] = result
+                    observe_attempt(request, job, jobs)
         atomic(Path(control) / 'state.json', state)
         return state
 
@@ -460,11 +544,19 @@ def unique_json(path):
 
 
 def validate_batch_output(request, node):
-    policy = load_segmentation_filter(request['segmentation_filter_path']) if request.get('segmentation_filter_path') else None
     batch = next(b for b in request['batches'] if b['node'] == node)
-    expected = request['images'][batch['start']:batch['end']]
+    return _validate_prediction_output(request, Path(request['output']) / node / 'predictions.json',
+                                       request['images'][batch['start']:batch['end']])
+
+
+def validate_combined_output(request):
+    return _validate_prediction_output(request, Path(request['output']) / 'predictions.json', request['images'])
+
+
+def _validate_prediction_output(request, path, expected):
+    policy = load_segmentation_filter(request['segmentation_filter_path']) if request.get('segmentation_filter_path') else None
     verify_images(request, expected)
-    payload = unique_json(Path(request['output']) / node / 'predictions.json')
+    payload = unique_json(path)
     records = payload.get('predictions') if isinstance(payload, dict) else None
     if not isinstance(records, dict):
         raise ValueError('Batch output lacks predictions')
@@ -511,7 +603,7 @@ def validate_batch_output(request, node):
             _, counts = policy.filter_segmentation_record(record)
             if counts['removed']:
                 raise ValueError('Unfiltered degenerate segmentation predictions: ' + stem)
-    return {'count': len(records), 'sha256': file_hash(Path(request['output']) / node / 'predictions.json')}
+    return {'count': len(records), 'sha256': file_hash(path)}
 
 
 def run_with_receipt(control, node, attempt, command):
@@ -532,6 +624,9 @@ def run_with_receipt(control, node, attempt, command):
         if node != 'combine':
             batch = next(b for b in request['batches'] if b['node'] == node)
             verify_images(request, request['images'][batch['start']:batch['end']])
+        elif request.get('combine_execution') == 'pbs-deferred':
+            for batch in request['batches']:
+                validate_batch_output(request, batch['node'])
         # Activation hooks / PBS startup may replace SCRATCH after submission.
         # The frozen request owns both input and output paths for every worker,
         # including the combiner. Restore it at the child-process boundary.
@@ -543,9 +638,9 @@ def run_with_receipt(control, node, attempt, command):
         print(f"Prediction {node}: SCRATCH={request['scratch']} "
               f"(inherited {os.environ.get('SCRATCH', '<unset>')})", flush=True)
         code = subprocess.run(command, cwd=ROOT, env=worker_env).returncode
-        if code == 0 and node != 'combine':
+        if code == 0 and (node != 'combine' or request.get('combine_execution') == 'pbs-deferred'):
             code = 1
-            validation = validate_batch_output(request, node)
+            validation = validate_combined_output(request) if node == 'combine' else validate_batch_output(request, node)
             code = 0
         return code
     except BaseException as exc:
@@ -585,10 +680,10 @@ def main(argv=None):
         submit.add_argument('--' + name, required=True)
     for name, default, kind in (('imgsz', 448, int), ('conf', .01, float), ('iou', .45, float), ('job-batch-size', 5000, int)):
         submit.add_argument('--' + name, type=kind, default=default)
-    submit.add_argument('--combine-execution', choices=['pbs', 'login'], default='pbs')
+    submit.add_argument('--combine-execution', choices=['pbs', 'login', 'pbs-deferred'], default='pbs')
     submit.add_argument('--device', default='0')
     submit.add_argument('--predict-mode', default='per-image', choices=['per-image', 'directory'])
-    for name in ('status', 'abandon-combine', 'retry', 'run-worker', 'reconcile'):
+    for name in ('status', 'submit-combine', 'abandon-combine', 'retry', 'run-worker', 'reconcile'):
         p = subs.add_parser(name)
         p.add_argument('control')
         if name in ('retry', 'run-worker', 'reconcile'):
@@ -606,6 +701,8 @@ def main(argv=None):
         result = submit_or_resume(args)
     elif args.command == 'status':
         result = status(args.control)
+    elif args.command == 'submit-combine':
+        result = submit_combine(args.control)
     elif args.command == 'retry':
         result = retry_batch(args.control, args.node)
     elif args.command == 'abandon-combine':

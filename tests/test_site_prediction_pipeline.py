@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import argparse
+import importlib.util
 import os
 import subprocess
 import sys
@@ -132,3 +134,72 @@ def test_combine_pbs_executes_combiner(pipeline_env, tmp_path):
     assert result.returncode == 0, result.stderr
     payload = json.loads((run_dir / "predictions.json").read_text())
     assert payload == {"count": 2, "predictions": {"1": {}, "2": {}}}
+
+
+@pytest.mark.parametrize('broken_setup', [False, True])
+def test_deferred_combine_pbs_receipt_logging_and_frozen_environment(pipeline_env, tmp_path, monkeypatch, broken_setup):
+    from PIL import Image
+
+    helper_path = REPO_ROOT / 'jobs/infer/site_predict_job_control.py'
+    spec = importlib.util.spec_from_file_location('compute_combine_helper', helper_path)
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    logging = Path(os.environ.get('SITE_PIPELINE_REPO', REPO_ROOT.parent.parent / 'rip-detection')) / (
+        'Code/time_series_analysis/scripts/analysis/site_pipeline_job_logging.sh')
+    assert logging.is_file(), 'Set SITE_PIPELINE_REPO to the pipeline checkout'
+    image_root = Path(pipeline_env['SCRATCH']) / 'data_processed/Treachery/PSScene/visual/pngs_c448'
+    for path in image_root.glob('*.png'):
+        Image.new('RGB', (8, 6)).save(path)
+    settings = tmp_path / 'scheduler.json'
+    settings.write_text(json.dumps({'python': sys.executable, 'combine_resources': {
+        'cpus': 2, 'pbs': ['select=1:ncpus=2:mem=64gb', 'walltime=11:30:00']}}))
+    monkeypatch.setenv('SCRATCH', pipeline_env['SCRATCH'])
+    args = argparse.Namespace(control=str(tmp_path / 'control'), ckpt=pipeline_env['CHECKPOINT'],
+        site_name='Treachery', img_dir=pipeline_env['IMG_DIR'], scheduler_settings=str(settings),
+        imgsz=448, conf=.01, iou=.45, device='0', predict_mode='per-image', job_batch_size=2,
+        combine_execution='pbs-deferred')
+    request = helper.build_submission_plan(args)
+    for batch in request['batches']:
+        records = {Path(item['path']).stem: {'task': 'segment', 'orig_shape': {'height': 6, 'width': 8},
+            'predictions': []} for item in request['images'][batch['start']:batch['end']]}
+        helper.atomic(Path(request['output']) / batch['node'] / 'predictions.json', {'count': len(records), 'predictions': records})
+    job = helper.new_attempt(request, 'combine', 1)
+    job.update(job_id='42.server', status='accepted', released=True)
+    helper.atomic(Path(args.control) / 'request.json', request)
+    helper.atomic(Path(args.control) / 'state.json', {'jobs': {'combine': [job]}})
+    setup = tmp_path / 'environment.sh'
+    if not broken_setup:
+        setup.write_text('export SCRATCH=' + str(tmp_path / 'wrong-scratch') + '\n')
+    mamba = tmp_path / 'micromamba'
+    mamba.write_text('#!/bin/bash\nset -eu\n[[ "$1 $2 $3" == "run -n test-environment" ]]\nshift 3\nexec "$@"\n')
+    mamba.chmod(0o755)
+    env = {**pipeline_env, 'MAMBA_EXE': str(mamba), 'SITE_PREDICT_CONTROL': args.control,
+        'SITE_PREDICT_PYTHON': sys.executable, 'SITE_PREDICT_ENVIRONMENT': 'test-environment',
+        'SITE_PREDICT_ENV_SETUP': str(setup), 'SITE_PIPELINE_JOB_LOGGING': str(logging),
+        'SITE_PREDICT_OUTPUT_DIR': request['output'], 'SITE_PREDICT_NODE': 'combine',
+        'SITE_PREDICT_ATTEMPT': '1', 'SITE_PREDICT_TOKEN': job['token'], 'SITE_PREDICT_REQUEST': request['hash'],
+        'PBS_JOBID': job['job_id'], 'EXPECTED_BATCHES': str(len(request['batches'])), 'EXPECTED_COUNT': '5',
+        'PYTHONDONTWRITEBYTECODE': '1'}
+    command = ['bash', str(REPO_ROOT / 'jobs/infer/hpc/combine_yolo_site_predict_json_batches.pbs')]
+    result = subprocess.run(command, cwd=REPO_ROOT, env=env, capture_output=True, text=True)
+    logs = Path(args.control) / 'logs/executions/combine'
+    exit_log = next(logs.glob('*.exit'))
+    assert int(exit_log.read_text()) == result.returncode
+    assert 'host=' in next(logs.glob('*.out')).read_text()
+    if broken_setup:
+        assert result.returncode != 0
+        assert 'Environment setup is unreadable' in next(logs.glob('*.err')).read_text()
+        assert not (Path(request['output']) / 'predictions.json').exists()
+        return
+    assert result.returncode == 0, result.stderr
+    output = Path(request['output']) / 'predictions.json'
+    receipt_path = Path(args.control) / 'receipts' / (job['token'] + '.json')
+    receipt = helper.read(receipt_path)
+    assert receipt['exit_status'] == 0 and receipt['state'] == 'finished'
+    assert receipt['validation'] == {'count': 5, 'sha256': helper.file_hash(output)}
+    assert len(helper.read(output)['predictions']) == 5
+    assert not (tmp_path / 'wrong-scratch').exists()
+    repeated = subprocess.run(command, cwd=REPO_ROOT, env=env, capture_output=True, text=True)
+    assert repeated.returncode != 0
+    assert helper.read(receipt_path) == receipt
+    assert len(list(logs.glob('*.exit'))) == 2

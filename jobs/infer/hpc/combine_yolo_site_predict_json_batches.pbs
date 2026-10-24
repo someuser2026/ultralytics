@@ -4,11 +4,20 @@
 #PBS -l walltime=01:00:00
 #PBS -m ae
 
-# Submitted with depend=afterok:<batch job IDs> by the site prediction submitter.
+# Deferred managed runs are submitted only after batch completion is verified.
 set -euo pipefail
 
+if [[ -n "${SITE_PREDICT_CONTROL:-}" && -n "${SITE_PIPELINE_JOB_LOGGING:-}" ]]; then
+    export SITE_PIPELINE_EXECUTION_LOGS="${SITE_PREDICT_CONTROL}/logs/executions/${SITE_PREDICT_NODE:?}"
+    source "${SITE_PIPELINE_JOB_LOGGING}"
+fi
+
 if [[ -n "${SITE_PREDICT_CONTROL:-}" && -n "${SITE_PREDICT_ENV_SETUP:-}" ]]; then
-    source "${SITE_PREDICT_ENV_SETUP}"
+    if [[ -n "${SITE_PIPELINE_JOB_LOGGING:-}" ]]; then
+        site_pipeline_source "${SITE_PREDICT_ENV_SETUP}"
+    else
+        source "${SITE_PREDICT_ENV_SETUP}"
+    fi
 fi
 
 cd "${PBS_O_WORKDIR:-$(pwd)}"
@@ -23,9 +32,13 @@ export MAMBA_EXE="${MAMBA_EXE:-/srv/scratch/z5428587/mamba/bin/micromamba}"
 export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-/srv/scratch/z5428587/mamba}"
 
 echo "Combining ${EXPECTED_BATCHES} batches for ${SITE_NAME}; job ${PBS_JOBID:-local}"
-combine_args=(jobs/infer/combine_yolo_site_predict_json_batches.py
-    --ckpt "${CHECKPOINT}" --site-name "${SITE_NAME}" --img-dir "${IMG_DIR}"
-    --expected-batches "${EXPECTED_BATCHES}" --expected-count "${EXPECTED_COUNT}")
+combine_args=(jobs/infer/combine_yolo_site_predict_json_batches.py)
+if [[ -n "${SITE_PREDICT_CONTROL:-}" && -n "${SITE_PREDICT_OUTPUT_DIR:-}" ]]; then
+    combine_args+=(--output-dir "${SITE_PREDICT_OUTPUT_DIR}")
+else
+    combine_args+=(--ckpt "${CHECKPOINT}" --site-name "${SITE_NAME}" --img-dir "${IMG_DIR}")
+fi
+combine_args+=(--expected-batches "${EXPECTED_BATCHES}" --expected-count "${EXPECTED_COUNT}")
 if [[ -n "${SITE_PREDICT_CONTROL:-}" ]]; then
     "${MAMBA_EXE}" run -n "${SITE_PREDICT_ENVIRONMENT:-ultralytics_contrib}" "${SITE_PREDICT_PYTHON:?}" \
         jobs/infer/site_predict_job_control.py run-worker \
