@@ -119,6 +119,24 @@ def validate_combine_resources(resource):
         raise ValueError('Combination resource select/ncpus/mem mismatch')
 
 
+def capabilities():
+    return {'prepared_site_validation': [1], 'job_name_styles': ['stage-site-v1']}
+
+
+def validate_prepared_settings(settings, execution):
+    marker = settings.get('prepared_site_validation')
+    style = settings.get('job_name_style')
+    if style is not None and style not in capabilities()['job_name_styles']:
+        raise ValueError('Unsupported job naming style')
+    if marker is None:
+        return
+    if (not isinstance(marker, dict) or type(marker.get('version')) is not int or marker['version'] != 1
+            or execution != 'pbs-deferred' or style != 'stage-site-v1'
+            or any(not isinstance(marker.get(k), str) or not Path(marker[k]).is_absolute() for k in ('run', 'repo'))
+            or not re.fullmatch(r'[0-9a-f]{64}', str(marker.get('package_fingerprint', '')))):
+        raise ValueError('Unsupported or invalid prepared worker settings')
+
+
 def build_submission_plan(args):
     control, checkpoint = Path(args.control).resolve(), Path(args.ckpt).resolve()
     scratch = Path(os.environ['SCRATCH']).resolve()
@@ -152,6 +170,9 @@ def build_submission_plan(args):
                'batches': [{'node': f'batch_{i // args.job_batch_size + 1}', 'start': i,
                             'end': min(i + args.job_batch_size, len(images)), 'index': i // args.job_batch_size + 1}
                            for i in range(0, len(images), args.job_batch_size)]}
+    validate_prepared_settings(request['settings'], execution)
+    if request['settings'].get('job_name_style') and len(request['site']) > 200:
+        raise ValueError('Site name exceeds 200 characters')
     filter_path = request['settings'].get('segmentation_filter_path')
     if filter_path:
         filter_path = str(Path(filter_path).resolve())
@@ -171,7 +192,13 @@ def build_submission_plan(args):
 
 def new_attempt(request, node, number):
     token = digest([request['hash'], node, number])[:24]
-    return {'node': node, 'attempt': number, 'token': token, 'job_name': 'sp' + token[:12],
+    name = 'sp' + token[:12]
+    if request['settings'].get('job_name_style') == 'stage-site-v1':
+        label = 'combine' if node == 'combine' else 'pred' + format(int(node.split('_')[1]), '04d')
+        name = label + '_' + request['site'] + '_' + token[:8]
+        if len(name) > 230:
+            raise ValueError('PBS job name exceeds 230 characters')
+    return {'node': node, 'attempt': number, 'token': token, 'job_name': name,
             'job_id': None, 'status': 'pending', 'owner': request['owner']}
 
 
@@ -417,6 +444,7 @@ def submit_or_resume(args):
 
 def observe_attempt(request, job, jobs):
     history = jobs.get(job['job_id'])
+    job['scheduler_status'] = (history or {}).get('job_state')
     if request.get('max_attempts') == 1 and history:
         if matching(request, job, jobs) != [job['job_id']]:
             raise ValueError('Prediction PBS ownership mismatch')
@@ -459,7 +487,10 @@ def submit_combine(control):
         if not ready:
             return state
         for batch in request['batches']:
-            validate_batch_output(request, batch['node'])
+            if request['settings'].get('prepared_site_validation'):
+                validate_success_receipt(request, state['jobs'][batch['node']][-1])
+            else:
+                validate_batch_output(request, batch['node'])
         submit_job(request, state, combine)
         return state
 
@@ -606,6 +637,43 @@ def _validate_prediction_output(request, path, expected):
     return {'count': len(records), 'sha256': file_hash(path)}
 
 
+def validate_success_receipt(request, job):
+    receipt = read(Path(request['control']) / 'receipts' / (job['token'] + '.json'))
+    validation = receipt.get('validation') or {}
+    batch = next((b for b in request['batches'] if b['node'] == job['node']), None)
+    count = batch['end'] - batch['start'] if batch else len(request['images'])
+    if (not job.get('job_id') or job.get('execution_failure')
+            or (job.get('terminal') or {}).get('exit_status', 0) != 0
+            or any(receipt.get(k) != v for k, v in identity(request, job).items())
+            or receipt.get('state') != 'finished' or receipt.get('exit_status') != 0
+            or type(validation.get('count')) is not int or validation['count'] != count
+            or not re.fullmatch(r'[0-9a-f]{64}', str(validation.get('sha256', '')))):
+        raise ValueError('Prediction lacks owned successful receipt: ' + job['node'])
+    return validation
+
+
+def run_prepared_validation(request):
+    settings = request['settings']
+    validate_prepared_settings(settings, request.get('combine_execution'))
+    marker = settings['prepared_site_validation']
+    env = os.environ.copy()
+    env['SCRATCH'] = request['scratch']
+    result = subprocess.run([settings.get('python', sys.executable), '-B', '-m',
+        'Code.time_series_analysis.scripts.analysis.prepared_site_pipeline',
+        '_validate-predictions', marker['run']], cwd=marker['repo'], env=env,
+        text=True, capture_output=True, check=True)
+    summary = json.loads(result.stdout)
+    outer = read(Path(marker['run']) / 'request.json')
+    if (summary.get('schema_version') != 'prepared-prediction-validation-v1'
+            or summary.get('request_hash') != outer.get('request_hash')
+            or type(summary.get('tiles')) is not int or summary['tiles'] != len(request['images'])
+            or type(summary.get('detections')) is not int or summary['detections'] < 0
+            or any(not re.fullmatch(r'[0-9a-f]{64}', str(summary.get(k, '')))
+                   for k in ('sha256', 'tile_inventory_sha256', 'image_inventory_sha256'))):
+        raise ValueError('Invalid prepared worker validation summary')
+    return {'count': summary['tiles'], 'sha256': summary['sha256'], 'prepared': summary}
+
+
 def run_with_receipt(control, node, attempt, command):
     request, state = load_request(control), read(Path(control) / 'state.json')
     job = state['jobs'][node][attempt - 1]
@@ -626,7 +694,11 @@ def run_with_receipt(control, node, attempt, command):
             verify_images(request, request['images'][batch['start']:batch['end']])
         elif request.get('combine_execution') == 'pbs-deferred':
             for batch in request['batches']:
-                validate_batch_output(request, batch['node'])
+                actual = validate_batch_output(request, batch['node'])
+                if request['settings'].get('prepared_site_validation'):
+                    expected = validate_success_receipt(request, state['jobs'][batch['node']][-1])
+                    if any(actual[k] != expected[k] for k in ('count', 'sha256')):
+                        raise ValueError('Batch output changed after successful receipt: ' + batch['node'])
         # Activation hooks / PBS startup may replace SCRATCH after submission.
         # The frozen request owns both input and output paths for every worker,
         # including the combiner. Restore it at the child-process boundary.
@@ -640,7 +712,10 @@ def run_with_receipt(control, node, attempt, command):
         code = subprocess.run(command, cwd=ROOT, env=worker_env).returncode
         if code == 0 and (node != 'combine' or request.get('combine_execution') == 'pbs-deferred'):
             code = 1
-            validation = validate_combined_output(request) if node == 'combine' else validate_batch_output(request, node)
+            if node == 'combine' and request['settings'].get('prepared_site_validation'):
+                validation = run_prepared_validation(request)
+            else:
+                validation = validate_combined_output(request) if node == 'combine' else validate_batch_output(request, node)
             code = 0
         return code
     except BaseException as exc:
@@ -674,6 +749,7 @@ def reconcile_submission(control, node, job_id=None, confirmed_not_submitted=Fal
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest='command', required=True)
+    subs.add_parser('capabilities')
     submit = subs.add_parser('submit')
     submit.add_argument('--control', required=True)
     for name in ('ckpt', 'site-name', 'img-dir', 'scheduler-settings'):
@@ -697,7 +773,9 @@ def main(argv=None):
             choices.add_argument('--confirmed-not-submitted', action='store_true')
             p.add_argument('--reason')
     args = parser.parse_args(argv)
-    if args.command == 'submit':
+    if args.command == 'capabilities':
+        result = capabilities()
+    elif args.command == 'submit':
         result = submit_or_resume(args)
     elif args.command == 'status':
         result = status(args.control)
