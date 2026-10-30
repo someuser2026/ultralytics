@@ -21,6 +21,7 @@ import re
 import subprocess
 import struct
 import sys
+import time
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -120,7 +121,7 @@ def validate_combine_resources(resource):
 
 
 def capabilities():
-    return {'prepared_site_validation': [1], 'job_name_styles': ['stage-site-v1']}
+    return {'prepared_site_validation': [1], 'job_name_styles': ['stage-site-v1'], 'scheduler_query_errors': [1]}
 
 
 def validate_prepared_settings(settings, execution):
@@ -206,8 +207,21 @@ def run_pbs(request, command):
     return subprocess.run(command, cwd=ROOT, text=True, capture_output=True, timeout=60)
 
 
+class SchedulerQueryTimeout(RuntimeError):
+    def __init__(self, command, timeout, started_at):
+        self.payload = {'schema_version': 'scheduler-query-error-v1',
+                        'code': 'scheduler_query_timeout', 'command': command,
+                        'timeout_seconds': timeout, 'started_at': started_at}
+        super().__init__('Scheduler query timed out')
+
+
 def query(request):
-    result = run_pbs(request, [request['settings'].get('qstat', 'qstat'), '-xf', '-F', 'json'])
+    command = [request['settings'].get('qstat', 'qstat'), '-xf', '-F', 'json']
+    started = time.time()
+    try:
+        result = run_pbs(request, command)
+    except subprocess.TimeoutExpired as exc:
+        raise SchedulerQueryTimeout(command, exc.timeout, started) from exc
     if result.returncode:
         raise RuntimeError('PBS query failed: ' + result.stderr)
     payload = json.loads(result.stdout)
@@ -378,10 +392,7 @@ def submit_job(request, state, job):
         job.update(job_id=identifier, status='accepted')
         persist()
     if job['job_id'].isdigit():
-        matches = matching(request, job, query(request))
-        if len(matches) != 1 or matches[0].split('.')[0] != job['job_id']:
-            raise RuntimeError('Cannot canonicalize PBS job ID')
-        job['job_id'] = matches[0]
+        canonicalize_job_id(request, job, query(request))
         persist()
     if job.get('released'):
         return
@@ -442,7 +453,18 @@ def submit_or_resume(args):
     return {'control': str(control), 'batches': len(request['batches'])}
 
 
+def canonicalize_job_id(request, job, jobs):
+    if job.get('job_id') and job['job_id'].isdigit():
+        matches = matching(request, job, jobs)
+        if len(matches) != 1 or matches[0].split('.')[0] != job['job_id']:
+            raise RuntimeError('Cannot canonicalize PBS job ID')
+        job['job_id'] = matches[0]
+
+
 def observe_attempt(request, job, jobs):
+    # A query timeout can leave an acknowledged numeric ID awaiting its suffix.
+    # Use the same ownership checks as submission before observing that job.
+    canonicalize_job_id(request, job, jobs)
     history = jobs.get(job['job_id'])
     job['scheduler_status'] = (history or {}).get('job_state')
     if request.get('max_attempts') == 1 and history:
@@ -798,9 +820,16 @@ def main(argv=None):
     return 0
 
 
-if __name__ == '__main__':
+def cli(argv=None):
     try:
-        raise SystemExit(main())
+        return main(argv)
+    except SchedulerQueryTimeout as exc:
+        print(json.dumps(exc.payload, sort_keys=True), file=sys.stderr)
+        return 75
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         print('Error: ' + str(exc), file=sys.stderr)
-        raise SystemExit(1)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(cli())
