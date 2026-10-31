@@ -471,7 +471,20 @@ def main(argv: list[str] | None = None) -> Path:
     if not image_dir.is_dir():
         raise FileNotFoundError(f"Image directory not found: {image_dir}")
 
-    images = list_input_images(image_dir)
+    images = None
+    control = os.environ.get('SITE_PREDICT_CONTROL')
+    if control:
+        from site_predict_job_control import load_request
+        from prepared_prediction_contract import is_v2
+        request = load_request(control)
+        if is_v2(request):
+            if (request['image_root'] != str(image_dir) or request['site'] != args.site_name
+                    or request['checkpoint'] != str(ckpt)
+                    or os.environ.get('SITE_PREDICT_REQUEST') != request['hash']):
+                raise ValueError('Managed inference input identity differs')
+            images = [Path(record['path']) for record in request['images']]
+    if images is None:
+        images = list_input_images(image_dir)
     if not images:
         raise RuntimeError(f"No PNG images found in {image_dir}")
 

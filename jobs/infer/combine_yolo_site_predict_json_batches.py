@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import sys
 import importlib.util
 import json
 import os
 import tempfile
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import prepared_prediction_contract as prepared
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -25,6 +30,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-batches", type=int, help="Require exactly batch_1 through batch_N")
     parser.add_argument("--expected-count", type=int, help="Require one prediction record per submitted image")
     parser.add_argument("--dry-run", action="store_true", help="Validate and report without writing")
+    parser.add_argument("--validated-batch-manifest", type=Path, default=os.environ.get("SITE_PREDICT_COMBINE_INPUTS"))
     args = parser.parse_args(argv)
     if args.expected_batches is not None and args.expected_batches < 1:
         parser.error("--expected-batches must be >= 1")
@@ -69,9 +75,15 @@ def list_batch_prediction_jsons(output_dir: Path) -> list[tuple[int, Path]]:
     return sorted(batch_files, key=lambda item: item[0])
 
 
-def load_predictions(path: Path) -> dict[str, Any]:
+def load_predictions(path: Path, expected=None, policy=None) -> dict[str, Any]:
     """Load one batch predictions.json payload."""
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    data = path.read_bytes()
+    if expected is not None and hashlib.sha256(data).hexdigest() != expected['sha256']:
+        raise ValueError('Batch output changed after successful receipt: ' + str(path))
+    payload = prepared.unique_payload(data)
+    if expected is not None:
+        if prepared.validate_records(payload, expected['images'], policy) != expected['count']:
+            raise ValueError('Batch result count differs from receipt')
     if not isinstance(payload, dict):
         raise ValueError(f"Expected a JSON object in {path}, found {type(payload).__name__}")
     predictions = payload.get("predictions")
@@ -95,13 +107,27 @@ def load_predictions(path: Path) -> dict[str, Any]:
 
 
 def combine_predictions(
-    output_dir: Path, *, expected_batches: int | None = None, expected_count: int | None = None, dry_run: bool = False
+    output_dir: Path, *, expected_batches: int | None = None, expected_count: int | None = None, dry_run: bool = False, validated_batch_manifest=None
 ) -> Path:
     """Merge all batch predictions.json files into the parent output directory."""
     if not output_dir.is_dir():
         raise FileNotFoundError(f"Output directory not found: {output_dir}")
 
+    evidence, policy = None, None
+    if validated_batch_manifest is not None:
+        evidence, request = prepared.load_batch_manifest(validated_batch_manifest, output_dir)
+        from segmentation_filter_bridge import load_segmentation_filter
+        policy = load_segmentation_filter(request['segmentation_filter_path']) if request.get('segmentation_filter_path') else None
     batch_files = list_batch_prediction_jsons(output_dir)
+    if evidence is not None:
+        expected_files = [(b['index'], output_dir / b['node'] / 'predictions.json') for b in evidence['batches']]
+        if batch_files != expected_files:
+            raise ValueError('Batch-result file membership differs from frozen assignments')
+        for _, path in expected_files:
+            if path.is_symlink() or path.resolve() != path.absolute():
+                raise ValueError('Redirected batch result')
+        batch_files = expected_files
+        expected_count = len(request['images'])
     if not batch_files:
         raise FileNotFoundError(f"No batch predictions.json files found under {output_dir}")
     if expected_batches is not None:
@@ -113,7 +139,8 @@ def combine_predictions(
 
     merged_predictions: dict[str, Any] = {}
     for batch_index, predictions_json in batch_files:
-        predictions = load_predictions(predictions_json)
+        expected = next((b for b in evidence['batches'] if b['index'] == batch_index), None) if evidence else None
+        predictions = load_predictions(predictions_json, expected, policy)
         duplicate_keys = set(merged_predictions).intersection(predictions)
         if duplicate_keys:
             preview = ", ".join(sorted(duplicate_keys)[:5])
@@ -123,6 +150,8 @@ def combine_predictions(
     if expected_count is not None and len(merged_predictions) != expected_count:
         raise ValueError(f"Expected {expected_count} prediction records, found {len(merged_predictions)}")
     merged_payload = {"count": len(merged_predictions), "predictions": merged_predictions}
+    if evidence is not None:
+        prepared.validate_records(merged_payload, request['images'], policy)
     output_path = output_dir / "predictions.json"
     print(f"{output_dir}: {len(batch_files)} batches, {len(merged_predictions)} records -> {output_path}")
     if dry_run:
@@ -170,7 +199,8 @@ def main(argv: list[str] | None = None) -> Path:
                 raise ValueError(f"Site and run must be directory names, got {name!r}")
         output_dir = root.expanduser() / args.site_name / "predictions" / args.task / args.run
     merged_path = combine_predictions(
-        output_dir, expected_batches=args.expected_batches, expected_count=args.expected_count, dry_run=args.dry_run
+        output_dir, expected_batches=args.expected_batches, expected_count=args.expected_count, dry_run=args.dry_run,
+        validated_batch_manifest=args.validated_batch_manifest
     )
     print(f"{'Validated' if args.dry_run else 'Merged'} predictions json: {merged_path}")
     return merged_path

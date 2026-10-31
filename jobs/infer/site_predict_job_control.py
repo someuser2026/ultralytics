@@ -26,6 +26,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from segmentation_filter_bridge import load_segmentation_filter
+import prepared_prediction_contract as prepared
 
 SCHEMA = 'site-predict-control-v1'
 ROOT = Path(__file__).resolve().parents[2]
@@ -95,6 +96,8 @@ def verify_sources(request):
 
 
 def verify_images(request, images=None):
+    if prepared.is_v2(request) and not request['settings']['prepared_site_validation']['verify_tile_contents']:
+        return
     current = sorted(str(p) for p in Path(request['image_root']).iterdir() if p.is_file() and p.suffix.lower() == '.png')
     if current != [r['path'] for r in request['images']]:
         raise ValueError('Prediction tile membership changed')
@@ -121,7 +124,7 @@ def validate_combine_resources(resource):
 
 
 def capabilities():
-    return {'prepared_site_validation': [1], 'job_name_styles': ['stage-site-v1'], 'scheduler_query_errors': [1]}
+    return {'prepared_site_validation': [1, 2], 'job_name_styles': ['stage-site-v1'], 'scheduler_query_errors': [1]}
 
 
 def validate_prepared_settings(settings, execution):
@@ -131,11 +134,16 @@ def validate_prepared_settings(settings, execution):
         raise ValueError('Unsupported job naming style')
     if marker is None:
         return
-    if (not isinstance(marker, dict) or type(marker.get('version')) is not int or marker['version'] != 1
+    if (not isinstance(marker, dict) or type(marker.get('version')) is not int or marker['version'] not in (1, 2)
             or execution != 'pbs-deferred' or style != 'stage-site-v1'
             or any(not isinstance(marker.get(k), str) or not Path(marker[k]).is_absolute() for k in ('run', 'repo'))
             or not re.fullmatch(r'[0-9a-f]{64}', str(marker.get('package_fingerprint', '')))):
         raise ValueError('Unsupported or invalid prepared worker settings')
+    if marker['version'] == 2:
+        if (type(marker.get('verify_tile_contents')) is not bool or not Path(marker.get('inventory', '')).is_absolute()
+                or Path(marker['inventory']) != Path(marker['run']) / 'tile-inventory.json'
+                or not re.fullmatch('[0-9a-f]{64}', str(marker.get('inventory_sha256', '')))):
+            raise ValueError('Invalid prepared v2 inventory/policy')
 
 
 def build_submission_plan(args):
@@ -149,14 +157,19 @@ def build_submission_plan(args):
     if img_dir.is_absolute() or '..' in img_dir.parts or not img_dir.parts:
         raise ValueError('img-dir must be relative under PSScene')
     image_root = scratch / 'data_processed' / args.site_name / 'PSScene' / img_dir
-    images = [{'path': str(p), 'sha256': file_hash(p)} for p in sorted(image_root.iterdir())
-              if p.is_file() and p.suffix.lower() == '.png']
+    settings = read(args.scheduler_settings)
+    execution = getattr(args, 'combine_execution', 'pbs')
+    validate_prepared_settings(settings, execution)
+    images = (prepared.image_records(settings['prepared_site_validation'], image_root)
+              if prepared.is_v2({'settings': settings}) else
+              [{'path': str(p), 'sha256': file_hash(p)} for p in sorted(image_root.iterdir())
+               if p.is_file() and p.suffix.lower() == '.png'])
     if not images or args.job_batch_size < 1:
         raise ValueError('Nonempty images and positive job batch size required')
     output = scratch / 'data_processed' / args.site_name / 'predictions/segment' / (
         checkpoint.parent.parent.name + '__' + '__'.join(img_dir.parts))
     scripts = ROOT / 'jobs/infer'
-    source_names = ['site_predict_job_control.py', 'yolo_site_predict_json.py', 'segmentation_filter_bridge.py', 'combine_yolo_site_predict_json_batches.py',
+    source_names = ['prepared_prediction_contract.py', 'site_predict_job_control.py', 'yolo_site_predict_json.py', 'segmentation_filter_bridge.py', 'combine_yolo_site_predict_json_batches.py',
                     'hpc/submit_yolo_site_predict_json.sh', 'hpc/yolo_site_predict_json.pbs', 'hpc/combine_yolo_site_predict_json_batches.pbs']
     execution = getattr(args, 'combine_execution', 'pbs')
     login_combine = execution == 'login'
@@ -166,7 +179,7 @@ def build_submission_plan(args):
                'checkpoint_sha256': file_hash(checkpoint), 'scratch': str(scratch), 'site': args.site_name,
                'img_dir': str(img_dir), 'image_root': str(image_root), 'images': images, 'output': str(output),
                'options': {k: getattr(args, k) for k in ('imgsz', 'conf', 'iou', 'device', 'predict_mode', 'job_batch_size')},
-               'settings': read(args.scheduler_settings), 'owner': getpass.getuser(),
+               'settings': settings, 'owner': getpass.getuser(),
                'sources': {str(scripts / name): file_hash(scripts / name) for name in source_names},
                'batches': [{'node': f'batch_{i // args.job_batch_size + 1}', 'start': i,
                             'end': min(i + args.job_batch_size, len(images)), 'index': i // args.job_batch_size + 1}
@@ -609,6 +622,10 @@ def validate_combined_output(request):
 def _validate_prediction_output(request, path, expected):
     policy = load_segmentation_filter(request['segmentation_filter_path']) if request.get('segmentation_filter_path') else None
     verify_images(request, expected)
+    if prepared.is_v2(request):
+        data = Path(path).read_bytes()
+        count = prepared.validate_records(prepared.unique_payload(data), expected, policy)
+        return {'count': count, 'sha256': hashlib.sha256(data).hexdigest()}
     payload = unique_json(path)
     records = payload.get('predictions') if isinstance(payload, dict) else None
     if not isinstance(records, dict):
@@ -686,13 +703,20 @@ def run_prepared_validation(request):
         text=True, capture_output=True, check=True)
     summary = json.loads(result.stdout)
     outer = read(Path(marker['run']) / 'request.json')
-    if (summary.get('schema_version') != 'prepared-prediction-validation-v1'
+    if (summary.get('schema_version') != ('prepared-prediction-validation-v2' if prepared.is_v2(request) else 'prepared-prediction-validation-v1')
             or summary.get('request_hash') != outer.get('request_hash')
             or type(summary.get('tiles')) is not int or summary['tiles'] != len(request['images'])
             or type(summary.get('detections')) is not int or summary['detections'] < 0
             or any(not re.fullmatch(r'[0-9a-f]{64}', str(summary.get(k, '')))
                    for k in ('sha256', 'tile_inventory_sha256', 'image_inventory_sha256'))):
         raise ValueError('Invalid prepared worker validation summary')
+    if prepared.is_v2(request):
+        inventory = prepared.load_inventory(marker)
+        if (summary.get('inventory_file_sha256') != marker['inventory_sha256']
+                or summary.get('verify_tile_contents') is not marker['verify_tile_contents']
+                or summary['tile_inventory_sha256'] != inventory['sha256']
+                or summary['image_inventory_sha256'] != inventory['image_inventory_sha256']):
+            raise ValueError('Outer validation inventory/policy mismatch')
     return {'count': summary['tiles'], 'sha256': summary['sha256'], 'prepared': summary}
 
 
@@ -709,29 +733,49 @@ def run_with_receipt(control, node, attempt, command):
     record = {**identity(request, job), 'state': 'started', 'started_at': now()}
     atomic(path, record)
     code, validation, error = 1, None, None
+    metrics = {'phases': {}}
+    started, started_cpu = time.monotonic(), time.process_time()
     try:
         verify_sources(request)
+        metrics['phases']['source_validation'] = {'elapsed_seconds': time.monotonic() - started,
+                                                  'cpu_seconds': time.process_time() - started_cpu}
+        inputs_started, inputs_cpu = time.monotonic(), time.process_time()
         if node != 'combine':
             batch = next(b for b in request['batches'] if b['node'] == node)
             verify_images(request, request['images'][batch['start']:batch['end']])
-        elif request.get('combine_execution') == 'pbs-deferred':
+        elif request.get('combine_execution') == 'pbs-deferred' and not prepared.is_v2(request):
             for batch in request['batches']:
                 actual = validate_batch_output(request, batch['node'])
                 if request['settings'].get('prepared_site_validation'):
                     expected = validate_success_receipt(request, state['jobs'][batch['node']][-1])
                     if any(actual[k] != expected[k] for k in ('count', 'sha256')):
                         raise ValueError('Batch output changed after successful receipt: ' + batch['node'])
+        metrics['phases']['input_evidence'] = {'elapsed_seconds': time.monotonic() - inputs_started,
+                                               'cpu_seconds': time.process_time() - inputs_cpu}
         # Activation hooks / PBS startup may replace SCRATCH after submission.
         # The frozen request owns both input and output paths for every worker,
         # including the combiner. Restore it at the child-process boundary.
         worker_env = os.environ.copy()
         worker_env['SCRATCH'] = request['scratch']
+        worker_env.pop('SITE_PREDICT_COMBINE_INPUTS', None)
+        if prepared.is_v2(request):
+            worker_env['SITE_PREDICT_CONTROL'] = request['control']
+            if node == 'combine':
+                manifest = prepared.build_batch_manifest(request, state, validate_success_receipt)
+                manifest_path = Path(control) / 'combine-inputs.json'
+                atomic(manifest_path, manifest)
+                worker_env['SITE_PREDICT_COMBINE_INPUTS'] = str(manifest_path)
         worker_env.pop('SITE_PREDICT_SEGMENT_FILTER', None)
         if request.get('segmentation_filter_path'):
             worker_env['SITE_PREDICT_SEGMENT_FILTER'] = request['segmentation_filter_path']
         print(f"Prediction {node}: SCRATCH={request['scratch']} "
               f"(inherited {os.environ.get('SCRATCH', '<unset>')})", flush=True)
+        child_started, child_cpu = time.monotonic(), os.times()
         code = subprocess.run(command, cwd=ROOT, env=worker_env).returncode
+        child_finished = os.times()
+        metrics['phases']['computation'] = {'elapsed_seconds': time.monotonic() - child_started,
+            'cpu_seconds': child_finished.children_user + child_finished.children_system - child_cpu.children_user - child_cpu.children_system}
+        validation_started, validation_cpu = time.monotonic(), time.process_time()
         if code == 0 and (node != 'combine' or request.get('combine_execution') == 'pbs-deferred'):
             code = 1
             if node == 'combine' and request['settings'].get('prepared_site_validation'):
@@ -739,6 +783,11 @@ def run_with_receipt(control, node, attempt, command):
             else:
                 validation = validate_combined_output(request) if node == 'combine' else validate_batch_output(request, node)
             code = 0
+            metrics['phases']['output_validation'] = {'elapsed_seconds': time.monotonic() - validation_started,
+                                                      'cpu_seconds': time.process_time() - validation_cpu}
+            if prepared.is_v2(request) and not request['settings']['prepared_site_validation']['verify_tile_contents']:
+                metrics['logical_io'] = {'tile_content_reads': 0, 'tile_hashes': 0, 'tile_decodes': 0,
+                    'prediction_json_reads': len(request['batches']) + 1 if node == 'combine' else 1}
         return code
     except BaseException as exc:
         code, error = 1, str(exc)
@@ -747,7 +796,7 @@ def run_with_receipt(control, node, attempt, command):
         raise
     finally:
         atomic(path, {**record, 'state': 'finished', 'exit_status': code,
-                      'finished_at': now(), 'validation': validation, 'error': error})
+                      'finished_at': now(), 'validation': validation, 'error': error, 'metrics': metrics})
 
 
 def reconcile_submission(control, node, job_id=None, confirmed_not_submitted=False, reason=None):
