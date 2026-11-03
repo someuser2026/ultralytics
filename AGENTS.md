@@ -4,36 +4,30 @@ Custom `ultralytics` fork for rip current detection on satellite imagery. Primar
 
 ## Route Before Reading
 
-1. Identify the requested task, model family, and any named file or error. Choose the narrowest relevant route below before reading implementation files.
-2. Along that route, read applicable `AGENTS.md` guidance and existing `CONTEXT.md` files from parent to child, including intermediate folders even when starting from a named file. Read `CONTEXT.md` explicitly; do not assume it was automatically loaded.
-3. Parent contexts route to children; child contexts supply local entry points, behavior, configs, tests, and data/output locations. Read only the selected branch, not sibling contexts or every file in a folder. Reuse context already read unless it changes.
-4. If a selected folder lacks `CONTEXT.md`, report the missing path. Use the nearest parent guidance and a scoped filename/symbol search to proceed; do not create context files unless requested. Ask if the missing information leaves the task ambiguous.
-5. Start with `rg --files <selected-folder>` or `rg -n '<symbol>' <selected-folder>`, narrowed by filename/glob where possible. Read the matching sections and relevant nearby tests/configs. Avoid repository-wide content searches and recursive file dumps as a first step.
-6. Expand only when a relevant import, caller, config, test, or unsuccessful scoped search points elsewhere. Follow that dependency's context chain before reading its implementation. Stop expanding once the task and affected dependencies are understood.
+1. Choose the narrowest route for the requested task, model family, file, or error before reading implementation files.
+2. Read applicable `AGENTS.md` guidance and existing `CONTEXT.md` files along that route, parent to child, including intermediate folders. Read contexts explicitly; reuse unchanged guidance already read. Skip unrelated branches.
+3. Contexts mark routing/workflow boundaries, not every folder. Report a missing linked context; otherwise inherit the nearest parent without a missing-file warning. Do not create contexts unless requested. Ask if missing information leaves the task ambiguous.
+4. Use scoped `rg --files <folder>` or `rg -n '<symbol>' <folder>` searches, narrowed by filename/glob. Read matching sections and relevant nearby tests/configs, not entire folders. Avoid repository-wide content searches as a first step.
+5. Expand only when an import, caller, config, test, or unsuccessful scoped search points elsewhere; read that dependency's context chain first. Stop when the task and affected dependencies are understood.
+
+Context paths are relative to their folder; commands run from the repository root unless stated otherwise. Follow cross-folder links only when needed. Shared rules belong here, child routing in parent contexts, and local contracts in the owning context. Update affected routes when paths or responsibilities change; avoid copying parent guidance.
 
 ## Task Routing
 
 | Task / question | Start here |
 | --- | --- |
-| Model YAMLs, datasets, experiment settings, CLI defaults | `ultralytics/cfg/`: `models/` for architectures, `datasets/` for data, `experiments/` for experiments, `default.yaml` and `__init__.py` for defaults/CLI |
-| Family/task-specific training, validation, prediction | `ultralytics/models/`; YOLO OBB and segmentation use `yolo/obb/` and `yolo/segment/`. For another family, choose its own subfolder. |
-| Shared training loop, checkpoint/resume, prediction/validation lifecycle, export, result objects | `ultralytics/engine/` |
-| Model construction, YAML parsing, task dispatch | `ultralytics/nn/tasks.py`; follow the selected family adapter in `ultralytics/models/` as needed |
-| Backbones, necks, heads, attention, custom layers | `ultralytics/nn/modules/`; select by the model YAML or imported class |
-| Losses, assignment, metrics, box/mask geometry, NMS | `ultralytics/utils/`; trace the selected model's criterion first, since some families keep helpers in `ultralytics/models/` |
-| Dataset loading, labels, augmentation, preprocessing, batches | `ultralytics/data/`; dataset configuration lives in `ultralytics/cfg/datasets/` |
-| Logging, W&B, integration callbacks | `ultralytics/utils/callbacks/`; job-specific prediction logging is in `jobs/infer/` |
-| HPC training submission, PBS resources, batch/resume scripts | `jobs/train/hpc/` |
-| Site inference, prediction JSONs, batch combination, inference PBS jobs | `jobs/infer/`; scheduler scripts in `jobs/infer/hpc/` |
-| Regression tests and test fixtures | `tests/`; choose the feature/family test, then its fixtures and `tests/configs/` as needed |
+| Model configuration, construction, training, validation, inference, data, losses | [ultralytics/CONTEXT.md](ultralytics/CONTEXT.md) |
+| HPC training submission, PBS resources, batch/resume scripts | [jobs/train/hpc/CONTEXT.md](jobs/train/hpc/CONTEXT.md) |
+| Site inference, prediction JSONs, batch combination, inference PBS jobs | [jobs/infer/CONTEXT.md](jobs/infer/CONTEXT.md) |
+| Regression tests, fixtures, targeted checks | [tests/CONTEXT.md](tests/CONTEXT.md) |
 | CUDA extension builds or extension import/runtime errors | `selective_scan/`, `dcnv4/`; first identify which extension the active module requires |
 | Installation, dependencies, containers, usage examples, documentation | `pyproject.toml`, `docker/`, `examples/`, or `docs/`, according to the request |
 
-`ultralytics/hub/`, `ultralytics/solutions/`, and `ultralytics/trackers/` are specialized areas; enter them only for those features or a traced dependency. Inspect `runs/`, `wandb/`, and `datasets/` only when the task needs particular outputs, logs, or data; keep them out of general source searches.
+Inspect `runs/`, `wandb/`, and `datasets/` only when the task needs particular outputs, logs, or data; keep them out of general source searches.
 
 ## Reference Sources
 
-`mmdetection/`, `LEGNet/`, `RHINO/`, `Mamba-YOLO/`, and `detectron2/` are reference-only checkouts for comparison or porting into `ultralytics/`. They are not the normal model construction, training, or testing path unless explicitly stated. Start with the active implementation even when a model shares a reference repository's name. Other upstream trees such as `HRVMamba/` and `Mask2Former/` should likewise only be explored for a relevant comparison, port, or traced dependency.
+`mmdetection/`, `LEGNet/`, `RHINO/`, `Mamba-YOLO/`, `detectron2/`, `HRVMamba/`, and `Mask2Former/` are reference checkouts. Consult them for a relevant comparison, port, or traced dependency. Start with the active implementation in `ultralytics/`, even when a model shares a reference repository's name.
 
 ## Environment and Checks
 
@@ -43,14 +37,7 @@ Use `ultralytics_contrib` unless told otherwise. Local interpreter: `/Users/mani
 conda activate ultralytics_contrib
 ```
 
-Run the checks relevant to the selected route; these are examples, not a mandatory full suite:
-
-```bash
-pytest tests/test_hpc_submission.py
-pytest tests/test_legnet.py
-pytest tests/test_rhino_variants.py
-pytest tests/test_rotated_fcos.py
-```
+Select relevant checks through [tests/CONTEXT.md](tests/CONTEXT.md); do not run the full suite by default.
 
 ## Smoke-Test Dataset Paths
 
@@ -70,9 +57,8 @@ Focus on data loading, loss logic, and architecture/module logic. Do not edit co
 
 ## Agent Rules
 
-- Only edit `ultralytics/` rahter than the reference repos.
+- Edit the active implementation and supporting project files, including `ultralytics/`, `jobs/`, `tests/`, and routing documentation. Do not edit the reference repositories unless explicitly requested.
 - Reuse existing components before adding new abstractions.
-- Check nearby tests/configs before making assumptions.
 - Be careful with absolute dataset paths, scratch paths, and HPC env variables.
 - In HPC submit scripts, keep `plots=False` to prevent large image uploads to `wandb` when `wandb=True`.
 - Ask before deleting non-temporary files.
