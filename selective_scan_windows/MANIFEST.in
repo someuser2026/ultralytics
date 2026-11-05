@@ -1,0 +1,5 @@
+include LICENSE THIRD_PARTY_NOTICES.md README.md pytest.ini
+recursive-include csrc *.h *.cuh *.cpp *.cu
+recursive-include tests *.py
+recursive-include tools *.py
+global-exclude __pycache__ *.pyc *.pyd

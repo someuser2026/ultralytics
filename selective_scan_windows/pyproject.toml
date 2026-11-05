@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=70", "wheel", "torch==2.8.0", "packaging", "ninja"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "selective-scan-windows"
+version = "0.1.0"
+description = "Self-contained native Windows CUDA selective-scan core for this Ultralytics fork"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "AGPL-3.0; bundled third-party notices apply"}
+dependencies = ["torch==2.8.0"]
+classifiers = ["Operating System :: Microsoft :: Windows", "Programming Language :: Python :: 3", "Programming Language :: C++"]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "numpy"]
+
+[project.scripts]
+selective-scan-windows-diagnostics = "selective_scan_windows.diagnostics:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["selective_scan_windows"]
+py-modules = ["selective_scan_cuda_core"]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]

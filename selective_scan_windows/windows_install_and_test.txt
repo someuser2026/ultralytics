@@ -1,0 +1,415 @@
+WINDOWS SELECTIVE-SCAN INSTALLATION AND TEST HANDOFF
+Prepared: 5 November 2026
+Package: selective-scan-windows 0.1.0
+
+PURPOSE
+Install the new independent Windows CUDA package, test it, and send the logs
+back. The original selective_scan and ultralytics source files are unchanged.
+Windows compilation and GPU tests have NOT yet been verified on this PC.
+
+READ THIS FIRST
+- Use "x64 Native Tools Command Prompt for VS 2022" throughout this guide.
+  These are Command Prompt commands, NOT commands to paste into PowerShell.
+  Commands beginning with "powershell -NoProfile" launch PowerShell themselves;
+  paste those commands into the same Command Prompt too.
+- Run one numbered section at a time. Paste each command on its own line.
+- Do not continue after an unexpected failure. Go to section 10 and send the
+  logs already produced. Failed builds are useful diagnostic results.
+- Keep the same Command Prompt open: its variables and compiler environment
+  are used by later sections. Logs are redirected to files, so some commands
+  show no progress on screen while they run. Wait until the prompt returns.
+- Do not run "pip install" from the original selective_scan directory.
+- Do not remove the original package from an existing environment. If that
+  package is installed, use a separate Windows environment instead.
+
+REQUIRED SOFTWARE
+The PC setup guide should already have installed:
+  * NVIDIA driver, with nvidia-smi working.
+  * micromamba, available on PATH.
+  * Visual Studio 2022 Build Tools, Desktop development with C++, a Windows
+    SDK, and MSVC v143 toolset v14.38 (compiler 19.38).
+  * CUDA Toolkit 12.6 Update 3, including nvcc.exe.
+  * A local copy of the custom ultralytics repository.
+
+If these are not installed, complete that setup first. Installer locations:
+  VS 2022 Build Tools: https://aka.ms/vs/17/release/vs_BuildTools.exe
+  CUDA 12.6 Update 3: https://developer.nvidia.com/cuda-12-6-3-download-archive
+  micromamba: https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html
+
+The Python environment and Python dependencies can be installed below.
+No WSL or Ubuntu is involved. R2/rclone credentials are not needed for testing.
+
+======================================================================
+1. PUT THE NEW CODE ON THE PC
+======================================================================
+
+The package and this guide are on the rip-detectionv2 branch of the custom
+ultralytics repository. In Command Prompt, update an existing Git checkout:
+
+cd /d "%USERPROFILE%\rip-work\repos\ultralytics"
+git status --short
+git fetch origin
+git switch rip-detectionv2
+git pull --ff-only origin rip-detectionv2
+
+If git status shows local edits, or a command reports a conflict/untracked
+file obstruction, stop and retain those files. Do not reset or delete them.
+If this PC has only a downloaded source ZIP rather than a Git checkout, use
+the transfer method below or obtain a fresh ZIP of the rip-detectionv2 branch.
+
+Alternative: transfer selective_scan_windows_transfer.zip with this text file.
+The ZIP contains only the new selective_scan_windows folder and its sources;
+it does not contain the full custom Ultralytics repository or model weights.
+
+In File Explorer:
+  1. Right-click the ZIP -> Extract All.
+  2. Copy the extracted selective_scan_windows folder into the EXISTING custom
+     ultralytics repository folder. If this new folder already exists from an
+     earlier attempt, keep that earlier copy separately before replacing it.
+  3. Do not replace the original selective_scan or ultralytics subfolders.
+
+Expected layout:
+  C:\Users\YOUR_USER\rip-work\repos\ultralytics\pyproject.toml
+  C:\Users\YOUR_USER\rip-work\repos\ultralytics\ultralytics\
+  C:\Users\YOUR_USER\rip-work\repos\ultralytics\selective_scan\
+  C:\Users\YOUR_USER\rip-work\repos\ultralytics\selective_scan_windows\setup.py
+  C:\Users\YOUR_USER\rip-work\repos\ultralytics\selective_scan_windows\src\
+  C:\Users\YOUR_USER\rip-work\repos\ultralytics\selective_scan_windows\csrc\
+
+Avoid an extra nested selective_scan_windows\selective_scan_windows folder.
+After updating with Git or copying the ZIP, confirm the same files exist.
+
+======================================================================
+2. OPEN THE DEVELOPER COMMAND PROMPT AND START A LOG FOLDER
+======================================================================
+
+Open Start -> x64 Native Tools Command Prompt for VS 2022.
+Run the following. Change ONLY the SSW_REPO path if the repo is elsewhere:
+
+set "SSW_REPO=%USERPROFILE%\rip-work\repos\ultralytics"
+set "SSW_ENV=ultralytics_contrib"
+set "SSW_RUN=%USERPROFILE%\rip-work\logs\selective-scan-windows-%RANDOM%-%RANDOM%"
+mkdir "%SSW_RUN%"
+echo Windows selective scan test > "%SSW_RUN%\status.txt"
+echo Started=%DATE% %TIME% >> "%SSW_RUN%\status.txt"
+echo Repository=%SSW_REPO% >> "%SSW_RUN%\status.txt"
+echo Environment=%SSW_ENV% >> "%SSW_RUN%\status.txt"
+echo Logs=%SSW_RUN%
+dir "%SSW_REPO%\selective_scan_windows\setup.py"
+dir "%SSW_REPO%\pyproject.toml"
+
+Both dir commands must find their files. If they do not, fix the folder layout
+or SSW_REPO before continuing. Note the Logs path printed above.
+
+Choose the intended compiler (default VS Build Tools installation path):
+
+call "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64 -vcvars_ver=14.38 > "%SSW_RUN%\01_compiler_setup.txt" 2>&1
+echo compiler_setup_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\01_compiler_setup.txt"
+cl > "%SSW_RUN%\02_compiler_version.txt" 2>&1
+type "%SSW_RUN%\02_compiler_version.txt"
+
+Expected: compiler_setup_exit=0; compiler version 19.38... for x64.
+The "missing source filename" error from cl alone is EXPECTED: this command
+only asks it to print its version. If VS is installed elsewhere, adjust the
+vcvarsall.bat path. Do not substitute a newer compiler silently.
+
+Select the default CUDA 12.6 toolkit location:
+
+set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
+set "CUDA_HOME=%CUDA_PATH%"
+set "PATH=%CUDA_PATH%\bin;%PATH%"
+set "MAX_JOBS=2"
+set "TORCH_CUDA_ARCH_LIST="
+nvcc --version > "%SSW_RUN%\03_nvcc.txt" 2>&1
+echo nvcc_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\03_nvcc.txt"
+nvidia-smi > "%SSW_RUN%\04_nvidia_smi.txt" 2>&1
+echo nvidia_smi_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\04_nvidia_smi.txt"
+micromamba --version > "%SSW_RUN%\05_micromamba.txt" 2>&1
+echo micromamba_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\05_micromamba.txt"
+
+Expected: each exit code 0; nvcc release 12.6; NVIDIA A1000 visible.
+The CUDA Version displayed by nvidia-smi is the driver's supported version,
+which can be newer than 12.6. That is different from the toolkit version.
+If CUDA was installed elsewhere, adjust CUDA_PATH to that v12.6 installation.
+The architecture variable is cleared so the build detects the actual GPU.
+
+======================================================================
+3. CHECK OR CREATE THE PYTHON ENVIRONMENT
+======================================================================
+
+Run:
+
+micromamba env list > "%SSW_RUN%\06_environments.txt" 2>&1
+type "%SSW_RUN%\06_environments.txt"
+
+If ultralytics_contrib ALREADY EXISTS, skip the following creation command.
+If it DOES NOT EXIST, run:
+
+micromamba create -n "%SSW_ENV%" -c conda-forge python=3.13.5 pip -y > "%SSW_RUN%\07_environment_create.txt" 2>&1
+echo environment_create_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\07_environment_create.txt"
+
+Creation must exit 0. Then everyone runs:
+
+micromamba run -n "%SSW_ENV%" python -c "import sys, struct; print(sys.executable); print(sys.version); print('Bits:', struct.calcsize('P') * 8)" > "%SSW_RUN%\08_python.txt" 2>&1
+echo python_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\08_python.txt"
+micromamba run -n "%SSW_ENV%" python -m pip show selective_scan > "%SSW_RUN%\09_original_extension_check.txt" 2>&1
+echo original_extension_check_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\09_original_extension_check.txt"
+
+Expected: Python 3.13.5, 64 bits, python_exit=0.
+For pip show selective_scan, "Package(s) not found" and exit 1 are EXPECTED.
+If the original distribution IS installed, stop and send this log. Do not
+uninstall it. We can use a separate environment for the Windows package.
+If Python differs from the target version, report it before proceeding.
+
+======================================================================
+4. INSTALL PYTORCH AND THE CUSTOM ULTRALYTICS DEPENDENCIES
+======================================================================
+
+Run each command and its immediately following echo line before inspecting
+logs. This preserves the actual exit code in status.txt.
+
+micromamba run -n "%SSW_ENV%" python -m pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu126 > "%SSW_RUN%\10_torch_install.txt" 2>&1
+echo torch_install_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\10_torch_install.txt"
+
+Expected exit 0. Then:
+
+micromamba run -n "%SSW_ENV%" python -m pip install setuptools wheel ninja packaging pytest numpy > "%SSW_RUN%\11_build_dependencies.txt" 2>&1
+echo build_dependencies_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\11_build_dependencies.txt"
+
+Expected exit 0. Then install the local custom repo, not PyPI Ultralytics:
+
+micromamba run -n "%SSW_ENV%" python -m pip install -e "%SSW_REPO%[mamba]" > "%SSW_RUN%\12_ultralytics_install.txt" 2>&1
+echo ultralytics_install_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\12_ultralytics_install.txt"
+
+Expected exit 0. This registers the local source package and installs its
+dependencies; it does not compile the old selective_scan extension or edit
+the model's source files. Normal installer metadata may be generated.
+
+Check actual GPU computation:
+
+micromamba run -n "%SSW_ENV%" python -c "import torch; print('PyTorch:', torch.__version__); print('Runtime CUDA:', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); assert torch.__version__.split('+')[0] == '2.8.0'; assert torch.version.cuda == '12.6'; assert torch.cuda.is_available(); print('GPU:', torch.cuda.get_device_name(0)); print('Capability:', torch.cuda.get_device_capability(0)); print('VRAM GiB:', torch.cuda.get_device_properties(0).total_memory / 1024**3); x = torch.ones((256,256), device='cuda'); y = x @ x; torch.cuda.synchronize(); print('GPU calculation:', y[0,0].item())" > "%SSW_RUN%\13_gpu_check.txt" 2>&1
+echo gpu_check_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\13_gpu_check.txt"
+
+Expected: exit 0; torch 2.8.0+cu126; CUDA 12.6; CUDA available True;
+NVIDIA A1000; approximately 8 GiB VRAM; GPU calculation 256.0.
+If this fails, do not attempt the extension build yet.
+
+======================================================================
+5. BUILD AND INSTALL ONLY THE NEW WINDOWS EXTENSION
+======================================================================
+
+Run:
+
+cd /d "%SSW_REPO%\selective_scan_windows"
+micromamba run -n "%SSW_ENV%" python -m pip install --no-build-isolation --no-deps --no-cache-dir -v . > "%SSW_RUN%\14_extension_build.txt" 2>&1
+echo extension_build_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+powershell -NoProfile -Command "Get-Content -LiteralPath ($env:SSW_RUN + '\14_extension_build.txt') -Tail 60"
+
+Compilation can take several minutes. The redirected log may grow while the
+screen is quiet. Wait for the prompt to return before running the echo line.
+
+Expected: exit 0 and a successful selective-scan-windows install.
+If it fails, retain the ENTIRE 14_extension_build.txt, not just the last lines.
+Stop here and complete section 10. Do not try to build the old package, change
+compiler versions, or use --allow-unsupported-compiler to hide the error.
+
+======================================================================
+6. VERIFY IMPORTS AND RUN ALL PACKAGE TESTS
+======================================================================
+
+Run diagnostics:
+
+micromamba run -n "%SSW_ENV%" python -m selective_scan_windows.diagnostics > "%SSW_RUN%\15_diagnostics.txt" 2>&1
+echo diagnostics_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\15_diagnostics.txt"
+
+Expected: exit 0, "status": "passed", "errors": [], the new package's
+_C...pyd binary, and the new selective_scan_cuda_core.py compatibility file.
+If this fails, stop and send logs rather than accepting another backend.
+
+Run numerical, gradient, packaging, and unchanged-model-wrapper tests:
+
+micromamba run -n "%SSW_ENV%" python -m pytest -c pytest.ini --require-cuda -ra --junitxml="%SSW_RUN%\16_tests.xml" > "%SSW_RUN%\16_tests.txt" 2>&1
+echo tests_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\16_tests.txt"
+
+Expected for this source version: 53 passed, exit 0, with no skipped GPU tests.
+The tests may take time: some compare long sequences against a simple reference.
+The --require-cuda flag is essential; a CPU-only run is not qualification.
+Warnings alone are not failures. Send them in the complete log anyway.
+If any test fails, stop before checkpoint inference and send the full log/XML.
+
+======================================================================
+7. VERIFY A REAL CHECKPOINT (IF WEIGHTS AND TILES ARE AVAILABLE)
+======================================================================
+
+This step is additional to kernel tests. If the owner has not supplied the
+research checkpoint and sample tiles, skip it and say "checkpoint not supplied"
+in the message sent back. Do not download a different public model as a substitute.
+
+Transfer an existing research .pt checkpoint and two representative PNG tiles,
+each exactly 448 x 448. EDIT these three paths to the actual files:
+
+set "SSW_CHECKPOINT=%USERPROFILE%\rip-work\models\best.pt"
+set "SSW_TILE1=%USERPROFILE%\rip-work\data\tile1.png"
+set "SSW_TILE2=%USERPROFILE%\rip-work\data\tile2.png"
+dir "%SSW_CHECKPOINT%"
+dir "%SSW_TILE1%"
+dir "%SSW_TILE2%"
+
+All three files must exist. Then run:
+
+micromamba run -n "%SSW_ENV%" python tools\validate_checkpoint.py --checkpoint "%SSW_CHECKPOINT%" --images "%SSW_TILE1%" "%SSW_TILE2%" --output "%SSW_RUN%\checkpoint" > "%SSW_RUN%\17_checkpoint.txt" 2>&1
+echo checkpoint_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\17_checkpoint.txt"
+
+Expected: exit 0 and "inference_status": "passed" in checkpoint\report.json.
+"baseline_status": "not_provided" is expected unless a comparison baseline
+was explicitly supplied. It does NOT establish equality with HPC predictions.
+
+The report records latency and peak/live GPU memory. Defaults: one tile at a
+time, imgsz 448, full precision, confidence 0.25, IoU 0.7, max detections 300,
+retina masks disabled, two warm-up passes and five measured passes. If the
+owner supplied different prediction thresholds, append the corresponding
+--conf, --iou, --max-det or --retina-masks arguments before running.
+
+Outputs are checkpoint\report.json and checkpoint\predictions.npz. Send both.
+This does not upload anything to R2, save annotated images, or delete input data.
+The output directory must be new. To repeat, use a fresh output subfolder such
+as "%SSW_RUN%\checkpoint-repeat" and a different log filename.
+
+======================================================================
+8. VERIFY AN ISOLATED SOURCE ARCHIVE (AFTER MAIN TESTS PASS)
+======================================================================
+
+This second build verifies that the new package does not need the original
+extension's source directory. It adds another compilation and test run.
+If you cannot run it now, explicitly report this section as NOT RUN.
+
+Run from the new package directory:
+
+cd /d "%SSW_REPO%\selective_scan_windows"
+micromamba run -n "%SSW_ENV%" python setup.py sdist > "%SSW_RUN%\18_sdist.txt" 2>&1
+echo sdist_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\18_sdist.txt"
+
+Expected exit 0. Then:
+
+set "SSW_STAGE=%TEMP%\selective-scan-windows-%RANDOM%-%RANDOM%"
+mkdir "%SSW_STAGE%"
+tar -xf dist\selective_scan_windows-0.1.0.tar.gz -C "%SSW_STAGE%" > "%SSW_RUN%\19_extract.txt" 2>&1
+echo extract_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\19_extract.txt"
+
+Expected exit 0; an empty extraction log is normal. Then:
+
+cd /d "%SSW_STAGE%\selective_scan_windows-0.1.0"
+micromamba run -n "%SSW_ENV%" python -m pip wheel --no-build-isolation --no-deps --no-cache-dir -v . -w dist > "%SSW_RUN%\20_isolated_build.txt" 2>&1
+echo isolated_build_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+powershell -NoProfile -Command "Get-Content -LiteralPath ($env:SSW_RUN + '\20_isolated_build.txt') -Tail 60"
+
+Expected exit 0. Then install that newly built Windows package wheel:
+
+micromamba run -n "%SSW_ENV%" python -m pip install --no-deps --force-reinstall --no-index --find-links=dist selective-scan-windows==0.1.0 > "%SSW_RUN%\21_isolated_install.txt" 2>&1
+echo isolated_install_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\21_isolated_install.txt"
+
+Expected exit 0. This reinstalls only the NEW selective-scan-windows package.
+Then:
+
+micromamba run -n "%SSW_ENV%" python -m selective_scan_windows.diagnostics > "%SSW_RUN%\22_isolated_diagnostics.txt" 2>&1
+echo isolated_diagnostics_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\22_isolated_diagnostics.txt"
+micromamba run -n "%SSW_ENV%" python -m pytest -c pytest.ini --require-cuda -ra --junitxml="%SSW_RUN%\23_isolated_tests.xml" > "%SSW_RUN%\23_isolated_tests.txt" 2>&1
+echo isolated_tests_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\23_isolated_tests.txt"
+
+Expected: successful diagnostics, 53 passed tests, and exit codes 0.
+As elsewhere, stop at an unexpected failure and send the complete logs.
+
+======================================================================
+9. CAPTURE FINAL PACKAGE VERSIONS AND DEPENDENCY STATUS
+======================================================================
+
+Run these even if an earlier build/test failed, provided Python still works:
+
+micromamba run -n "%SSW_ENV%" python -m pip list --format=json > "%SSW_RUN%\24_package_versions.json" 2>&1
+echo package_list_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+micromamba run -n "%SSW_ENV%" python -m pip check > "%SSW_RUN%\25_pip_check.txt" 2>&1
+echo pip_check_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\25_pip_check.txt"
+echo Finished=%DATE% %TIME% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\status.txt"
+
+Expected pip check result: "No broken requirements found." If it differs,
+send that output too. Do not upgrade random dependencies to suppress it.
+
+======================================================================
+10. ZIP THE RESULTS AND SEND THEM BACK
+======================================================================
+
+Use this section after success OR after the first unexpected failure.
+If the same Command Prompt is still open, run:
+
+powershell -NoProfile -Command "Compress-Archive -LiteralPath $env:SSW_RUN -DestinationPath ($env:SSW_RUN + '.zip')"
+echo Send this ZIP: %SSW_RUN%.zip
+explorer "%USERPROFILE%\rip-work\logs"
+
+Send the ZIP printed above. It contains only the results folder created for
+this attempt, including any checkpoint output produced inside it.
+If creating the ZIP fails, right-click that results folder in File Explorer
+and choose Compress to ZIP file (or Send to -> Compressed (zipped) folder).
+Do not ZIP the entire repo, Python environment, or rip-work directory.
+
+If the Command Prompt was closed, open a new Command Prompt and set SSW_RUN
+to the actual saved log folder, then run the ZIP command. Example only:
+  set "SSW_RUN=C:\Users\YOUR_USER\rip-work\logs\selective-scan-windows-123-456"
+Do not rerun the random-folder command from section 2 to find existing logs.
+
+WHAT MUST BE IN THE RESULTS ZIP
+  * status.txt: command exit codes and the repo/environment selected.
+  * Compiler setup/version, nvcc, nvidia-smi, and Python information.
+  * 13_gpu_check.txt.
+  * 14_extension_build.txt: FULL build output, especially if compilation failed.
+  * 15_diagnostics.txt.
+  * 16_tests.txt and 16_tests.xml, when the test command ran.
+  * 17_checkpoint.txt, checkpoint\report.json and checkpoint\predictions.npz,
+    if the checkpoint test ran (a report may exist even after failure).
+  * 18-23 isolated archive/build/test logs, if section 8 ran.
+  * 24_package_versions.json and 25_pip_check.txt, if Python was usable.
+
+Missing files for steps you did not reach are expected. Send the existing logs.
+If a command failed before it could write a log, include its full console text
+or a screenshot of that error, together with the command you ran.
+
+INCLUDE THIS SHORT MESSAGE WITH THE ZIP
+  Last section completed:
+  First failing section/command (or "none"):
+  Main tests: passed / failed / not run:
+  Checkpoint inference: passed / failed / checkpoint not supplied / not run:
+  Isolated archive test: passed / failed / not run:
+  Any paths or commands changed from this guide:
+
+The owner does NOT need the checkpoint file, sample source images, .pyd file,
+entire environment, R2 credentials, or GitHub login details sent back with this
+initial diagnostic ZIP. Keep the complete compiler/test logs, not just a success
+message or screenshot of the final line.
+
+OFFICIAL REFERENCES
+PyTorch 2.8 Windows/CUDA installation commands:
+https://pytorch.org/get-started/previous-versions/#v2-8-0
+CUDA 12.6 Windows compiler compatibility:
+https://docs.nvidia.com/cuda/archive/12.6.3/cuda-installation-guide-microsoft-windows/index.html
+Windows PowerShell archive command:
+https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.archive/compress-archive?view=powershell-5.1
