@@ -44,7 +44,8 @@ The dir command must show the transferred best.pt file.
 Continue with section 7 of windows_install_and_test.txt after section 6's
 diagnostics and GPU tests pass. Section 7 can be run from a NEW Command Prompt;
 it defines all variables, creates the log folder, and changes to the script
-directory. You also need two representative 448 x 448 JPG/JPEG or PNG tiles.
+directory. You also need two representative JPG/JPEG or PNG images of any
+dimensions; Ultralytics resizes and pads them to 448 x 448 for inference.
 Its current examples use data\tile1.jpg and data\tile2.jpg; edit as needed.
 
 Variables set with "set" apply only to that window; the copied file remains

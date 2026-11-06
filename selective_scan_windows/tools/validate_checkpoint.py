@@ -38,7 +38,6 @@ def compare_baseline(baseline_path, identity, arrays):
 
 def run(args, report):
     import numpy as np
-    from PIL import Image
     import torch
     from selective_scan_windows.diagnostics import require_backend
 
@@ -47,11 +46,6 @@ def run(args, report):
     images = [p.resolve(strict=True) for p in args.images]
     if not checkpoint.is_file() or checkpoint.suffix.lower() != ".pt":
         raise ValueError("--checkpoint must be an existing local .pt file.")
-    for path in images:
-        with Image.open(path) as image:
-            if image.size != (448, 448):
-                raise ValueError(f"Expected a 448 x 448 tile, got {image.size}: {path}")
-
     from ultralytics import YOLO
     from ultralytics.nn.modules import common_utils_mbyolo
     from selective_scan_windows import fwd, bwd
@@ -66,6 +60,7 @@ def run(args, report):
                      if module.__class__.__module__ == "ultralytics.nn.modules.mamba_yolo"]
     if not mamba_modules:
         raise ValueError("Checkpoint contains no active Mamba modules; it cannot qualify selective scan.")
+    # Let prediction letterbox source images of any size to the fixed model input.
     settings = dict(imgsz=448, batch=1, half=False, conf=args.conf, iou=args.iou,
                     max_det=args.max_det, retina_masks=args.retina_masks, rect=False,
                     augment=False, agnostic_nms=False)

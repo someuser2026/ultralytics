@@ -306,7 +306,7 @@ micromamba run -n "%SSW_ENV%" python -m pytest -c pytest.ini --require-cuda -ra 
 echo tests_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
 type "%SSW_RUN%\16_tests.txt"
 
-Expected for this source version: 70 passed, exit 0, with no skipped GPU tests.
+Expected for this source version: 71 passed, exit 0, with no skipped GPU tests.
 The tests may take time: some compare long sequences against a simple reference.
 The --require-cuda flag is essential; a CPU-only run is not qualification.
 Warnings alone are not failures. Send them in the complete log anyway.
@@ -354,8 +354,11 @@ dir tools\validate_checkpoint.py
 The dir command must find the script. Stop if it does not. Running from the
 Visual Studio BuildTools directory will not find tools\validate_checkpoint.py.
 
-Use the transferred .pt checkpoint and two representative JPG or PNG tiles,
-each exactly 448 x 448. These paths match the current PC; edit them if needed:
+Use the transferred .pt checkpoint and two representative JPG or PNG images.
+Source images may have different dimensions. Ultralytics resizes and pads them
+to a fixed 448 x 448 model input while preserving aspect ratio. It does not
+split large images into tiles or change the source files.
+These paths match the current PC; edit them if needed:
 
 set "SSW_CHECKPOINT=%USERPROFILE%\rip-work\models\best.pt"
 set "SSW_TILE1=%USERPROFILE%\rip-work\data\tile1.jpg"
@@ -443,7 +446,7 @@ micromamba run -n "%SSW_ENV%" python -m pytest -c pytest.ini --require-cuda -ra 
 echo isolated_tests_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
 type "%SSW_RUN%\23_isolated_tests.txt"
 
-Expected: successful diagnostics, 70 passed tests, and exit codes 0.
+Expected: successful diagnostics, 71 passed tests, and exit codes 0.
 As elsewhere, stop at an unexpected failure and send the complete logs.
 
 ======================================================================

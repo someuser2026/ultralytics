@@ -168,7 +168,10 @@ mistaken for a qualified build.
 ## Checkpoint inference verification
 
 Supply an existing local trusted research `.pt` checkpoint and a small set of
-representative **448 x 448 tiles**, including challenging sites. Checkpoints
+representative site images or tiles, including challenging sites. Source images
+may have different dimensions; Ultralytics resizes and pads each to the fixed
+448 x 448 model input while preserving aspect ratio. This does not split large
+site images into tiles or modify the source files. Checkpoints
 and images are not downloaded. JPG/JPEG and PNG inputs are supported.
 For a new Command Prompt, section 7 of
 [`windows_install_and_test.txt`](windows_install_and_test.txt) sets all required

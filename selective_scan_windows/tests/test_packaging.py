@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+from types import ModuleType, SimpleNamespace
 import zipfile
 
 import numpy as np
@@ -211,3 +212,60 @@ def test_validator_help_does_not_require_gpu():
                             text=True, capture_output=True)
     assert result.returncode == 0
     assert "--checkpoint" in result.stdout and "--baseline" in result.stdout
+
+
+def test_validator_passes_mixed_image_sizes_to_prediction(tmp_path, monkeypatch):
+    """Exercise the CLI/report flow with mocked inference, not GPU qualification."""
+    from PIL import Image
+    import torch
+
+    validator = load_validator()
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"mock checkpoint")
+    images = [tmp_path / "landscape.jpg", tmp_path / "portrait.png"]
+    for path, size in zip(images, [(640, 320), (300, 600)]):
+        Image.new("RGB", size).save(path)
+    original_hashes = [validator.sha256(path) for path in images]
+    calls = []
+    mamba_type = type("MockMamba", (), {"__module__": "ultralytics.nn.modules.mamba_yolo"})
+
+    class MockYOLO:
+        def __init__(self, path):
+            assert path == str(checkpoint)
+            self.model = SimpleNamespace(named_modules=lambda: [("mamba", mamba_type())])
+
+        def predict(self, **kwargs):
+            calls.append(kwargs)
+            return [SimpleNamespace(boxes=SimpleNamespace(data=torch.ones(1, 6)),
+                                    masks=None, obb=None, probs=None, keypoints=None)]
+
+    # Isolate backend/model imports so this regression runs without the extension.
+    backend = ModuleType("selective_scan_windows")
+    backend.fwd, backend.bwd = object(), object()
+    diagnostics = ModuleType("selective_scan_windows.diagnostics")
+    diagnostics.require_backend = lambda: {"status": "mocked"}
+    modules = ModuleType("ultralytics.nn.modules")
+    modules.common_utils_mbyolo = SimpleNamespace(selective_scan_cuda_core=backend)
+    ultralytics = ModuleType("ultralytics")
+    ultralytics.YOLO = MockYOLO
+    for name, module in {"selective_scan_windows": backend,
+                         "selective_scan_windows.diagnostics": diagnostics,
+                         "ultralytics": ultralytics,
+                         "ultralytics.nn": ModuleType("ultralytics.nn"),
+                         "ultralytics.nn.modules": modules}.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    for name in ("set_device", "synchronize", "reset_peak_memory_stats", "memory_allocated",
+                 "memory_reserved", "max_memory_allocated", "max_memory_reserved"):
+        monkeypatch.setattr(torch.cuda, name, lambda *args: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(total_memory=1024))
+
+    output = tmp_path / "validation"
+    assert validator.main(["--checkpoint", str(checkpoint), "--images", *map(str, images),
+                           "--output", str(output), "--repeats", "3"]) == 0
+    assert [call["source"] for call in calls] == [str(path) for path in images] * 5
+    assert all(call["imgsz"] == 448 and call["rect"] is False for call in calls)
+    assert [validator.sha256(path) for path in images] == original_hashes
+    report = json.loads((output / "report.json").read_text())
+    assert report["inference_status"] == "passed"
+    assert report["identity"]["image_sha256"] == original_hashes
+    assert (output / "predictions.npz").is_file()
