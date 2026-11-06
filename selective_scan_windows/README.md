@@ -191,6 +191,13 @@ measured passes. It checks finite predictions and writes `report.json` plus
 The report includes median/minimum/maximum time per tile and peak allocated
 and reserved VRAM. Timing includes preprocessing and postprocessing.
 
+To view masks, boxes, and confidence scores overlaid on the original images,
+follow section 7V of [`windows_install_and_test.txt`](windows_install_and_test.txt).
+It reruns inference with the validation defaults and saves annotated copies
+under `%USERPROFILE%\rip-work\predictions\checkpoint-preview` (or a numbered
+folder on subsequent runs). This preview does not modify the original images
+or render the previously saved `predictions.npz` arrays.
+
 After warming all inputs, live GPU allocation at matching end-of-pass points
 must not grow by more than the larger of 16 MiB or 5% of the first measured
 pass. Reserved memory is recorded separately because it can reflect caching.

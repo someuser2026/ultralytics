@@ -398,6 +398,39 @@ dir "%SSW_RUN%"
 The log folder must exist before validation can start.
 
 ======================================================================
+7V. VIEW ANNOTATED PREDICTIONS (OPTIONAL, AFTER VALIDATION PASSES)
+======================================================================
+
+The validation run saves report.json and predictions.npz, but no annotated
+images. The command below reruns inference and saves copies with predicted
+masks, boxes, and confidence scores. It does not render the saved NPZ arrays
+or modify your original images.
+
+Run on the Windows PC in Command Prompt (cmd.exe), NOT PowerShell or a Katana
+SSH session. This command also works from a new Command Prompt: it uses the
+existing ultralytics_contrib environment and does not rely on SSW variables
+or compiler activation. It assumes the same best.pt, tile1.jpg, and tile2.jpg
+locations used in section 7; adjust the filenames if yours differ.
+
+micromamba run -n ultralytics_contrib python -c "from pathlib import Path; from ultralytics import YOLO; p=Path.home()/'rip-work'; model=YOLO(str(p/'models/best.pt')); model.predict(source=[str(p/'data/tile1.jpg'), str(p/'data/tile2.jpg')], imgsz=448, rect=False, batch=1, device=0, half=False, conf=0.25, iou=0.7, max_det=300, retina_masks=False, augment=False, agnostic_nms=False, save=True, show=False, plots=False, project=str(p/'predictions'), name='checkpoint-preview', exist_ok=False)"
+echo prediction_preview_exit=%ERRORLEVEL%
+
+Wait for prediction to finish, then run the echo immediately afterward.
+Expected exit code: 0. If it fails, retain the console output.
+These settings match section 7's default prediction settings. If validation
+used different thresholds or retina_masks, match those values here too.
+This separate preview run is not included in the validation timing report.
+
+Open the output directory:
+
+explorer "%USERPROFILE%\rip-work\predictions"
+
+Look inside checkpoint-preview for the annotated tile1 and tile2 images.
+The console prints the exact output path. If that folder already exists,
+Ultralytics selects a numbered folder such as checkpoint-preview2 so previous
+previews are preserved. Images with no detections have no instance overlays.
+
+======================================================================
 8. VERIFY AN ISOLATED SOURCE ARCHIVE (AFTER MAIN TESTS PASS)
 ======================================================================
 
