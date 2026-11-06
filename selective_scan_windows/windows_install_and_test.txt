@@ -1,5 +1,5 @@
 WINDOWS SELECTIVE-SCAN INSTALLATION AND TEST HANDOFF
-Prepared: 5 November 2026
+Updated: 6 November 2026
 Package: selective-scan-windows 0.1.0
 
 PURPOSE
@@ -19,6 +19,8 @@ READ THIS FIRST
 - Keep the same Command Prompt open: its variables and compiler environment
   are used by later sections. Logs are redirected to files, so some commands
   show no progress on screen while they run. Wait until the prompt returns.
+- Closing the window loses variables set with "set". In a new window, rerun
+  all of section 2. "cls" only clears the screen and preserves the variables.
 - Do not run "pip install" from the original selective_scan directory.
 - Do not remove the original package from an existing environment. If that
   package is installed, use a separate Windows environment instead.
@@ -40,6 +42,16 @@ If these are not installed, complete that setup first. Installer locations:
 The Python environment and Python dependencies can be installed below.
 No WSL or Ubuntu is involved. R2/rclone credentials are not needed for testing.
 
+RETURNING AFTER THE STEP 5 BUILD FAILURE
+Your existing CUDA 12.6 (V12.6.85), PyTorch 2.8.0+cu126, and environment can
+be reused. Adding MSVC 14.38 does not require reinstalling CUDA or PyTorch.
+After the updated source has been committed AND pushed from the development
+machine, run section 1 on the Windows PC, then all of section 2 in a fresh
+Command Prompt. If sections 3 and 4 previously passed and the environment
+has not changed, skip their installation commands and go to section 5R.
+Section 5R checks the environment before rebuilding. If you removed/recreated
+the environment, complete sections 3 and 4 first.
+
 ======================================================================
 1. PUT THE NEW CODE ON THE PC
 ======================================================================
@@ -49,25 +61,23 @@ ultralytics repository. In Command Prompt, update an existing Git checkout:
 
 cd /d "%USERPROFILE%\rip-work\repos\ultralytics"
 git status --short
+
+If git status shows local edits, stop and retain those files before updating.
+Do not reset or delete them. With a clean checkout, run one line at a time:
+
 git fetch origin
 git switch rip-detectionv2
 git pull --ff-only origin rip-detectionv2
+git log -1 --oneline
 
-If git status shows local edits, or a command reports a conflict/untracked
-file obstruction, stop and retain those files. Do not reset or delete them.
-If this PC has only a downloaded source ZIP rather than a Git checkout, use
-the transfer method below or obtain a fresh ZIP of the rip-detectionv2 branch.
+Stop if any Git command fails. A local commit on the development machine is
+not available to this PC until it has been pushed to origin. Source updates
+use Git; no source ZIP transfer is needed. Confirm the dispatch fix is present:
 
-Alternative: transfer selective_scan_windows_transfer.zip with this text file.
-The ZIP contains only the new selective_scan_windows folder and its sources;
-it does not contain the full custom Ultralytics repository or model weights.
+git merge-base --is-ancestor 7304d1a2 HEAD
+echo dispatch_fix_present_exit=%ERRORLEVEL%
 
-In File Explorer:
-  1. Right-click the ZIP -> Extract All.
-  2. Copy the extracted selective_scan_windows folder into the EXISTING custom
-     ultralytics repository folder. If this new folder already exists from an
-     earlier attempt, keep that earlier copy separately before replacing it.
-  3. Do not replace the original selective_scan or ultralytics subfolders.
+Expected: exit 0. If it is nonzero, do not retry the build with this checkout.
 
 Expected layout:
   C:\Users\YOUR_USER\rip-work\repos\ultralytics\pyproject.toml
@@ -78,7 +88,7 @@ Expected layout:
   C:\Users\YOUR_USER\rip-work\repos\ultralytics\selective_scan_windows\csrc\
 
 Avoid an extra nested selective_scan_windows\selective_scan_windows folder.
-After updating with Git or copying the ZIP, confirm the same files exist.
+After updating with Git, confirm the same files exist.
 
 ======================================================================
 2. OPEN THE DEVELOPER COMMAND PROMPT AND START A LOG FOLDER
@@ -89,18 +99,22 @@ Run the following. Change ONLY the SSW_REPO path if the repo is elsewhere:
 
 set "SSW_REPO=%USERPROFILE%\rip-work\repos\ultralytics"
 set "SSW_ENV=ultralytics_contrib"
-set "SSW_RUN=%USERPROFILE%\rip-work\logs\selective-scan-windows-%RANDOM%-%RANDOM%"
+set "SSW_RUN=%SSW_REPO%\selective_scan_windows\logs\run-%RANDOM%-%RANDOM%"
 mkdir "%SSW_RUN%"
 echo Windows selective scan test > "%SSW_RUN%\status.txt"
 echo Started=%DATE% %TIME% >> "%SSW_RUN%\status.txt"
 echo Repository=%SSW_REPO% >> "%SSW_RUN%\status.txt"
 echo Environment=%SSW_ENV% >> "%SSW_RUN%\status.txt"
+git -C "%SSW_REPO%" rev-parse HEAD > "%SSW_RUN%\00_revision.txt" 2>&1
 echo Logs=%SSW_RUN%
 dir "%SSW_REPO%\selective_scan_windows\setup.py"
 dir "%SSW_REPO%\pyproject.toml"
 
 Both dir commands must find their files. If they do not, fix the folder layout
 or SSW_REPO before continuing. Note the Logs path printed above.
+This logs folder is ignored by Git; it is not transferred by git pull/push.
+status.txt is inside this attempt's folder. To find or read it later in this
+same window, run "echo %SSW_RUN%\status.txt" or "type %SSW_RUN%\status.txt".
 
 Choose the intended compiler (default VS Build Tools installation path):
 
@@ -108,10 +122,17 @@ call "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\B
 echo compiler_setup_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
 type "%SSW_RUN%\01_compiler_setup.txt"
 set "DISTUTILS_USE_SDK=1"
+where cl > "%SSW_RUN%\02_compiler_environment.txt" 2>&1
+echo VCToolsVersion=%VCToolsVersion% >> "%SSW_RUN%\02_compiler_environment.txt"
+echo INCLUDE=%INCLUDE% >> "%SSW_RUN%\02_compiler_environment.txt"
+type "%SSW_RUN%\02_compiler_environment.txt"
 cl > "%SSW_RUN%\02_compiler_version.txt" 2>&1
 type "%SSW_RUN%\02_compiler_version.txt"
 
-Expected: compiler_setup_exit=0; compiler version 19.38... for x64.
+Expected: compiler_setup_exit=0; compiler version 19.38... for x64;
+VCToolsVersion=14.38...; first cl path and MSVC include paths use 14.38.
+If 14.44 include paths appear, restart from a fresh ordinary Command Prompt
+opened from Start and rerun section 2. Call vcvarsall only once per fresh window.
 The "missing source filename" error from cl alone is EXPECTED: this command
 only asks it to print its version. If VS is installed elsewhere, adjust the
 vcvarsall.bat path. Do not substitute a newer compiler silently.
@@ -228,12 +249,49 @@ If it fails, retain the ENTIRE 14_extension_build.txt, not just the last lines.
 Stop here and complete section 10. Do not try to build the old package, change
 compiler versions, or use --allow-unsupported-compiler to hide the error.
 
+If this first build succeeds, proceed directly to section 6; skip section 5R.
+
+======================================================================
+5R. RETRY AFTER SYNCING THE MSVC TEMPLATE-DISPATCH FIX
+======================================================================
+
+Use this instead of section 5 when retrying the C2975 build failure.
+Sections 1 and 2 must have completed in this attempt. Keep the same window.
+Check the existing environment, without reinstalling dependencies:
+
+micromamba run -n "%SSW_ENV%" python -c "import torch; from torch.utils.cpp_extension import CUDA_HOME; print(torch.__version__, torch.version.cuda, CUDA_HOME); assert torch.__version__.split('+')[0] == '2.8.0'; assert torch.version.cuda == '12.6'; assert torch.cuda.is_available()" > "%SSW_RUN%\13_retry_environment.txt" 2>&1
+echo retry_environment_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\13_retry_environment.txt"
+
+Expected: exit 0; torch 2.8.0+cu126; CUDA 12.6; CUDA_HOME points to v12.6.
+Stop if this fails. Otherwise, preserve the old build directory in TEMP so
+the next attempt recompiles from scratch:
+
+cd /d "%SSW_REPO%\selective_scan_windows"
+set "SSW_BUILD_BACKUP=%TEMP%\selective-scan-build-%RANDOM%-%RANDOM%"
+if exist build move build "%SSW_BUILD_BACKUP%"
+if exist build echo STOP: old build directory still exists; resolve the move failure before continuing.
+
+If there was no build directory, the move is skipped. If it still exists,
+stop. No previous logs or build files should be deleted. Then run each line:
+
+micromamba run -n "%SSW_ENV%" python -m pip install --no-build-isolation --no-deps --no-cache-dir -v . > "%SSW_RUN%\14_extension_build_retry2.txt" 2>&1
+echo extension_build_retry2_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\status.txt"
+powershell -NoProfile -Command "Get-Content -LiteralPath ($env:SSW_RUN + '\14_extension_build_retry2.txt') -Tail 80"
+
+Expected: exit 0 and a successful install. On success continue to section 6.
+On failure stop and share the complete retry log through section 10.
+For another attempt, create a fresh run folder via section 2 so these logs
+are preserved. This source fix still requires Windows compilation and tests.
+
 ======================================================================
 6. VERIFY IMPORTS AND RUN ALL PACKAGE TESTS
 ======================================================================
 
-Run diagnostics:
+Run diagnostics from the package directory:
 
+cd /d "%SSW_REPO%\selective_scan_windows"
 micromamba run -n "%SSW_ENV%" python -m selective_scan_windows.diagnostics > "%SSW_RUN%\15_diagnostics.txt" 2>&1
 echo diagnostics_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
 type "%SSW_RUN%\15_diagnostics.txt"
@@ -248,7 +306,7 @@ micromamba run -n "%SSW_ENV%" python -m pytest -c pytest.ini --require-cuda -ra 
 echo tests_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
 type "%SSW_RUN%\16_tests.txt"
 
-Expected for this source version: 53 passed, exit 0, with no skipped GPU tests.
+Expected for this source version: 70 passed, exit 0, with no skipped GPU tests.
 The tests may take time: some compare long sequences against a simple reference.
 The --require-cuda flag is essential; a CPU-only run is not qualification.
 Warnings alone are not failures. Send them in the complete log anyway.
@@ -339,7 +397,7 @@ micromamba run -n "%SSW_ENV%" python -m pytest -c pytest.ini --require-cuda -ra 
 echo isolated_tests_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
 type "%SSW_RUN%\23_isolated_tests.txt"
 
-Expected: successful diagnostics, 53 passed tests, and exit codes 0.
+Expected: successful diagnostics, 70 passed tests, and exit codes 0.
 As elsewhere, stop at an unexpected failure and send the complete logs.
 
 ======================================================================
@@ -368,7 +426,7 @@ If the same Command Prompt is still open, run:
 
 powershell -NoProfile -Command "Compress-Archive -LiteralPath $env:SSW_RUN -DestinationPath ($env:SSW_RUN + '.zip')"
 echo Send this ZIP: %SSW_RUN%.zip
-explorer "%USERPROFILE%\rip-work\logs"
+explorer "%SSW_RUN%"
 
 Send the ZIP printed above. It contains only the results folder created for
 this attempt, including any checkpoint output produced inside it.
@@ -378,14 +436,17 @@ Do not ZIP the entire repo, Python environment, or rip-work directory.
 
 If the Command Prompt was closed, open a new Command Prompt and set SSW_RUN
 to the actual saved log folder, then run the ZIP command. Example only:
-  set "SSW_RUN=C:\Users\YOUR_USER\rip-work\logs\selective-scan-windows-123-456"
+  set "SSW_RUN=C:\Users\YOUR_USER\rip-work\repos\ultralytics\selective_scan_windows\logs\run-123-456"
 Do not rerun the random-folder command from section 2 to find existing logs.
 
 WHAT MUST BE IN THE RESULTS ZIP
   * status.txt: command exit codes and the repo/environment selected.
+  * 00_revision.txt: the exact Git revision used for this attempt.
   * Compiler setup/version, nvcc, nvidia-smi, and Python information.
   * 13_gpu_check.txt.
   * 14_extension_build.txt: FULL build output, especially if compilation failed.
+    For section 5R, send 13_retry_environment.txt and
+    14_extension_build_retry2.txt instead.
   * 15_diagnostics.txt.
   * 16_tests.txt and 16_tests.xml, when the test command ran.
   * 17_checkpoint.txt, checkpoint\report.json and checkpoint\predictions.npz,

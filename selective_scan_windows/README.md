@@ -59,6 +59,13 @@ Optional absent gradients are returned as `None`.
 
 ## Windows installation
 
+For the numbered installation and logging procedure, use
+[`windows_install_and_test.txt`](windows_install_and_test.txt). After the
+`C2975` template-dispatch failure, sync the committed and pushed fix with Git,
+follow sections 1 and 2, then use section 5R to rebuild with the existing
+environment. Logs are kept under the Git-ignored `selective_scan_windows/logs/`
+directory and must be shared separately; Git does not sync them.
+
 These commands assume the Windows prerequisites and `ultralytics_contrib`
 environment from the PC setup guide are installed. The CUDA toolkit is a
 separate installation from PyTorch's CUDA runtime. See the official
@@ -68,15 +75,21 @@ and [PyTorch extension guide](https://docs.pytorch.org/docs/2.8/cpp_extension.ht
 Open a fresh **Command Prompt (`cmd.exe`) from Start**, then initialize the
 x64 compiler below (Command Prompt syntax, not PowerShell). Do not launch the
 new window from an existing developer shell, which can carry old toolset paths.
-Adjust `SSW_REPO` and the
-Visual Studio installation path if necessary. `micromamba run` selects the
+Adjust `SSW_REPO` and the Visual Studio installation path if necessary.
+`micromamba run` selects the
 existing Python environment without relying on shell activation.
 
 ```bat
 call "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64 -vcvars_ver=14.38
 set "DISTUTILS_USE_SDK=1"
 set "SSW_REPO=%USERPROFILE%\rip-work\repos\ultralytics"
+set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
+set "CUDA_HOME=%CUDA_PATH%"
+set "PATH=%CUDA_PATH%\bin;%PATH%"
 set "MAX_JOBS=2"
+set "TORCH_CUDA_ARCH_LIST="
+where cl
+echo VCToolsVersion=%VCToolsVersion%
 cl
 nvcc --version
 nvidia-smi
@@ -88,6 +101,8 @@ micromamba run -n ultralytics_contrib python -m pip show selective_scan
 version check. `nvcc` must report 12.6; PyTorch must report 2.8.0 and CUDA 12.6.
 `DISTUTILS_USE_SDK=1` tells the build to reuse the initialized compiler
 environment; PyTorch rejects an activated VC environment without this setting.
+Repeat the environment setup when opening a new Command Prompt. An existing
+working CUDA 12.6 toolkit and PyTorch 2.8.0+cu126 installation can be reused.
 The final `pip show` should say the original package was not found. If it is
 installed, use a separate environment instead of proceeding.
 
