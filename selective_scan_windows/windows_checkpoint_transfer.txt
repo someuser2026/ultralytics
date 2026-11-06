@@ -1,0 +1,54 @@
+COPY THE KATANA CHECKPOINT TO WINDOWS
+Prepared: 6 November 2026
+
+Run these commands on your Windows PC in Command Prompt (cmd.exe), NOT
+inside an SSH session on Katana. WSL and Ubuntu are not required.
+Run each command on its own line.
+
+Source:
+  z5428587@katana1.restech.unsw.edu.au
+  /srv/scratch/z5428587/runs/cuda/segment/imgsz_448/yolo/architecture_improvement_rscmc1_segment/1020-004859_mamba_hr_pointrend/weights/best.pt
+
+Destination:
+  %USERPROFILE%\rip-work\models\best.pt
+  For this PC: C:\Users\z2273773\rip-work\models\best.pt
+
+1. CHECK THAT SCP IS AVAILABLE
+
+where scp
+
+If scp is not found, stop and report that output.
+
+2. CREATE THE DESTINATION FOLDER
+
+if not exist "%USERPROFILE%\rip-work\models" mkdir "%USERPROFILE%\rip-work\models"
+
+If best.pt already exists in this folder, the transfer below will overwrite
+it. Preserve it under a different name first if it is another checkpoint.
+
+3. COPY THE CHECKPOINT
+
+scp "z5428587@katana1.restech.unsw.edu.au:/srv/scratch/z5428587/runs/cuda/segment/imgsz_448/yolo/architecture_improvement_rscmc1_segment/1020-004859_mamba_hr_pointrend/weights/best.pt" "%USERPROFILE%\rip-work\models\best.pt"
+echo checkpoint_transfer_exit=%ERRORLEVEL%
+
+Enter your Katana authentication when prompted. Wait for scp to finish,
+then run the echo command immediately afterward. Expected exit code: 0.
+If the transfer fails, stop and retain the error output.
+
+4. SELECT THE CHECKPOINT FOR VALIDATION
+
+set "SSW_CHECKPOINT=%USERPROFILE%\rip-work\models\best.pt"
+dir "%SSW_CHECKPOINT%"
+
+The dir command must show the transferred best.pt file.
+Continue with section 7 of windows_install_and_test.txt after section 6's
+diagnostics and GPU tests pass. Section 7 can be run from a NEW Command Prompt;
+it defines all variables, creates the log folder, and changes to the script
+directory. You also need two representative 448 x 448 JPG/JPEG or PNG tiles.
+Its current examples use data\tile1.jpg and data\tile2.jpg; edit as needed.
+
+Variables set with "set" apply only to that window; the copied file remains
+on disk. Run section 7's setup even if you set these variables during transfer.
+
+This transfer copies the checkpoint without changing CUDA, PyTorch, the
+Windows selective scan extension, or the checkpoint stored on Katana.

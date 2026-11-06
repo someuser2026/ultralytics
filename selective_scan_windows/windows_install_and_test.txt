@@ -313,27 +313,64 @@ Warnings alone are not failures. Send them in the complete log anyway.
 If any test fails, stop before checkpoint inference and send the full log/XML.
 
 ======================================================================
-7. VERIFY A REAL CHECKPOINT (IF WEIGHTS AND TILES ARE AVAILABLE)
+7. VERIFY A REAL CHECKPOINT (ALSO WORKS FROM A NEW COMMAND PROMPT)
 ======================================================================
 
 This step is additional to kernel tests. If the owner has not supplied the
 research checkpoint and sample tiles, skip it and say "checkpoint not supplied"
 in the message sent back. Do not download a different public model as a substitute.
 
-Transfer an existing research .pt checkpoint and two representative PNG tiles,
-each exactly 448 x 448. EDIT these three paths to the actual files:
+Prerequisite: the extension is installed, and section 6's diagnostics and
+GPU tests have passed. This step runs inference; it does not rebuild the
+extension and does not require activating the Visual Studio compiler.
+
+Open Start -> Command Prompt (cmd.exe). The prompt must NOT begin with PS.
+Run every setup command below, even if you set these variables in a previous
+window. micromamba run selects the existing environment without activation.
+
+set "SSW_REPO=%USERPROFILE%\rip-work\repos\ultralytics"
+set "SSW_ENV=ultralytics_contrib"
+set "SSW_RUN=%SSW_REPO%\selective_scan_windows\logs\checkpoint-%RANDOM%-%RANDOM%"
+mkdir "%SSW_RUN%"
+echo Checkpoint validation > "%SSW_RUN%\status.txt"
+echo Started=%DATE% %TIME% >> "%SSW_RUN%\status.txt"
+echo Repository=%SSW_REPO% >> "%SSW_RUN%\status.txt"
+echo Environment=%SSW_ENV% >> "%SSW_RUN%\status.txt"
+git -C "%SSW_REPO%" rev-parse HEAD > "%SSW_RUN%\00_revision.txt" 2>&1
+echo Logs=%SSW_RUN%
+
+The mkdir command must succeed. This creates a NEW ignored log folder and
+preserves earlier build/test logs. Keep their folder paths too when sharing
+results; they are not copied into this new checkpoint folder.
+
+Select the existing toolkit and change to the directory containing the script:
+
+set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
+set "CUDA_HOME=%CUDA_PATH%"
+set "PATH=%CUDA_PATH%\bin;%PATH%"
+cd /d "%SSW_REPO%\selective_scan_windows"
+dir tools\validate_checkpoint.py
+
+The dir command must find the script. Stop if it does not. Running from the
+Visual Studio BuildTools directory will not find tools\validate_checkpoint.py.
+
+Use the transferred .pt checkpoint and two representative JPG or PNG tiles,
+each exactly 448 x 448. These paths match the current PC; edit them if needed:
 
 set "SSW_CHECKPOINT=%USERPROFILE%\rip-work\models\best.pt"
-set "SSW_TILE1=%USERPROFILE%\rip-work\data\tile1.png"
-set "SSW_TILE2=%USERPROFILE%\rip-work\data\tile2.png"
+set "SSW_TILE1=%USERPROFILE%\rip-work\data\tile1.jpg"
+set "SSW_TILE2=%USERPROFILE%\rip-work\data\tile2.jpg"
 dir "%SSW_CHECKPOINT%"
 dir "%SSW_TILE1%"
 dir "%SSW_TILE2%"
 
-All three files must exist. Then run:
+All three files must exist. Use the actual extensions (.jpg, .jpeg, or .png);
+no image conversion is needed. Then run the following commands one at a time.
+Wait for validation to finish and run the echo line immediately afterward:
 
 micromamba run -n "%SSW_ENV%" python tools\validate_checkpoint.py --checkpoint "%SSW_CHECKPOINT%" --images "%SSW_TILE1%" "%SSW_TILE2%" --output "%SSW_RUN%\checkpoint" > "%SSW_RUN%\17_checkpoint.txt" 2>&1
 echo checkpoint_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
+type "%SSW_RUN%\status.txt"
 type "%SSW_RUN%\17_checkpoint.txt"
 
 Expected: exit 0 and "inference_status": "passed" in checkpoint\report.json.
@@ -348,8 +385,14 @@ owner supplied different prediction thresholds, append the corresponding
 
 Outputs are checkpoint\report.json and checkpoint\predictions.npz. Send both.
 This does not upload anything to R2, save annotated images, or delete input data.
-The output directory must be new. To repeat, use a fresh output subfolder such
-as "%SSW_RUN%\checkpoint-repeat" and a different log filename.
+The output directory must be new. To repeat, rerun this section from its setup
+commands to create a fresh checkpoint log folder and preserve previous results.
+If redirection reports "The system cannot find the path specified", run:
+
+echo %SSW_RUN%
+dir "%SSW_RUN%"
+
+The log folder must exist before validation can start.
 
 ======================================================================
 8. VERIFY AN ISOLATED SOURCE ARCHIVE (AFTER MAIN TESTS PASS)
@@ -358,6 +401,9 @@ as "%SSW_RUN%\checkpoint-repeat" and a different log filename.
 This second build verifies that the new package does not need the original
 extension's source directory. It adds another compilation and test run.
 If you cannot run it now, explicitly report this section as NOT RUN.
+If you ran section 7 from a new ordinary Command Prompt, complete section 2
+again before this build to initialize MSVC and DISTUTILS_USE_SDK. Keep the
+previous checkpoint log folder; section 2 creates a separate build log folder.
 
 Run from the new package directory:
 

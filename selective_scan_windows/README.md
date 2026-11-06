@@ -169,11 +169,17 @@ mistaken for a qualified build.
 
 Supply an existing local trusted research `.pt` checkpoint and a small set of
 representative **448 x 448 tiles**, including challenging sites. Checkpoints
-and images are not downloaded. The command requires a new output directory:
+and images are not downloaded. JPG/JPEG and PNG inputs are supported.
+For a new Command Prompt, section 7 of
+[`windows_install_and_test.txt`](windows_install_and_test.txt) sets all required
+variables, creates a fresh log folder, selects the toolkit, and changes to the
+script directory. Compiler activation is not required for this inference step.
+The minimal command below requires a new output directory:
 
 ```bat
+set "SSW_REPO=%USERPROFILE%\rip-work\repos\ultralytics"
 cd /d "%SSW_REPO%\selective_scan_windows"
-micromamba run -n ultralytics_contrib python tools\validate_checkpoint.py --checkpoint "%USERPROFILE%\rip-work\models\best.pt" --images "%USERPROFILE%\rip-work\data\tile1.png" "%USERPROFILE%\rip-work\data\tile2.png" --output validation-output\first-run
+micromamba run -n ultralytics_contrib python tools\validate_checkpoint.py --checkpoint "%USERPROFILE%\rip-work\models\best.pt" --images "%USERPROFILE%\rip-work\data\tile1.jpg" "%USERPROFILE%\rip-work\data\tile2.jpg" --output validation-output\first-run
 ```
 
 The tool uses device 0, batch 1, `imgsz=448`, FP32, two warm-up passes and five
