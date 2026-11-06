@@ -22,7 +22,6 @@
 #include "selective_scan.h"
 #include "selective_scan_common.h"
 #include "reverse_scan.cuh"
-#include "static_switch.h"
 
 template<int kNThreads_, int kNItems_, bool kIsEvenLen_, bool kDeltaSoftplus_, typename input_t_, typename weight_t_>
 struct Selective_Scan_bwd_kernel_traits {
@@ -282,22 +281,35 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
     }
 }
 
+// Keep both switches outside lambdas so NVCC/MSVC sees literal template arguments.
+template<int kNThreads, int kNItems, bool kIsEvenLen, bool kDeltaSoftplus, typename input_t, typename weight_t>
+void selective_scan_bwd_launch_impl(SSMParamsBwd &params, cudaStream_t stream) {
+    using Ktraits = Selective_Scan_bwd_kernel_traits<kNThreads, kNItems, kIsEvenLen, kDeltaSoftplus, input_t, weight_t>;
+    constexpr int kSmemSize = Ktraits::kSmemSize + Ktraits::MaxDState * sizeof(typename Ktraits::scan_t) + (kNThreads + 4 * Ktraits::MaxDState) * sizeof(typename Ktraits::weight_t);
+    dim3 grid(params.batch, params.dim);
+    auto kernel = &selective_scan_bwd_kernel<Ktraits>;
+    if (kSmemSize >= 48 * 1024) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+    }
+    kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 template<int kNThreads, int kNItems, typename input_t, typename weight_t>
 void selective_scan_bwd_launch(SSMParamsBwd &params, cudaStream_t stream) {
-    BOOL_SWITCH(params.seqlen % (kNThreads * kNItems) == 0, kIsEvenLen, [&] {
-        BOOL_SWITCH(params.delta_softplus, kDeltaSoftplus, [&] {
-            using Ktraits = Selective_Scan_bwd_kernel_traits<kNThreads, kNItems, kIsEvenLen, kDeltaSoftplus, input_t, weight_t>;
-            constexpr int kSmemSize = Ktraits::kSmemSize + Ktraits::MaxDState * sizeof(typename Ktraits::scan_t) + (kNThreads + 4 * Ktraits::MaxDState) * sizeof(typename Ktraits::weight_t);
-            // printf("smem_size = %d\n", kSmemSize);
-            dim3 grid(params.batch, params.dim);
-            auto kernel = &selective_scan_bwd_kernel<Ktraits>;
-            if (kSmemSize >= 48 * 1024) {
-                C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-            }
-            kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
-        });
-    });
+    if (params.seqlen % (kNThreads * kNItems) == 0) {
+        if (params.delta_softplus) {
+            selective_scan_bwd_launch_impl<kNThreads, kNItems, true, true, input_t, weight_t>(params, stream);
+        } else {
+            selective_scan_bwd_launch_impl<kNThreads, kNItems, true, false, input_t, weight_t>(params, stream);
+        }
+    } else {
+        if (params.delta_softplus) {
+            selective_scan_bwd_launch_impl<kNThreads, kNItems, false, true, input_t, weight_t>(params, stream);
+        } else {
+            selective_scan_bwd_launch_impl<kNThreads, kNItems, false, false, input_t, weight_t>(params, stream);
+        }
+    }
 }
 
 template<int knrows, typename input_t, typename weight_t>

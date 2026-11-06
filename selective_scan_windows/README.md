@@ -65,13 +65,16 @@ separate installation from PyTorch's CUDA runtime. See the official
 [CUDA Windows guide](https://docs.nvidia.com/cuda/archive/12.6.3/cuda-installation-guide-microsoft-windows/index.html)
 and [PyTorch extension guide](https://docs.pytorch.org/docs/2.8/cpp_extension.html).
 
-Use **x64 Native Tools Command Prompt for VS 2022** for all commands in this
-section (Command Prompt syntax, not PowerShell). Adjust `SSW_REPO` and the
+Open a fresh **Command Prompt (`cmd.exe`) from Start**, then initialize the
+x64 compiler below (Command Prompt syntax, not PowerShell). Do not launch the
+new window from an existing developer shell, which can carry old toolset paths.
+Adjust `SSW_REPO` and the
 Visual Studio installation path if necessary. `micromamba run` selects the
 existing Python environment without relying on shell activation.
 
 ```bat
 call "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64 -vcvars_ver=14.38
+set "DISTUTILS_USE_SDK=1"
 set "SSW_REPO=%USERPROFILE%\rip-work\repos\ultralytics"
 set "MAX_JOBS=2"
 cl
@@ -83,6 +86,8 @@ micromamba run -n ultralytics_contrib python -m pip show selective_scan
 
 `cl` should report 19.38; its missing-source-file error is normal for this
 version check. `nvcc` must report 12.6; PyTorch must report 2.8.0 and CUDA 12.6.
+`DISTUTILS_USE_SDK=1` tells the build to reuse the initialized compiler
+environment; PyTorch rejects an activated VC environment without this setting.
 The final `pip show` should say the original package was not found. If it is
 installed, use a separate environment instead of proceeding.
 

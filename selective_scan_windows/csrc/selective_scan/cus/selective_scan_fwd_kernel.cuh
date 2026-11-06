@@ -18,7 +18,6 @@
 
 #include "selective_scan.h"
 #include "selective_scan_common.h"
-#include "static_switch.h"
 
 template<int kNThreads_, int kNItems_, bool kIsEvenLen_, typename input_t_, typename weight_t_>
 struct Selective_Scan_fwd_kernel_traits {
@@ -177,20 +176,28 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     }
 }
 
+// Use template parameters directly: NVCC/MSVC rejects the BOOL_SWITCH lambda
+// constants as template arguments in the generated host code (C2975).
+template<int kNThreads, int kNItems, bool kIsEvenLen, typename input_t, typename weight_t>
+void selective_scan_fwd_launch_impl(SSMParamsBase &params, cudaStream_t stream) {
+    using Ktraits = Selective_Scan_fwd_kernel_traits<kNThreads, kNItems, kIsEvenLen, input_t, weight_t>;
+    constexpr int kSmemSize = Ktraits::kSmemSize + Ktraits::MaxDState * sizeof(typename Ktraits::scan_t);
+    dim3 grid(params.batch, params.dim);
+    auto kernel = &selective_scan_fwd_kernel<Ktraits>;
+    if (kSmemSize >= 48 * 1024) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+    }
+    kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 template<int kNThreads, int kNItems, typename input_t, typename weight_t>
 void selective_scan_fwd_launch(SSMParamsBase &params, cudaStream_t stream) {
-    BOOL_SWITCH(params.seqlen % (kNThreads * kNItems) == 0, kIsEvenLen, [&] {
-        using Ktraits = Selective_Scan_fwd_kernel_traits<kNThreads, kNItems, kIsEvenLen, input_t, weight_t>;
-        constexpr int kSmemSize = Ktraits::kSmemSize + Ktraits::MaxDState * sizeof(typename Ktraits::scan_t);
-        // printf("smem_size = %d\n", kSmemSize);
-        dim3 grid(params.batch, params.dim);
-        auto kernel = &selective_scan_fwd_kernel<Ktraits>;
-        if (kSmemSize >= 48 * 1024) {
-            C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-        }
-        kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-    });
+    if (params.seqlen % (kNThreads * kNItems) == 0) {
+        selective_scan_fwd_launch_impl<kNThreads, kNItems, true, input_t, weight_t>(params, stream);
+    } else {
+        selective_scan_fwd_launch_impl<kNThreads, kNItems, false, input_t, weight_t>(params, stream);
+    }
 }
 
 template<int knrows, typename input_t, typename weight_t>

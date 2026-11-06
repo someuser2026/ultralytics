@@ -8,7 +8,8 @@ back. The original selective_scan and ultralytics source files are unchanged.
 Windows compilation and GPU tests have NOT yet been verified on this PC.
 
 READ THIS FIRST
-- Use "x64 Native Tools Command Prompt for VS 2022" throughout this guide.
+- Open a fresh Command Prompt (cmd.exe) from Start; section 2 initializes the
+  VS 2022 x64 compiler. Do not launch it from an existing developer shell.
   These are Command Prompt commands, NOT commands to paste into PowerShell.
   Commands beginning with "powershell -NoProfile" launch PowerShell themselves;
   paste those commands into the same Command Prompt too.
@@ -83,7 +84,7 @@ After updating with Git or copying the ZIP, confirm the same files exist.
 2. OPEN THE DEVELOPER COMMAND PROMPT AND START A LOG FOLDER
 ======================================================================
 
-Open Start -> x64 Native Tools Command Prompt for VS 2022.
+Open Start -> Command Prompt (cmd.exe).
 Run the following. Change ONLY the SSW_REPO path if the repo is elsewhere:
 
 set "SSW_REPO=%USERPROFILE%\rip-work\repos\ultralytics"
@@ -106,6 +107,7 @@ Choose the intended compiler (default VS Build Tools installation path):
 call "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64 -vcvars_ver=14.38 > "%SSW_RUN%\01_compiler_setup.txt" 2>&1
 echo compiler_setup_exit=%ERRORLEVEL% >> "%SSW_RUN%\status.txt"
 type "%SSW_RUN%\01_compiler_setup.txt"
+set "DISTUTILS_USE_SDK=1"
 cl > "%SSW_RUN%\02_compiler_version.txt" 2>&1
 type "%SSW_RUN%\02_compiler_version.txt"
 
@@ -113,6 +115,8 @@ Expected: compiler_setup_exit=0; compiler version 19.38... for x64.
 The "missing source filename" error from cl alone is EXPECTED: this command
 only asks it to print its version. If VS is installed elsewhere, adjust the
 vcvarsall.bat path. Do not substitute a newer compiler silently.
+DISTUTILS_USE_SDK=1 tells PyTorch/setuptools to reuse this compiler environment.
+Set it again after compiler activation if you open another Command Prompt.
 
 Select the default CUDA 12.6 toolkit location:
 

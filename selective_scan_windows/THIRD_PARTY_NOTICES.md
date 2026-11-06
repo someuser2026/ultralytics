@@ -33,7 +33,9 @@ replace or remove third-party license terms.
 
 Windows compiler flags and independent packaging; explicit host/device headers;
 portable pointer qualifiers and log2(e) constant; explicit dependent-type aliases;
-qualified reverse-scan type name. Scan mathematics, chunking, launch choices,
+qualified reverse-scan type name; explicit boolean template dispatch in launch
+helpers to avoid NVCC/MSVC nested-lambda constant-expression errors.
+Scan mathematics, chunking, launch choices,
 fast math, and accumulation types are preserved.
 
 ## NVIDIA notice

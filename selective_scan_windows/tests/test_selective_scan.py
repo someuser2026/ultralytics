@@ -26,8 +26,10 @@ def test_first_step_does_not_depend_on_transition():
 
 
 BOUNDARIES = [1, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1023, 1024, 1025, 2047, 2048, 2049, 4096]
+# Exercise aligned/tail launch specializations with softplus both on and off.
 # Boundary coverage in FP32; mixed precision covers both single and multiple chunks.
-CASES = [(length, torch.float32, 1, 4, 8, True, True, True, False) for length in BOUNDARIES]
+CASES = [(length, torch.float32, 1, 4, 8, True, True, softplus, False)
+         for length, softplus in itertools.product(BOUNDARIES, [False, True])]
 CASES += [(length, dtype, 2, 2, 16, True, True, True, False)
           for length, dtype in itertools.product([129, 2049], [torch.float16, torch.bfloat16])]
 CASES += [(65, torch.float32, 2, 1, 1, d, bias, softplus, False)
