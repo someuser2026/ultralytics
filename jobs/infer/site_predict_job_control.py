@@ -124,7 +124,8 @@ def validate_combine_resources(resource):
 
 
 def capabilities():
-    return {'prepared_site_validation': [1, 2], 'job_name_styles': ['stage-site-v1'], 'scheduler_query_errors': [1]}
+    return {'prepared_site_validation': [1, 2], 'job_name_styles': ['stage-site-v1'], 'scheduler_query_errors': [1],
+            'combine_execution': ['pbs', 'login', 'pbs-deferred', 'none']}
 
 
 def validate_prepared_settings(settings, execution):
@@ -132,10 +133,12 @@ def validate_prepared_settings(settings, execution):
     style = settings.get('job_name_style')
     if style is not None and style not in capabilities()['job_name_styles']:
         raise ValueError('Unsupported job naming style')
+    if execution == 'none' and (not isinstance(marker, dict) or marker.get('version') != 2):
+        raise ValueError('Batch-only execution requires prepared inventory v2')
     if marker is None:
         return
     if (not isinstance(marker, dict) or type(marker.get('version')) is not int or marker['version'] not in (1, 2)
-            or execution != 'pbs-deferred' or style != 'stage-site-v1'
+            or execution not in {'pbs-deferred', 'none'} or style != 'stage-site-v1'
             or any(not isinstance(marker.get(k), str) or not Path(marker[k]).is_absolute() for k in ('run', 'repo'))
             or not re.fullmatch(r'[0-9a-f]{64}', str(marker.get('package_fingerprint', '')))):
         raise ValueError('Unsupported or invalid prepared worker settings')
@@ -173,8 +176,10 @@ def build_submission_plan(args):
                     'hpc/submit_yolo_site_predict_json.sh', 'hpc/yolo_site_predict_json.pbs', 'hpc/combine_yolo_site_predict_json_batches.pbs']
     execution = getattr(args, 'combine_execution', 'pbs')
     login_combine = execution == 'login'
-    if login_combine:
+    if login_combine or execution == 'none':
         source_names.remove('hpc/combine_yolo_site_predict_json_batches.pbs')
+    if execution == 'none':
+        source_names.remove('combine_yolo_site_predict_json_batches.py')
     request = {'schema': SCHEMA, 'control': str(control), 'checkpoint': str(checkpoint),
                'checkpoint_sha256': file_hash(checkpoint), 'scratch': str(scratch), 'site': args.site_name,
                'img_dir': str(img_dir), 'image_root': str(image_root), 'images': images, 'output': str(output),
@@ -194,9 +199,9 @@ def build_submission_plan(args):
         request['segmentation_filter_path'] = filter_path
         request['sources'][filter_path] = file_hash(filter_path)
     # This is a quota guard, not a second scheduler. Normal sites use fewer than 50 jobs.
-    if len(request['batches']) + 1 > 550:
+    if len(request['batches']) + (execution not in {'login', 'none'}) > 550:
         raise ValueError('Prediction graph exceeds the single-site quota; increase job batch size')
-    if execution in {'login', 'pbs-deferred'}:
+    if execution in {'login', 'pbs-deferred', 'none'}:
         request.update(combine_execution=execution, max_attempts=1)
     if execution == 'pbs-deferred':
         validate_combine_resources(request['settings'].get('combine_resources'))
@@ -284,7 +289,7 @@ def observe(request, job, jobs):
     receipt = read(path) if path.exists() else None
     if receipt and any(receipt.get(k) != v for k, v in identity(request, job).items()):
         raise ValueError('Prediction receipt identity mismatch')
-    if request.get('combine_execution') == 'pbs-deferred':
+    if request.get('combine_execution') in {'pbs-deferred', 'none'}:
         # A cached success or scheduler success must never hide a failed worker.
         prior = job.get('terminal') or {}
         codes = []
@@ -314,6 +319,8 @@ def identity(request, job):
 
 
 def command_for(request, job, state):
+    if job['node'] == 'combine' and request.get('combine_execution') == 'none':
+        raise ValueError('Batch-only prediction runs cannot combine')
     settings = request['settings']
     options = request['options']
     values = {'SCRATCH': request['scratch'], 'CHECKPOINT': request['checkpoint'], 'SITE_NAME': request['site'],
@@ -442,12 +449,12 @@ def submit_or_resume(args):
             atomic(control / 'request.json', request)
         if not (control / 'state.json').exists():
             state = {'jobs': {name: [new_attempt(request, name, 1)] for name in
-                             [b['node'] for b in request['batches']] + ([] if request.get('combine_execution') == 'login' else ['combine'])}, 'combine_fallback': False}
+                             [b['node'] for b in request['batches']] + ([] if request.get('combine_execution') in {'login', 'none'} else ['combine'])}, 'combine_fallback': False}
             atomic(control / 'state.json', state)
         state = read(control / 'state.json')
         for batch in request['batches']:
             submit_job(request, state, state['jobs'][batch['node']][-1])
-        if request.get('combine_execution') in {'login', 'pbs-deferred'}:
+        if request.get('combine_execution') in {'login', 'pbs-deferred', 'none'}:
             return {'control': str(control), 'batches': len(request['batches']),
                     'combine_execution': request['combine_execution']}
         combine = state['jobs']['combine'][-1]
@@ -488,7 +495,7 @@ def observe_attempt(request, job, jobs):
     result = observe(request, job, jobs)
     if result is not None:
         job['terminal'] = result
-    elif request.get('combine_execution') == 'pbs-deferred':
+    elif request.get('combine_execution') in {'pbs-deferred', 'none'}:
         job.pop('terminal', None)  # Fresh active/held evidence outranks cached completion.
     return result
 
@@ -624,8 +631,11 @@ def _validate_prediction_output(request, path, expected):
     verify_images(request, expected)
     if prepared.is_v2(request):
         data = Path(path).read_bytes()
-        count = prepared.validate_records(prepared.unique_payload(data), expected, policy)
-        return {'count': count, 'sha256': hashlib.sha256(data).hexdigest()}
+        payload = prepared.unique_payload(data)
+        count = prepared.validate_records(payload, expected, policy)
+        return {'count': count, 'sha256': hashlib.sha256(data).hexdigest(),
+                'bytes': len(data),
+                'detections': sum(len(r['predictions']) for r in payload['predictions'].values())}
     payload = unique_json(path)
     records = payload.get('predictions') if isinstance(payload, dict) else None
     if not isinstance(records, dict):
@@ -827,7 +837,7 @@ def main(argv=None):
         submit.add_argument('--' + name, required=True)
     for name, default, kind in (('imgsz', 448, int), ('conf', .01, float), ('iou', .45, float), ('job-batch-size', 5000, int)):
         submit.add_argument('--' + name, type=kind, default=default)
-    submit.add_argument('--combine-execution', choices=['pbs', 'login', 'pbs-deferred'], default='pbs')
+    submit.add_argument('--combine-execution', choices=['pbs', 'login', 'pbs-deferred', 'none'], default='pbs')
     submit.add_argument('--device', default='0')
     submit.add_argument('--predict-mode', default='per-image', choices=['per-image', 'directory'])
     for name in ('status', 'submit-combine', 'abandon-combine', 'retry', 'run-worker', 'reconcile'):

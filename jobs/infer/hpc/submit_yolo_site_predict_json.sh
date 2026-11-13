@@ -186,9 +186,14 @@ fi
 cd "${REPO_ROOT}"
 
 if [[ -n "${SITE_PREDICT_CONTROL:-}" && "${DRY_RUN}" == "0" ]]; then
-  [[ "${COMBINE_BATCHES}" == "1" && "${JOB_BATCHING}" == "1" && "${JOB_BATCH_SIZE}" -gt 0 ]] || {
-    echo 'Managed prediction requires batching and COMBINE_BATCHES=1' >&2; exit 1;
+  [[ "${JOB_BATCHING}" == "1" && "${JOB_BATCH_SIZE}" -gt 0 ]] || {
+    echo 'Managed prediction requires batching and JOB_BATCH_SIZE > 0' >&2; exit 1;
   }
+  if [[ "${SITE_PREDICT_COMBINE_EXECUTION:-pbs}" == "none" ]]; then
+    [[ "${COMBINE_BATCHES}" == "0" ]] || { echo 'Batch-only execution requires COMBINE_BATCHES=0' >&2; exit 1; }
+  else
+    [[ "${COMBINE_BATCHES}" == "1" ]] || { echo 'Managed combination requires COMBINE_BATCHES=1' >&2; exit 1; }
+  fi
   : "${SITE_PREDICT_SETTINGS:?Managed scheduler settings are required}"
   : "${SITE_PREDICT_PYTHON:?Managed Python executable is required}"
   [[ -z "${MAX_DET}" && -z "${BATCH}" && -z "${WANDB_RUN_ID}" ]] || {
